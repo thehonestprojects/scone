@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use scone_core::{DomainId, DomainName, OwnerId, PublicKeyRef, Register, Update};
 use scone_crypto::{Signature, SigningKey};
+use tracing::{debug, info};
 use zeroize::Zeroize;
 
 /// Extension of keystore files (re-exported for path building).
@@ -79,6 +80,13 @@ fn validate_identity_name(name: &str) -> Result<(), CliError> {
     disable_help_subcommand = true
 )]
 struct Cli {
+    /// Increase logging verbosity (-v: info, -vv: debug, -vvv:
+    /// trace). Without -v, commands log at WARN, except `scone
+    /// relay` which stays at INFO (a daemon must log its activity).
+    /// RUST_LOG, when set, overrides these defaults entirely.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -879,6 +887,7 @@ fn run_identity(command: IdentityCommand) -> Result<Vec<String>, CliError> {
         }
         IdentityCommand::List { dir } => {
             let dir = keystore_dir(dir.as_deref());
+            debug!(dir = %dir.display(), "listing identities");
             let entries = scone_keystore::list(&dir).map_err(CliError::Keystore)?;
             if entries.is_empty() {
                 return Ok(vec!["no identities".to_string()]);
@@ -937,6 +946,7 @@ fn rpc_call(
         .enable_all()
         .build()
         .map_err(|e| CliError::RelayUnreachable(e.to_string()))?;
+    debug!(addr = %client.addr(), "rpc round trip");
     let response = rt.block_on(client.request(request)).map_err(|e| match e {
         scone_network::NetworkError::Io(_) | scone_network::NetworkError::Timeout(_) => {
             CliError::RelayUnreachable(client_addr(client))
@@ -1008,7 +1018,7 @@ fn run_relay(
     rt.block_on(async move {
         let relay =
             scone_network::Relay::new(config).map_err(|e| CliError::RelayError(e.to_string()))?;
-        eprintln!("scone-relay[{}]: starting", relay.peer_id());
+        info!(peer = %relay.peer_id(), "starting relay");
         relay
             .run()
             .await
@@ -1511,6 +1521,7 @@ fn run_record(command: RecordCommand) -> Result<Vec<String>, CliError> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    init_tracing(&cli);
     match run(cli) {
         Ok(lines) => {
             for line in lines {
@@ -1523,6 +1534,39 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Initializes the tracing subscriber (compact format, stderr —
+/// stdout stays reserved for command output, which matters for
+/// scripting).
+///
+/// Level selection:
+///
+/// - `RUST_LOG`, when set, wins outright (env-filter syntax, e.g.
+///   `RUST_LOG=debug` or `RUST_LOG=scone_network=trace,info`);
+/// - otherwise `-v` selects the level: none → WARN, `-v` → INFO,
+///   `-vv` → DEBUG, `-vvv` (and more) → TRACE;
+/// - `scone relay` defaults to INFO even without `-v` — a daemon
+///   must log its activity to be operable.
+fn init_tracing(cli: &Cli) {
+    use tracing_subscriber::EnvFilter;
+
+    let is_relay = matches!(cli.command, Command::Relay { .. });
+    let default_level = match cli.verbose {
+        0 if is_relay => "info",
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 #[cfg(test)]

@@ -126,14 +126,16 @@ fn start_relay(data_dir: &Path, rpc: SocketAddr, bootstrap: Option<&str>) -> Rel
     }
 }
 
-/// Extracts A's bootstrap multiaddr from its relay log.
+/// Extracts A's bootstrap multiaddr from its stdout line `p2p: <addr>`
+/// (stdout and stderr are both redirected into the same log file; the
+/// data line is matched by prefix, log lines start with a timestamp).
 fn bootstrap_of(log_path: &Path, rpc: SocketAddr) -> String {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let log = read_all(log_path);
         for line in log.lines() {
-            if let Some(index) = line.find("p2p listening on ") {
-                return line[index + "p2p listening on ".len()..].trim().to_string();
+            if let Some(index) = line.find("p2p: ") {
+                return line[index + "p2p: ".len()..].trim().to_string();
             }
         }
         assert!(

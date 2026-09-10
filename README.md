@@ -115,6 +115,16 @@ Deux nœuds sur une machine : `scone relay --rpc 127.0.0.1:7475
 affiche son adresse p2p au démarrage), puis ajoutez `--rpc
 127.0.0.1:7475` aux commandes ci-dessus pour parler au nœud B.
 
+### Logging
+
+Les logs vont **sur stderr** (stdout reste réservé aux sorties de
+commandes — fiable en script). Verbosité : `-v` (info), `-vv`
+(debug), `-vvv` (trace) ; sans `-v`, les commandes one-shot loggent
+à WARN et `scone relay` reste à INFO (un daemon doit logger son
+activité). `RUST_LOG` (syntaxe env-filter) remplace ces défauts,
+par ex. `RUST_LOG=scone_network=trace scone relay`. Détails :
+[`docs/development/cli.md`](docs/development/cli.md).
+
 ## Développement
 
 ```bash

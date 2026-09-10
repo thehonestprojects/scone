@@ -30,9 +30,11 @@ futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
 redb = "4.2.0"
 rpassword = "7"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 scone-blockchain = { path = "crates/scone-blockchain" }
 scone-core = { path = "crates/scone-core" }
 scone-crypto = { path = "crates/scone-crypto" }

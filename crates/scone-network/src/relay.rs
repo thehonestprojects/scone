@@ -47,6 +47,7 @@ use scone_protocol::{Block, BlockHash, Message, PROTOCOL_VERSION, decode_complet
 use scone_storage::{NodeStore, RedbStore, integration as store_integration};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
+use tracing::{debug, info, warn};
 
 use crate::behaviour::{
     SconeBehaviour, SconeBehaviourEvent, build_behaviour, parse_bootstrap_addr,
@@ -249,18 +250,23 @@ impl Relay {
         let p2p_addr = self.wait_listen_addr().await.ok();
         let listener = rpc::bind(self.config.rpc_addr).await?;
         self.rpc_addr = listener.local_addr()?;
-        eprintln!(
-            "scone-relay[{}]: rpc listening on {}",
-            self.peer_id(),
-            self.rpc_addr
+        info!(
+            peer = %self.peer_id(),
+            rpc_addr = %self.rpc_addr,
+            "rpc listening"
         );
         // Best-effort echo of the P2P address for `--bootstrap`.
         if let Some(addr) = p2p_addr {
-            eprintln!(
-                "scone-relay[{}]: p2p listening on {addr}/p2p/{}",
-                self.peer_id(),
-                self.peer_id()
+            info!(
+                peer = %self.peer_id(),
+                p2p_addr = format!("{addr}/p2p/{}", self.peer_id()),
+                "p2p listening"
             );
+            // Machine-readable contract (stdout = command data, not a
+            // log): one `p2p: <multiaddr>` line as soon as the
+            // listener is bound, for scripts and the e2e tests. Rust's
+            // stdout is line-buffered, so the line is flushed at once.
+            println!("p2p: {addr}/p2p/{}", self.peer_id());
         }
 
         // RPC → relay command channel.
@@ -364,7 +370,7 @@ impl Relay {
                     // swallowed; only local fatal failures (store,
                     // production) still propagate out of run().
                     if let Err(e) = self.handle_swarm_event(*event) {
-                        eprintln!("scone-relay: dropped misbehaving network input: {e}");
+                        warn!("dropped misbehaving network input: {e}");
                     }
                 }
                 Wake::Produce => {
@@ -592,6 +598,7 @@ impl Relay {
                 if !self.peers.contains(&peer_id) {
                     self.peers.push(peer_id);
                 }
+                info!(peer = %peer_id, "peer connected");
                 // Kick off sync catch-up from our height + 1.
                 let from = self.chain.height() + 1;
                 self.sync.insert(
@@ -604,6 +611,7 @@ impl Relay {
                 self.request_sync_batch(peer_id, from);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                debug!(peer = %peer_id, "peer disconnected");
                 self.peers.retain(|p| *p != peer_id);
                 self.sync.remove(&peer_id);
             }
@@ -643,11 +651,11 @@ impl Relay {
                 }
             },
             ReqResEvent::OutboundFailure { peer, error, .. } => {
-                eprintln!("scone-relay: outbound failure ({peer}): {error}");
+                warn!("outbound failure ({peer}): {error}");
                 self.sync.remove(&peer);
             }
             ReqResEvent::InboundFailure { error, .. } => {
-                eprintln!("scone-relay: inbound failure: {error}");
+                warn!("inbound failure: {error}");
             }
             ReqResEvent::ResponseSent { .. } => {}
         }
@@ -745,7 +753,7 @@ impl Relay {
     /// stored under domain A's key) both land in the `else` branches.
     fn handle_kad(&mut self, event: kad::Event) {
         if std::env::var_os("SCONE_KAD_DEBUG").is_some() {
-            eprintln!("scone-relay[{}]: kad event: {event:?}", self.peer_id());
+            debug!(peer = %self.peer_id(), ?event, "kad event");
         }
         let (query_id, result) = match event {
             kad::Event::OutboundQueryProgressed { id, result, .. } => (id, result),
@@ -763,10 +771,7 @@ impl Relay {
                 // Key check BEFORE on-chain verification (H1): the
                 // record must live under the requested domain's key.
                 if found.record.key.as_ref() != waiter.domain_id.as_bytes().as_slice() {
-                    eprintln!(
-                        "scone-relay: dht answer key mismatch for query {:?} — dropped",
-                        query_id
-                    );
+                    warn!(?query_id, "dht answer key mismatch — dropped");
                     waiter.send(RpcResponse::error(
                         "resolved record key does not match the requested domain",
                     ));
@@ -827,12 +832,12 @@ impl Relay {
         }
         let hash = self.chain.push_block(&block)?;
         store_integration::store_block(&mut self.store, &self.chain, &block, hash)?;
-        eprintln!(
-            "scone-relay: accepted block {} (height {}, {} txs) from {}",
-            hex(hash.as_bytes()),
-            block.header.height,
-            block.transactions.len(),
-            from.map(|p| p.to_string()).unwrap_or_else(|| "self".into())
+        info!(
+            hash = hex(hash.as_bytes()),
+            height = block.header.height,
+            txs = block.transactions.len(),
+            from = from.map(|p| p.to_string()).unwrap_or_else(|| "self".into()),
+            "accepted block"
         );
         for tx in &block.transactions {
             if let Ok(id) = transaction_id(tx) {
@@ -866,6 +871,7 @@ impl Relay {
             // first seen). Do NOT relay again.
             return Ok(id);
         }
+        debug!(txid = hex(id.as_bytes()), "accepted transaction");
         let message = Message::Transaction(tx);
         for peer in self.peers.iter().filter(|p| Some(**p) != from) {
             self.swarm
@@ -942,7 +948,7 @@ impl Relay {
                 match self.precheck_state(&tx) {
                     Ok(()) => candidates.push(tx),
                     Err(e) => {
-                        eprintln!("scone-relay: evicted stale tx from the mempool: {e}");
+                        warn!("evicted stale tx from the mempool: {e}");
                     }
                 }
             }
@@ -969,11 +975,11 @@ impl Relay {
                         // now-redundant re-validation: the block was
                         // just pushed; store it and relay it.
                         store_integration::store_block(&mut self.store, &self.chain, &block, hash)?;
-                        eprintln!(
-                            "scone-relay: produced block {} (height {}, {} txs)",
-                            hex(hash.as_bytes()),
-                            block.header.height,
-                            block.transactions.len(),
+                        info!(
+                            hash = hex(hash.as_bytes()),
+                            height = block.header.height,
+                            txs = block.transactions.len(),
+                            "produced block"
                         );
                         let message = Message::Block(Box::new(block));
                         for peer in &self.peers {
@@ -986,7 +992,7 @@ impl Relay {
                     }
                     Err(e) => {
                         candidates.pop();
-                        eprintln!("scone-relay: dropped conflicting tx from block production: {e}");
+                        warn!("dropped conflicting tx from block production: {e}");
                     }
                 }
             }

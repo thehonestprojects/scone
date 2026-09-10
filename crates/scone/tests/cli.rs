@@ -514,3 +514,87 @@ fn relay_rejects_a_bad_bootstrap_multiaddr() {
             .contains("multiaddr")
     );
 }
+
+// ---- logging: -v/-vv levels, RUST_LOG override, clean stdout ----
+
+/// The default level for one-shot commands is WARN: a plain
+/// `scone identity list` must produce NO debug/info logs on stderr.
+#[test]
+fn default_identity_list_emits_no_logs_on_stderr() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, stdout, stderr) = run_with_env(home.path(), &[], &["identity", "list"]);
+    assert!(ok, "stderr: {stderr}");
+    assert_eq!(stdout, "no identities\n");
+    assert!(
+        stderr.is_empty(),
+        "no logs expected at WARN default: {stderr}"
+    );
+}
+
+/// `-vv` (DEBUG) makes the debug-level logs of a simple command
+/// appear on stderr — and still NOT on stdout.
+#[test]
+fn vv_makes_debug_logs_appear_on_stderr_only() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, stdout, stderr) = run_with_env(home.path(), &[], &["-vv", "identity", "list"]);
+    assert!(ok, "stderr: {stderr}");
+    assert_eq!(stdout, "no identities\n");
+    assert!(
+        stderr.contains("DEBUG") && stderr.contains("listing identities"),
+        "debug logs expected on stderr with -vv: {stderr}"
+    );
+}
+
+/// `-v` (INFO) is below DEBUG: the same command stays quiet.
+#[test]
+fn v_info_level_stays_quiet_for_debug_events() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, _stdout, stderr) = run_with_env(home.path(), &[], &["-v", "identity", "list"]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        !stderr.contains("listing identities"),
+        "no DEBUG logs at INFO level: {stderr}"
+    );
+}
+
+/// `RUST_LOG=debug` overrides the flag-derived level, even without
+/// any -v.
+#[test]
+fn rust_log_overrides_the_level_without_flags() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, _stdout, stderr) =
+        run_with_env(home.path(), &[("RUST_LOG", "debug")], &["identity", "list"]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stderr.contains("DEBUG") && stderr.contains("listing identities"),
+        "RUST_LOG=debug must enable debug logs: {stderr}"
+    );
+}
+
+/// `RUST_LOG` takes precedence over -vv too (here: silencing it).
+#[test]
+fn rust_log_takes_precedence_over_flags() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, _stdout, stderr) = run_with_env(
+        home.path(),
+        &[("RUST_LOG", "error")],
+        &["-vv", "identity", "list"],
+    );
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        !stderr.contains("listing identities"),
+        "RUST_LOG=error must win over -vv: {stderr}"
+    );
+}
+
+/// `-v` is accepted after the subcommand as well (global flag).
+#[test]
+fn verbose_flag_is_global_and_works_after_subcommand() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (ok, _stdout, stderr) = run_with_env(home.path(), &[], &["identity", "list", "-vv"]);
+    assert!(ok, "stderr: {stderr}");
+    assert!(
+        stderr.contains("listing identities"),
+        "global -vv after subcommand must work: {stderr}"
+    );
+}
