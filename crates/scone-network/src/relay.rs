@@ -202,6 +202,20 @@ impl Relay {
         *self.swarm.local_peer_id()
     }
 
+    /// P2P listen multiaddr of this relay, once bound (M5: lets the
+    /// CLI print a ready-to-use `--bootstrap` value for other nodes).
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::Peer`] when no address is (yet) bound.
+    pub fn listen_addr(&self) -> Result<libp2p::Multiaddr> {
+        self.swarm
+            .listeners()
+            .next()
+            .cloned()
+            .ok_or_else(|| NetworkError::Peer("no listen address".into()))
+    }
+
     /// Waits until the QUIC listener is bound; returns the multiaddr
     /// (tests use it to bootstrap node B onto node A).
     ///
@@ -228,6 +242,11 @@ impl Relay {
     ///
     /// [`NetworkError`] on fatal swarm/store failures.
     pub async fn run(mut self) -> Result<()> {
+        // Ensure the P2P listener is bound before announcing anything
+        // (libp2p only reports the address once the swarm is polled;
+        // the events consumed here are pre-connection and carry no
+        // application traffic).
+        let p2p_addr = self.wait_listen_addr().await.ok();
         let listener = rpc::bind(self.config.rpc_addr).await?;
         self.rpc_addr = listener.local_addr()?;
         eprintln!(
@@ -235,6 +254,14 @@ impl Relay {
             self.peer_id(),
             self.rpc_addr
         );
+        // Best-effort echo of the P2P address for `--bootstrap`.
+        if let Some(addr) = p2p_addr {
+            eprintln!(
+                "scone-relay[{}]: p2p listening on {addr}/p2p/{}",
+                self.peer_id(),
+                self.peer_id()
+            );
+        }
 
         // RPC → relay command channel.
         let (command_tx, mut command_rx) = mpsc::channel::<RelayCommand>(64);
@@ -415,6 +442,10 @@ impl Relay {
                     Err(e) => Dispatched::Now(RpcResponse::error(e.to_string())),
                 }
             }
+            RpcRequest::DomainInfo { name } => Dispatched::Now(match self.domain_info(&name) {
+                Ok(data) => RpcResponse::ok(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }),
         }
     }
 
@@ -493,6 +524,48 @@ impl Relay {
         let key = kad::RecordKey::new(&id.as_bytes());
         let query = self.swarm.behaviour_mut().kad.get_record(key);
         Ok(DhtWaiter::fresh(query, id))
+    }
+
+    /// `domain_info` (M5): rich read-only exploration of one domain.
+    ///
+    /// On-chain part: registered, owner, sequence, record_hash
+    /// (same fields as `lookup`). DNS part: served from the LOCAL
+    /// persistent DHT cache only (no network query, no waiter), and
+    /// only after full verification against the chain state — an
+    /// unregistered domain, a stale/foreign cached record or a hash
+    /// mismatch yields `dns: []` (availability is never authority).
+    fn domain_info(&self, name: &str) -> Result<Value> {
+        let domain = DomainName::new(name).map_err(|e| NetworkError::Blockchain(e.into()))?;
+        let id = DomainId::from_name(&domain);
+        let Some(state) = self.chain.state().domain(&id) else {
+            return Ok(json!({
+                "name": domain.canonical(),
+                "domain_id": hex(id.as_bytes()),
+                "registered": false,
+                "dns": [],
+            }));
+        };
+        // Local cache only: if this node has (replicated) the record,
+        // decode and verify it; anything short of a fully valid match
+        // silently degrades to "no DNS data known locally".
+        let dns = match self.store.dht_cache(&id)? {
+            Some(bytes) => match decode_complete::<SignedDnsRecord>(&bytes) {
+                Ok(record) if self.verify_record_against_chain(&record)? => {
+                    json_record_data(&record)
+                }
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        Ok(json!({
+            "name": domain.canonical(),
+            "domain_id": hex(id.as_bytes()),
+            "registered": true,
+            "owner": hex(state.owner.as_bytes()),
+            "sequence": state.sequence,
+            "record_hash": state.record_hash.map(|h| hex(h.as_bytes())),
+            "dns": dns,
+        }))
     }
 
     // ---- P2P ----------------------------------------------------------
@@ -703,6 +776,13 @@ impl Relay {
                     match decode_complete::<SignedDnsRecord>(&found.record.value) {
                         Ok(record) => {
                             if self.verify_record_against_chain(&record).unwrap_or(false) {
+                                // M5: a chain-verified resolution is cached in
+                                // the persistent store, so `domain_info`
+                                // (local read) serves it afterwards without
+                                // hitting the DHT again.
+                                let _ = self
+                                    .store
+                                    .put_dht_cache(waiter.domain_id, &found.record.value);
                                 RpcResponse::ok(json!({
                                     "record": hex(&found.record.value),
                                     "verified": true,
@@ -878,6 +958,36 @@ fn hex(bytes: &[u8]) -> String {
         out.push(HEX[usize::from(b & 0x0f)] as char);
     }
     out
+}
+
+/// Renders the record set of a [`SignedDnsRecord`] as one JSON object
+/// per DNS record (`domain_info`, M5). Human-oriented values (IPs,
+/// names, text); unknown types expose their raw type code and hex
+/// data. Bounded by `MAX_RECORDS_PER_SET` at decode time.
+fn json_record_data(record: &SignedDnsRecord) -> Vec<Value> {
+    use scone_core::RecordData;
+    record
+        .record
+        .records
+        .iter()
+        .map(|r| match r {
+            RecordData::A(ip) => json!({ "type": "A", "value": ip.to_string() }),
+            RecordData::Aaaa(ip) => json!({ "type": "AAAA", "value": ip.to_string() }),
+            RecordData::Cname(n) => json!({ "type": "CNAME", "value": n.canonical() }),
+            RecordData::Mx {
+                preference,
+                exchange,
+            } => {
+                json!({ "type": "MX", "preference": preference, "value": exchange.canonical() })
+            }
+            RecordData::Txt(t) => json!({ "type": "TXT", "value": t }),
+            RecordData::Ns(n) => json!({ "type": "NS", "value": n.canonical() }),
+            RecordData::Unknown { type_code, data } => json!({
+                "type": format!("TYPE{type_code}"),
+                "value": hex(data),
+            }),
+        })
+        .collect()
 }
 
 /// Strict hex decode (bounded by the caller).

@@ -142,7 +142,10 @@ malveillant ne peut faire accepter quoi que ce soit d'invalide.
   exactement le domaine demandé (vérifié **avant** la vérification
   on-chain). Le résultat est ensuite vérifié contre la chaîne avant
   d'être retourné. Plafond de requêtes simultanées :
-  `MAX_DHT_WAITERS` (256) ; au-delà, erreur immédiate.
+  `MAX_DHT_WAITERS` (256) ; au-delà, erreur immédiate. Une
+  résolution vérifiée avec succès est écrite dans le cache persistant
+  (M5) : les lectures locales (`domain_info`) la servent ensuite
+  sans nouvelle requête DHT.
 - Kademlia fonctionne en mode serveur, sans TTL de records (la chaîne
   gouverne la validité, pas le temps).
 
@@ -186,6 +189,7 @@ Toutes en JSON, discriminées par `"method"` :
 {"method": "lookup", "name": "example.uip"}
 {"method": "put_record", "record_hex": "<hex canonique du SignedDnsRecord>"}
 {"method": "get_record", "name": "example.uip"}
+{"method": "domain_info", "name": "example.uip"}
 ```
 
 ### Réponses
@@ -208,28 +212,80 @@ Formes de `data` par méthode :
 - **get_record** : `{"record": "<hex canonique>", "verified": true}`
   — la réponse n'est **jamais** émise sans vérification on-chain
   réussie ; non trouvé / non vérifié → `error`.
+- **domain_info** (M5) : `{"name", "domain_id", "registered": bool,
+  ["owner", "sequence", "record_hash"], "dns": [ … ]}`. Exploration
+  riche en **lecture locale uniquement** (aucune requête réseau,
+  aucun waiter DHT) : la partie `dns` n'est remplie que si ce nœud
+  détient en cache local un `SignedDnsRecord` qui vérifie
+  intégralement contre l'état on-chain courant (règles de
+  « Vérification des records ») ; sinon `dns: []`. Chaque entrée
+  `dns` est un objet `{"type": "A"|"AAAA"|"CNAME"|"NS"|"MX"|"TXT"|"TYPE<code>",
+  "value": …}` (MX ajoute `"preference"`).
 
 ### Sémantique temporelle
 
-`status`, `submit_tx`, `lookup` et `put_record` répondent
-immédiatement. `get_record` lance une requête Kademlia asynchrone : la
-connexion RPC reste ouverte jusqu'à résolution (borne 30 s côté
-relay, 60 s côté client).
+`status`, `submit_tx`, `lookup`, `put_record` et `domain_info`
+répondent immédiatement. `get_record` lance une requête Kademlia
+asynchrone : la connexion RPC reste ouverte jusqu'à résolution
+(borne 30 s côté relay, 60 s côté client).
 
 ## CLI
 
 ```
-scone relay [--data-dir DIR] [--listen MULTIADDR] [--bootstrap MULTIADDR]...
+scone relay [--data-dir DIR] [--listen MULTIADDR] [--bootstrap MULTIADDR]... [--rpc ADDR]
 scone status [--rpc ADDR]
 scone submit tx --hex HEX [--rpc ADDR]
 scone lookup NAME [--rpc ADDR]
+scone domain register NAME --identity ID [--dir DIR] [--passphrase-env VAR] [--rpc ADDR]
+scone domain update NAME --file FILE --identity ID [--dir DIR] [--passphrase-env VAR] [--rpc ADDR]
+scone domain info NAME [--rpc ADDR]
 scone record put NAME --file FILE [--rpc ADDR]      # FILE = hex canonique
 scone record get NAME [--rpc ADDR]
 ```
 
 `--rpc` défaut `127.0.0.1:7474` (le port que `scone relay` bind par
-défaut). Relay absent → message clair « cannot reach the relay — is
+défaut ; deux relays sur une même machine passent chacun leur
+`--rpc`). Relay absent → message clair « cannot reach the relay — is
 'scone relay' running? », exit non nul.
+
+### `domain register|update` (M5) — transactions signées en une commande
+
+Ces commandes enchaînent build → sign (keystore) → submit →
+(confirmation) en une seule invocation ; elles suppriment le
+pipe-shell `tx build | tx sign | submit tx` du devnet M4.
+
+- **register** : construit une `Register` signée (timestamp = now,
+  proof vide en devnet), la soumet, attend la confirmation on-chain
+  (séquence ≥ 0, timeout 30 s). Un nom déjà enregistré est refusé
+  côté client ET côté relay.
+- **update** : le fichier de records est l'unique source de vérité.
+  La séquence (on-chain + 1) et le `record_hash` (BLAKE3 canonique
+  des records du fichier) sont **dérivés**, jamais saisis : signataire
+  et vérificateurs ne peuvent pas diverger. Après confirmation de
+  l'Update, le `SignedDnsRecord` (records du fichier + owner +
+  signature Ed25519 sur l'encodage canonique) est publié dans la
+  DHT via `put_record` (qui revérifie contre la chaîne). Un domaine
+  non enregistré, une identité non-propriétaire ou une erreur de
+  fichier échouent proprement, sans toucher à la chaîne.
+
+#### Fichier de records
+
+Texte, un record par ligne, `#` = commentaire, lignes vides
+ignorées ; l'encodage canonique trié rend l'ordre du fichier sans
+effet sur le hash engagé. Le fichier est le set COMPLET (un update
+remplace, il ne fusionne pas). Types :
+
+```text
+A 192.0.2.1
+AAAA 2001:db8::1
+CNAME www.example.uip
+NS ns1.example.uip
+MX 10 mail.example.uip
+TXT texte libre (espaces normalisés)
+```
+
+Erreurs typées : type inconnu, IP/nom invalide (avec numéro de
+ligne), set vide, doublon, > `MAX_RECORDS_PER_SET`.
 
 ## Limites et garanties mémoire
 

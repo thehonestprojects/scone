@@ -106,6 +106,11 @@ enum Command {
         /// `/p2p/<peer-id>`.
         #[arg(long = "bootstrap")]
         bootstrap: Vec<String>,
+
+        /// Control RPC bind address (default 127.0.0.1:7474). Two
+        /// relays on one machine need distinct ports.
+        #[arg(long)]
+        rpc: Option<String>,
     },
 
     /// Relay status (tip, height, peers, domains).
@@ -129,6 +134,12 @@ enum Command {
         /// RPC address of the relay (default 127.0.0.1:7474).
         #[arg(long)]
         rpc: Option<String>,
+    },
+
+    /// Rich domain exploration and one-command register/update (M5).
+    Domain {
+        #[command(subcommand)]
+        command: DomainCommand,
     },
 
     /// Publish / resolve signed DNS records in the DHT.
@@ -159,6 +170,77 @@ enum SubmitCommand {
         /// Hex of the complete signed transaction.
         #[arg(long = "hex")]
         hex: String,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+}
+
+/// Subcommands of `scone domain` (M5).
+#[derive(Debug, Subcommand)]
+enum DomainCommand {
+    /// Claim a domain: build, sign and submit a `Register`
+    /// transaction in one command.
+    Register {
+        /// Domain name to register (e.g. `example.uip`).
+        name: String,
+
+        /// Local name of the signing identity.
+        #[arg(long)]
+        identity: String,
+
+        /// Keystore directory (default: `$HOME/.scone/keys`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Read the passphrase from this environment variable instead
+        /// of prompting.
+        #[arg(long = "passphrase-env", value_name = "VAR")]
+        passphrase_env: Option<String>,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+
+    /// Publish a new version of a domain's DNS data: reads the record
+    /// file, builds and signs the `Update` (sequence = on-chain
+    /// current + 1, record_hash = BLAKE3 of the file's records),
+    /// submits it, then publishes the signed record in the DHT.
+    Update {
+        /// Domain name to update.
+        name: String,
+
+        /// DNS record file (`A 192.0.2.1`, `AAAA …`, `TXT …`, one per
+        /// line; `#` comments). The WHOLE file becomes the record
+        /// set: submitting atomically replaces the previous set.
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Local name of the signing identity (must be the owner).
+        #[arg(long)]
+        identity: String,
+
+        /// Keystore directory (default: `$HOME/.scone/keys`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Read the passphrase from this environment variable instead
+        /// of prompting.
+        #[arg(long = "passphrase-env", value_name = "VAR")]
+        passphrase_env: Option<String>,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+
+    /// Rich read-only exploration of a domain: on-chain state plus,
+    /// when a chain-valid record is locally cached, its DNS records.
+    Info {
+        /// Domain name.
+        name: String,
 
         /// RPC address of the relay (default 127.0.0.1:7474).
         #[arg(long)]
@@ -347,6 +429,11 @@ enum CliError {
     InvalidRpcAddr(String),
     /// A file needed by a command could not be read.
     FileRead(std::io::Error),
+    /// A DNS record file is malformed (M5).
+    BadRecordFile(String),
+    /// A domain is not in the state required by the command (M5):
+    /// update of an unregistered domain, register of a taken one.
+    DomainState(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -388,6 +475,8 @@ impl std::fmt::Display for CliError {
             Self::RelayError(message) => write!(f, "relay: {message}"),
             Self::InvalidRpcAddr(addr) => write!(f, "invalid rpc address '{addr}'"),
             Self::FileRead(e) => write!(f, "cannot read file: {e}"),
+            Self::BadRecordFile(msg) => write!(f, "invalid record file: {msg}"),
+            Self::DomainState(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -484,10 +573,12 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
             data_dir,
             listen,
             bootstrap,
-        } => run_relay(data_dir, listen, bootstrap),
+            rpc,
+        } => run_relay(data_dir, listen, bootstrap, rpc),
         Command::Status { rpc } => run_status(rpc),
         Command::Submit { command } => run_submit(command),
         Command::Lookup { name, rpc } => run_lookup(name, rpc),
+        Command::Domain { command } => run_domain(command),
         Command::Record { command } => run_record(command),
     }
 }
@@ -893,6 +984,7 @@ fn run_relay(
     data_dir: Option<PathBuf>,
     listen: Option<String>,
     bootstrap: Vec<String>,
+    rpc: Option<String>,
 ) -> Result<Vec<String>, CliError> {
     let data_dir = data_dir.unwrap_or_else(|| match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".scone"),
@@ -903,10 +995,12 @@ fn run_relay(
         config.listen = Some(listen);
     }
     config.bootstrap = bootstrap;
-    // Devnet defaults: fixed RPC port so the CLI can find us.
-    config.rpc_addr = DEFAULT_RPC_ADDR
+    // Devnet defaults: fixed RPC port so the CLI can find us, unless
+    // --rpc says otherwise (two relays on one machine).
+    let rpc_text = rpc.as_deref().unwrap_or(DEFAULT_RPC_ADDR);
+    config.rpc_addr = rpc_text
         .parse()
-        .map_err(|_| CliError::InvalidRpcAddr(DEFAULT_RPC_ADDR.into()))?;
+        .map_err(|_| CliError::InvalidRpcAddr(rpc_text.to_string()))?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -945,6 +1039,402 @@ fn run_submit(command: SubmitCommand) -> Result<Vec<String>, CliError> {
 fn run_lookup(name: String, rpc: Option<String>) -> Result<Vec<String>, CliError> {
     let client = rpc_client(rpc.as_deref())?;
     rpc_call(&client, scone_network::RpcRequest::Lookup { name })
+}
+
+/// Runs one async RPC round trip and returns the raw `data` value.
+fn rpc_json(
+    client: &scone_network::RpcClient,
+    request: scone_network::RpcRequest,
+) -> Result<serde_json::Value, CliError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::RelayUnreachable(e.to_string()))?;
+    let response = rt.block_on(client.request(request)).map_err(|e| match e {
+        scone_network::NetworkError::Io(_) | scone_network::NetworkError::Timeout(_) => {
+            CliError::RelayUnreachable(client_addr(client))
+        }
+        other => CliError::RelayError(other.to_string()),
+    })?;
+    match response {
+        scone_network::RpcResponse::Ok { data } => Ok(data),
+        scone_network::RpcResponse::Error { message } => Err(CliError::RelayError(message)),
+    }
+}
+
+/// How long `domain register|update` waits for devnet confirmation.
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Polling period while waiting for chain confirmation.
+const CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Current Unix time (seconds), best effort (0 before the epoch).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Signs an unsigned (placeholder-signature) transaction with `sk`
+/// over its canonical payload. Owner/public key of the input are
+/// already bound to `sk` by construction (the caller builds with
+/// `sk.public_key()`).
+fn sign_tx_with(
+    unsigned: scone_core::Transaction,
+    sk: &SigningKey,
+) -> Result<scone_core::Transaction, CliError> {
+    let payload =
+        scone_protocol::signing_payload(&unsigned).map_err(CliError::MalformedTransaction)?;
+    let signature = sk.sign(&payload);
+    Ok(attach_signature(unsigned, signature))
+}
+
+/// Canonical hex of a signed transaction.
+fn tx_hex(tx: &scone_core::Transaction) -> Result<String, CliError> {
+    Ok(hex_lower(
+        &scone_protocol::encode_to_vec(tx).map_err(CliError::MalformedTransaction)?,
+    ))
+}
+
+/// Builds and signs a `Register` for `domain` with `sk`.
+fn signed_register_tx(
+    sk: &SigningKey,
+    domain: &DomainName,
+    timestamp: u64,
+) -> Result<scone_core::Transaction, CliError> {
+    let unsigned = scone_core::Transaction::Register(Register::register_signed(
+        DomainId::from_name(domain),
+        timestamp,
+        scone_core::Proof::from_bytes(Vec::new()),
+        sk.public_key(),
+        Signature::from_bytes([0; 64]),
+    ));
+    sign_tx_with(unsigned, sk)
+}
+
+/// Builds and signs an `Update` committing `record_hash` at
+/// `sequence` for `domain` with `sk`.
+fn signed_update_tx(
+    sk: &SigningKey,
+    domain: &DomainName,
+    sequence: u64,
+    record_hash: scone_core::RecordHash,
+) -> Result<scone_core::Transaction, CliError> {
+    let unsigned = scone_core::Transaction::Update(Update::update_signed(
+        DomainId::from_name(domain),
+        sequence,
+        record_hash,
+        sk.public_key(),
+        Signature::from_bytes([0; 64]),
+    ));
+    sign_tx_with(unsigned, sk)
+}
+
+/// Waits until the on-chain sequence of `name` reaches `at_least`,
+/// then returns the confirming `lookup` data.
+fn wait_for_sequence(
+    client: &scone_network::RpcClient,
+    name: &str,
+    at_least: u64,
+    what: &str,
+) -> Result<serde_json::Value, CliError> {
+    let deadline = std::time::Instant::now() + CONFIRM_TIMEOUT;
+    loop {
+        let info = rpc_json(
+            client,
+            scone_network::RpcRequest::Lookup { name: name.into() },
+        )?;
+        if info["sequence"].as_u64().is_some_and(|s| s >= at_least) {
+            return Ok(info);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::RelayError(format!(
+                "timeout waiting for {what} (chain sequence still < {at_least})"
+            )));
+        }
+        std::thread::sleep(CONFIRM_POLL);
+    }
+}
+
+/// Parses one DNS record file line into a [`scone_core::RecordData`].
+///
+/// Supported forms (M5): `A <ipv4>`, `AAAA <ipv6>`, `CNAME <name>`,
+/// `NS <name>`, `MX <preference> <name>`, `TXT <free text>`. Empty
+/// lines and `#` comments are skipped.
+fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordData, CliError> {
+    let bad = |msg: String| CliError::BadRecordFile(format!("line {line_no}: {msg}"));
+    let mut fields = line.split_ascii_whitespace();
+    let Some(kind) = fields.next() else {
+        return Err(bad("empty line".into()));
+    };
+    match kind.to_ascii_uppercase().as_str() {
+        "A" => {
+            let ip = fields
+                .next()
+                .ok_or_else(|| bad("A needs an IPv4 address".into()))?;
+            let ip: std::net::Ipv4Addr = ip
+                .parse()
+                .map_err(|_| bad(format!("'{ip}' is not an IPv4 address")))?;
+            Ok(scone_core::RecordData::A(ip))
+        }
+        "AAAA" => {
+            let ip = fields
+                .next()
+                .ok_or_else(|| bad("AAAA needs an IPv6 address".into()))?;
+            let ip: std::net::Ipv6Addr = ip
+                .parse()
+                .map_err(|_| bad(format!("'{ip}' is not an IPv6 address")))?;
+            Ok(scone_core::RecordData::Aaaa(ip))
+        }
+        "CNAME" | "NS" => {
+            let raw = fields
+                .next()
+                .ok_or_else(|| bad("needs a domain name".into()))?;
+            let name = DomainName::new(raw).map_err(|e| bad(format!("'{raw}': {e}")))?;
+            if kind.eq_ignore_ascii_case("CNAME") {
+                Ok(scone_core::RecordData::Cname(name))
+            } else {
+                Ok(scone_core::RecordData::Ns(name))
+            }
+        }
+        "MX" => {
+            let pref = fields
+                .next()
+                .ok_or_else(|| bad("MX needs a preference".into()))?;
+            let pref: u16 = pref
+                .parse()
+                .map_err(|_| bad(format!("'{pref}' is not a u16 preference")))?;
+            let raw = fields
+                .next()
+                .ok_or_else(|| bad("MX needs an exchange domain name".into()))?;
+            let exchange = DomainName::new(raw).map_err(|e| bad(format!("'{raw}': {e}")))?;
+            Ok(scone_core::RecordData::Mx {
+                preference: pref,
+                exchange,
+            })
+        }
+        "TXT" => {
+            // Free-form: everything after the keyword, whitespace
+            // collapsed to a single space (canonical form).
+            let text = line
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            Ok(scone_core::RecordData::Txt(text))
+        }
+        other => Err(bad(format!("unknown record type '{other}'"))),
+    }
+}
+
+/// Reads and parses a DNS record file (M5): one record per line,
+/// `#` comments, blank lines skipped. The file is the COMPLETE new
+/// record set (updates replace, they do not merge).
+fn read_record_file(path: &Path) -> Result<Vec<scone_core::RecordData>, CliError> {
+    let text = std::fs::read_to_string(path).map_err(CliError::FileRead)?;
+    let mut records = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        records.push(parse_record_line(index + 1, line)?);
+    }
+    if records.is_empty() {
+        return Err(CliError::BadRecordFile(
+            "no records (empty set is invalid)".into(),
+        ));
+    }
+    if records.len() > scone_protocol::limits::MAX_RECORDS_PER_SET {
+        return Err(CliError::BadRecordFile(format!(
+            "too many records (max {})",
+            scone_protocol::limits::MAX_RECORDS_PER_SET
+        )));
+    }
+    // Duplicate entries would be rejected by the canonical encoder;
+    // fail here with a file-oriented message instead.
+    let mut canonical = Vec::with_capacity(records.len());
+    for record in &records {
+        let encoded =
+            scone_protocol::encode_to_vec(record).map_err(CliError::MalformedTransaction)?;
+        canonical.push(encoded);
+    }
+    canonical.sort();
+    if canonical.windows(2).any(|w| w[0] == w[1]) {
+        return Err(CliError::BadRecordFile("duplicate record".into()));
+    }
+    Ok(records)
+}
+
+/// Dispatches `scone domain …` (M5).
+fn run_domain(command: DomainCommand) -> Result<Vec<String>, CliError> {
+    match command {
+        DomainCommand::Register {
+            name,
+            identity,
+            dir,
+            passphrase_env,
+            rpc,
+        } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let client = rpc_client(rpc.as_deref())?;
+            // Fail fast on a taken name (the relay re-checks).
+            let info = rpc_json(
+                &client,
+                scone_network::RpcRequest::Lookup { name: name.clone() },
+            )?;
+            if info["registered"].as_bool() == Some(true) {
+                return Err(CliError::DomainState(format!(
+                    "domain '{}' is already registered",
+                    domain.canonical()
+                )));
+            }
+            let sk = open_identity(&identity, dir.as_deref(), passphrase_env.as_deref())?;
+            let tx = signed_register_tx(&sk, &domain, unix_now())?;
+            let hex_string = tx_hex(&tx)?;
+            let submitted = rpc_json(
+                &client,
+                scone_network::RpcRequest::SubmitTx { tx_hex: hex_string },
+            )?;
+            let txid = submitted["txid"].as_str().unwrap_or("?").to_string();
+            let confirmed = wait_for_sequence(&client, &name, 0, "registration")?;
+            Ok(vec![
+                format!(
+                    "registering {} (owner {})",
+                    domain.canonical(),
+                    hex_lower(owner_id_of(&sk).as_bytes())
+                ),
+                format!("txid: {txid}"),
+                format!(
+                    "confirmed: height {}, sequence {}",
+                    confirmed["height"], confirmed["sequence"]
+                ),
+            ])
+        }
+        DomainCommand::Update {
+            name,
+            file,
+            identity,
+            dir,
+            passphrase_env,
+            rpc,
+        } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let records = read_record_file(&file)?;
+            let client = rpc_client(rpc.as_deref())?;
+
+            let info = rpc_json(
+                &client,
+                scone_network::RpcRequest::Lookup { name: name.clone() },
+            )?;
+            if info["registered"].as_bool() != Some(true) {
+                return Err(CliError::DomainState(format!(
+                    "domain '{}' is not registered — register it first",
+                    domain.canonical()
+                )));
+            }
+            let current = info["sequence"].as_u64().ok_or_else(|| {
+                CliError::RelayError("relay returned no sequence for a registered domain".into())
+            })?;
+            let Some(next) = current.checked_add(1) else {
+                return Err(CliError::DomainState(
+                    "domain sequence exhausted (u64::MAX)".into(),
+                ));
+            };
+
+            let sk = open_identity(&identity, dir.as_deref(), passphrase_env.as_deref())?;
+            // Client-side ownership check (the relay enforces it too).
+            let owner = hex_lower(owner_id_of(&sk).as_bytes());
+            if info["owner"].as_str() != Some(owner.as_str()) {
+                return Err(CliError::DomainState(format!(
+                    "identity '{identity}' is not the owner of '{}'",
+                    domain.canonical()
+                )));
+            }
+
+            // The record file is the single source of truth: the hash
+            // committed on-chain is derived from THESE records at the
+            // NEXT sequence — signer and verifier agree by construction.
+            let dns = scone_core::DnsRecord {
+                domain_id: DomainId::from_name(&domain),
+                sequence: next,
+                expiration: 0,
+                records,
+            };
+            let record_hash = scone_protocol::record_hash(&dns);
+
+            let tx = signed_update_tx(&sk, &domain, next, record_hash)?;
+            let hex_string = tx_hex(&tx)?;
+            let submitted = rpc_json(
+                &client,
+                scone_network::RpcRequest::SubmitTx { tx_hex: hex_string },
+            )?;
+            let txid = submitted["txid"].as_str().unwrap_or("?").to_string();
+
+            // Wait until the chain carries the new sequence, then
+            // publish the signed record (put_record verifies against
+            // the chain state — publishing earlier would be rejected).
+            wait_for_sequence(&client, &name, next, "update confirmation")?;
+            let canonical =
+                scone_protocol::encode_to_vec(&dns).map_err(CliError::MalformedTransaction)?;
+            let signed = scone_core::SignedDnsRecord {
+                record: dns,
+                owner: owner_id_of(&sk),
+                signature: scone_core::Signature::from_bytes(
+                    sk.sign(&canonical).to_bytes().to_vec(),
+                ),
+            };
+            let record_hex = hex_lower(
+                &scone_protocol::encode_to_vec(&signed).map_err(CliError::MalformedTransaction)?,
+            );
+            rpc_json(&client, scone_network::RpcRequest::PutRecord { record_hex })?;
+            Ok(vec![
+                format!("updating {} → sequence {next}", domain.canonical()),
+                format!("txid: {txid}"),
+                format!("record hash: {}", hex_lower(record_hash.as_bytes())),
+                "record published in the DHT".to_string(),
+            ])
+        }
+        DomainCommand::Info { name, rpc } => {
+            let client = rpc_client(rpc.as_deref())?;
+            let info = rpc_json(&client, scone_network::RpcRequest::DomainInfo { name })?;
+            let get = |key: &str| info[key].as_str().unwrap_or("-").to_string();
+            let mut lines = vec![
+                format!("name: {}", get("name")),
+                format!("domain_id: {}", get("domain_id")),
+                format!(
+                    "registered: {}",
+                    info["registered"].as_bool().unwrap_or(false)
+                ),
+            ];
+            if info["registered"].as_bool() == Some(true) {
+                lines.push(format!("owner: {}", get("owner")));
+                lines.push(format!(
+                    "sequence: {}",
+                    info["sequence"].as_u64().unwrap_or(0)
+                ));
+                lines.push(format!(
+                    "record_hash: {}",
+                    info["record_hash"].as_str().unwrap_or("(none)")
+                ));
+                lines.push("dns:".to_string());
+                let dns = info["dns"].as_array().cloned().unwrap_or_default();
+                if dns.is_empty() {
+                    lines.push("  (no chain-valid record cached locally)".to_string());
+                }
+                for entry in dns {
+                    let kind = entry["type"].as_str().unwrap_or("?");
+                    let value = entry["value"].as_str().unwrap_or("");
+                    if let Some(pref) = entry["preference"].as_u64() {
+                        lines.push(format!("  {kind} {pref} {value}"));
+                    } else {
+                        lines.push(format!("  {kind} {value}"));
+                    }
+                }
+            }
+            Ok(lines)
+        }
+    }
 }
 
 /// Runs `scone record put|get …`.
@@ -1379,5 +1869,141 @@ mod tests {
         ]))
         .expect_err("short hash must fail");
         assert!(matches!(err, CliError::InvalidHashLength(4)));
+    }
+
+    // ---- M5: record file parser ------------------------------------
+
+    #[test]
+    fn record_file_parses_all_supported_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(
+            &file,
+            "# comment\n\nA 192.0.2.1\naaaa 2001:db8::1\ncname www.example.uip\nns ns1.example.uip\nmx 10 mail.example.uip\ntxt   spaced   out   text\n",
+        )
+        .expect("write");
+        let records = read_record_file(&file).expect("parses");
+        assert_eq!(records.len(), 6);
+        assert_eq!(
+            records[0],
+            scone_core::RecordData::A("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            records[1],
+            scone_core::RecordData::Aaaa("2001:db8::1".parse().unwrap())
+        );
+        assert!(matches!(&records[5], scone_core::RecordData::Txt(t) if t == "spaced out text"));
+    }
+
+    #[test]
+    fn record_file_rejects_unknown_type_with_line_number() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(&file, "A 192.0.2.1\nBOGUS x\n").expect("write");
+        let err = read_record_file(&file).expect_err("must fail");
+        assert!(
+            matches!(err, CliError::BadRecordFile(ref m) if m.contains("line 2") && m.contains("BOGUS")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn record_file_rejects_bad_ip_and_bad_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(&file, "A not-an-ip\n").expect("write");
+        assert!(matches!(
+            read_record_file(&file),
+            Err(CliError::BadRecordFile(_))
+        ));
+        std::fs::write(&file, "CNAME UPPER.uip\n").expect("write");
+        assert!(matches!(
+            read_record_file(&file),
+            Err(CliError::BadRecordFile(_))
+        ));
+    }
+
+    #[test]
+    fn record_file_rejects_empty_and_duplicate_sets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(&file, "# only comments\n").expect("write");
+        let err = read_record_file(&file).expect_err("must fail");
+        assert!(
+            matches!(&err, CliError::BadRecordFile(m) if m.contains("empty")),
+            "{err}"
+        );
+        std::fs::write(&file, "A 192.0.2.1\nA 192.0.2.1\n").expect("write");
+        let err = read_record_file(&file).expect_err("must fail");
+        assert!(
+            matches!(&err, CliError::BadRecordFile(m) if m.contains("duplicate")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn record_file_missing_file_is_a_clean_error() {
+        let err = read_record_file(Path::new("/nonexistent/records.txt")).expect_err("must fail");
+        assert!(matches!(err, CliError::FileRead(_)));
+    }
+
+    #[test]
+    fn record_file_records_roundtrip_through_canonical_encoding() {
+        // What the parser produces must be encodable as a DnsRecord:
+        // this is the exact type `domain update` hashes and publishes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(
+            &file,
+            "A 192.0.2.1\nTXT integration check\nMX 10 mail.example.uip\n",
+        )
+        .expect("write");
+        let records = read_record_file(&file).expect("parses");
+        let dns = scone_core::DnsRecord {
+            domain_id: DomainId::from_name(&DomainName::new("example.uip").unwrap()),
+            sequence: 1,
+            expiration: 0,
+            records,
+        };
+        let encoded = scone_protocol::encode_to_vec(&dns).expect("canonical encode");
+        let decoded: scone_core::DnsRecord =
+            scone_protocol::decode_complete(&encoded).expect("canonical decode");
+        // The struct keeps file order while the wire is canonically
+        // sorted: compare encodings, and check the re-encode is stable.
+        assert_eq!(
+            scone_protocol::encode_to_vec(&decoded).expect("re-encode"),
+            encoded,
+            "canonical round trip"
+        );
+        // The record hash over the parsed file is stable (the wire
+        // order is canonical regardless of file order).
+        std::fs::write(
+            &file,
+            "MX 10 mail.example.uip\nTXT integration check\nA 192.0.2.1\n",
+        )
+        .expect("rewrite permuted");
+        let permuted = scone_core::DnsRecord {
+            records: read_record_file(&file).expect("parses"),
+            ..dns.clone()
+        };
+        assert_eq!(
+            scone_protocol::record_hash(&dns),
+            scone_protocol::record_hash(&permuted),
+            "file order must not change the committed hash"
+        );
+    }
+
+    #[test]
+    fn domain_info_of_offline_relay_is_unreachable() {
+        // No relay on this port: the typed "relay not running" error.
+        let err = run(cli(&[
+            "domain",
+            "info",
+            "example.uip",
+            "--rpc",
+            "127.0.0.1:1",
+        ]))
+        .expect_err("unreachable");
+        assert!(matches!(err, CliError::RelayUnreachable(_)));
     }
 }

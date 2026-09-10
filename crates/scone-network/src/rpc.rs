@@ -1,7 +1,7 @@
 //! Local control RPC: a length-bounded frame protocol carrying JSON
 //! requests over a localhost TCP socket. This is the surface the
 //! `scone` CLI talks to (`status`, `submit_tx`, `lookup`,
-//! `put_record`, `get_record`).
+//! `put_record`, `get_record`, `domain_info`).
 //!
 //! Wire format (both directions): `len: u32 BE || UTF-8 JSON || '\n'`,
 //! one request per connection (connection-per-command keeps the
@@ -44,6 +44,10 @@ pub enum RpcRequest {
     PutRecord { record_hex: String },
     /// Resolve a record from the DHT and verify it against the chain.
     GetRecord { name: String },
+    /// Rich exploration of a domain (M5): on-chain state plus, when
+    /// a chain-valid record is locally cached, its decoded DNS
+    /// records. Never hits the network.
+    DomainInfo { name: String },
 }
 
 /// Control response returned to the CLI.

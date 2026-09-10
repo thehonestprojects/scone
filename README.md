@@ -49,7 +49,7 @@ Documentation détaillée : [`docs/architecture.md`](docs/architecture.md),
 
 ## Status
 
-Early development — **Jalon M4 (relay réseau) atteint**.
+Early development — **Jalon M5 (exploration réseau riche et CLI signé) atteint**.
 
 En place :
 
@@ -78,10 +78,16 @@ En place :
   QUIC, identify, ping, Kademlia (records DNS signés), sync de blocs
   bornée, mempool, production devnet, RPC de contrôle local. Voir
   [`docs/development/relay.md`](docs/development/relay.md).
+- **Exploration riche + CLI signé** (M5) : RPC `domain_info`
+  (état on-chain + records DNS vérifiés en lecture locale), commandes
+  `scone domain register|update` (build → sign → submit →
+  confirmation en une invocation ; le fichier de records est
+  l'unique source de vérité : séquence et record hash dérivés), et
+  tests e2e multi-nœuds pilotant le **binaire réel**.
 - **CLI** (`scone`) : `scone show <name>`, `scone identity …`,
-  `scone tx build/sign/verify`, **`scone relay`** (daemon) et
-  **`scone status / submit tx / lookup / record put|get`** (parlent
-  au RPC du relay).
+  `scone tx build/sign/verify`, `scone relay` (daemon),
+  `scone status / lookup / domain register|update|info /
+  submit tx / record put|get` (parlent au RPC du relay).
 
 Non implémentés : PoW/consensus réel, serveur DNS, gouvernance des
 forks, identité réseau persistante du relay.
@@ -92,15 +98,22 @@ forks, identité réseau persistante du relay.
 # Terminal 1 — le nœud
 scone relay --data-dir /tmp/node-a
 
-# Terminal 2 — enregistrer un nom
+# Terminal 2 — enregistrer un nom et publier ses records
 scone identity generate --name alice
-scone tx build register --name example.uip | tail -1   # payload à signer
-scone tx sign <payload> --identity alice | tail -1      # hex de la tx signée
-scone submit tx --hex <tx-hex>
-sleep 2                                                  # production devnet
-scone status                                             # height: 1
-scone lookup example.uip
+scone domain register example.uip --identity alice
+
+printf 'A 192.0.2.1\nTXT hello scone\n' > /tmp/records.txt
+scone domain update example.uip --file /tmp/records.txt --identity alice
+
+# Explorer
+scone domain info example.uip     # état on-chain + records DNS
+scone lookup example.uip          # état on-chain seul
 ```
+
+Deux nœuds sur une machine : `scone relay --rpc 127.0.0.1:7475
+--data-dir /tmp/node-b --bootstrap <addr-p2p-de-A>` (le relay
+affiche son adresse p2p au démarrage), puis ajoutez `--rpc
+127.0.0.1:7475` aux commandes ci-dessus pour parler au nœud B.
 
 ## Développement
 
