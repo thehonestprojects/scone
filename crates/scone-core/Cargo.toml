@@ -1,0 +1,8 @@
+[package]
+name = "scone-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scone-crypto.workspace = true
+thiserror.workspace = true

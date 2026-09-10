@@ -1,0 +1,10 @@
+[package]
+name = "scone-blockchain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scone-core.workspace = true
+scone-crypto.workspace = true
+scone-protocol.workspace = true
+thiserror.workspace = true

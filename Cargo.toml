@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/scone",
+    "crates/scone-blockchain",
+    "crates/scone-core",
+    "crates/scone-crypto",
+    "crates/scone-protocol",
+    "crates/scone-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+blake3 = "1"
+thiserror = "2"
+scone-blockchain = { path = "crates/scone-blockchain" }
+scone-crypto = { path = "crates/scone-crypto" }
+scone-core = { path = "crates/scone-core" }
+scone-protocol = { path = "crates/scone-protocol" }
