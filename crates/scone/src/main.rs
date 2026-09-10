@@ -1162,11 +1162,28 @@ fn wait_for_sequence(
 /// Supported forms (M5): `A <ipv4>`, `AAAA <ipv6>`, `CNAME <name>`,
 /// `NS <name>`, `MX <preference> <name>`, `TXT <free text>`. Empty
 /// lines and `#` comments are skipped.
+///
+/// M5 fix-up (F3): the parser is STRICT. A line with trailing fields
+/// after a fixed-arity record (`A 1.2.3.4 extra`) is an error, not a
+/// silently-truncated record — a typo'd file must never commit a
+/// half-parsed record set on-chain. An empty TXT is rejected too
+/// (it cannot round-trip the canonical format, which delimits the
+/// text by length).
 fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordData, CliError> {
     let bad = |msg: String| CliError::BadRecordFile(format!("line {line_no}: {msg}"));
     let mut fields = line.split_ascii_whitespace();
     let Some(kind) = fields.next() else {
         return Err(bad("empty line".into()));
+    };
+    // After a fixed-arity record, nothing may remain on the line.
+    let no_trailing = |fields: &mut std::str::SplitAsciiWhitespace<'_>| {
+        if fields.next().is_some() {
+            Err(bad(format!(
+                "{kind} record has trailing fields — one record per line"
+            )))
+        } else {
+            Ok(())
+        }
     };
     match kind.to_ascii_uppercase().as_str() {
         "A" => {
@@ -1176,6 +1193,7 @@ fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordDat
             let ip: std::net::Ipv4Addr = ip
                 .parse()
                 .map_err(|_| bad(format!("'{ip}' is not an IPv4 address")))?;
+            no_trailing(&mut fields)?;
             Ok(scone_core::RecordData::A(ip))
         }
         "AAAA" => {
@@ -1185,6 +1203,7 @@ fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordDat
             let ip: std::net::Ipv6Addr = ip
                 .parse()
                 .map_err(|_| bad(format!("'{ip}' is not an IPv6 address")))?;
+            no_trailing(&mut fields)?;
             Ok(scone_core::RecordData::Aaaa(ip))
         }
         "CNAME" | "NS" => {
@@ -1192,6 +1211,7 @@ fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordDat
                 .next()
                 .ok_or_else(|| bad("needs a domain name".into()))?;
             let name = DomainName::new(raw).map_err(|e| bad(format!("'{raw}': {e}")))?;
+            no_trailing(&mut fields)?;
             if kind.eq_ignore_ascii_case("CNAME") {
                 Ok(scone_core::RecordData::Cname(name))
             } else {
@@ -1209,6 +1229,7 @@ fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordDat
                 .next()
                 .ok_or_else(|| bad("MX needs an exchange domain name".into()))?;
             let exchange = DomainName::new(raw).map_err(|e| bad(format!("'{raw}': {e}")))?;
+            no_trailing(&mut fields)?;
             Ok(scone_core::RecordData::Mx {
                 preference: pref,
                 exchange,
@@ -1221,6 +1242,9 @@ fn parse_record_line(line_no: usize, line: &str) -> Result<scone_core::RecordDat
                 .split_once(char::is_whitespace)
                 .map(|(_, rest)| rest.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
+            if text.is_empty() {
+                return Err(bad("TXT needs a non-empty text value".into()));
+            }
             Ok(scone_core::RecordData::Txt(text))
         }
         other => Err(bad(format!("unknown record type '{other}'"))),
@@ -1298,6 +1322,19 @@ fn run_domain(command: DomainCommand) -> Result<Vec<String>, CliError> {
             )?;
             let txid = submitted["txid"].as_str().unwrap_or("?").to_string();
             let confirmed = wait_for_sequence(&client, &name, 0, "registration")?;
+            // M5 fix-up (F2): the confirmed owner MUST be the one this
+            // command signed with. Between the fail-fast precheck and
+            // the confirmation, another racer's Register can land
+            // first; our own tx then gets evicted from the mempool.
+            // Reporting success here would be a lie — the domain
+            // belongs to someone else.
+            let owner = hex_lower(owner_id_of(&sk).as_bytes());
+            if confirmed["owner"].as_str() != Some(owner.as_str()) {
+                return Err(CliError::DomainState(format!(
+                    "domain '{}' was registered by a different owner (lost the race)",
+                    domain.canonical()
+                )));
+            }
             Ok(vec![
                 format!(
                     "registering {} (owner {})",
@@ -1387,7 +1424,17 @@ fn run_domain(command: DomainCommand) -> Result<Vec<String>, CliError> {
             let record_hex = hex_lower(
                 &scone_protocol::encode_to_vec(&signed).map_err(CliError::MalformedTransaction)?,
             );
-            rpc_json(&client, scone_network::RpcRequest::PutRecord { record_hex })?;
+            let published = rpc_json(&client, scone_network::RpcRequest::PutRecord { record_hex })?;
+            // M5 fix-up (F4): the publication must concern THE
+            // requested domain. The relay echoes the DomainId of the
+            // record it verified and stored; anything else (relay
+            // bug, mismatched answer) is reported, never assumed.
+            let expected_id = format!("{}", DomainId::from_name(&domain));
+            if published["published"].as_str() != Some(expected_id.as_str()) {
+                return Err(CliError::RelayError(format!(
+                    "record published for the wrong domain (expected {expected_id})"
+                )));
+            }
             Ok(vec![
                 format!("updating {} → sequence {next}", domain.canonical()),
                 format!("txid: {txid}"),
@@ -1921,6 +1968,63 @@ mod tests {
             read_record_file(&file),
             Err(CliError::BadRecordFile(_))
         ));
+    }
+
+    // ---- M5 fix-up F3: strict parser ----------------------------------
+
+    #[test]
+    fn record_file_rejects_trailing_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        for bad in [
+            "A 192.0.2.1 extra",
+            "AAAA 2001:db8::1 192.0.2.1",
+            "CNAME www.example.uip trailing",
+            "NS ns1.example.uip trailing",
+            "MX 10 mail.example.uip trailing",
+        ] {
+            std::fs::write(&file, bad).expect("write");
+            let err = match read_record_file(&file) {
+                Ok(_) => panic!("'{bad}' must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(&err, CliError::BadRecordFile(m) if m.contains("trailing")),
+                "'{bad}' → {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_file_rejects_empty_txt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(&file, "TXT\n").expect("write");
+        let err = read_record_file(&file).expect_err("empty TXT must fail");
+        assert!(
+            matches!(&err, CliError::BadRecordFile(m) if m.contains("non-empty")),
+            "{err}"
+        );
+        // A TXT of only whitespace collapses to empty: rejected too.
+        std::fs::write(&file, "TXT   \t  \n").expect("write");
+        assert!(matches!(
+            read_record_file(&file),
+            Err(CliError::BadRecordFile(_))
+        ));
+    }
+
+    #[test]
+    fn record_file_accepts_exact_arity_lines() {
+        // Each well-formed line parses even after the strictness fix.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("records.txt");
+        std::fs::write(
+            &file,
+            "A 192.0.2.1\nAAAA 2001:db8::1\nCNAME www.example.uip\nNS ns1.example.uip\nMX 10 mail.example.uip\nTXT one two  three\n",
+        )
+        .expect("write");
+        let records = read_record_file(&file).expect("parses");
+        assert_eq!(records.len(), 6);
     }
 
     #[test]

@@ -909,22 +909,88 @@ impl Relay {
         }
     }
 
-    /// Devnet production: mempool non-empty → build and accept a
-    /// block (timestamp = now; permissive consensus applies).
+    /// Devnet production: mempool non-empty → assemble a block the
+    /// canonical chain ACCEPTS, then treat it exactly like a received
+    /// block (store + broadcast).
+    ///
+    /// M5 fix-up (F1, crash prouvé par
+    /// `concurrent_registers_never_kill_the_producer`): production is
+    /// resilient. Two racers for one name both pass the admit-time
+    /// precheck and sit in the mempool; a block containing both is
+    /// rejected WHOLE by `push_block` (`DomainAlreadyRegistered`) —
+    /// propagating that error killed the relay. Instead:
+    ///
+    /// 1. transactions gone stale w.r.t. the CURRENT state are
+    ///    evicted (a stale Register/Update can never become valid
+    ///    again — the state only moves forward);
+    /// 2. the candidate list shrinks from the end while the chain
+    ///    rejects the block (intra-block conflict), the conflicting
+    ///    transaction is dropped with a log — never fatal.
+    ///
+    /// Every candidate passes the precheck alone, so a one-transaction
+    /// block always applies and both loops terminate. Only genuinely
+    /// local failures (builder, store) still propagate out of `run`.
     fn produce_if_ready(&mut self) -> Result<()> {
-        if self.mempool.is_empty() {
-            return Ok(());
+        while !self.mempool.is_empty() {
+            // 1. Drain one block's worth (bounded).
+            let drained = self
+                .mempool
+                .drain_up_to(scone_protocol::limits::MAX_TXS_PER_BLOCK);
+            // 2. Evict stale transactions (state moved since admit).
+            let mut candidates: Vec<Transaction> = Vec::with_capacity(drained.len());
+            for tx in drained {
+                match self.precheck_state(&tx) {
+                    Ok(()) => candidates.push(tx),
+                    Err(e) => {
+                        eprintln!("scone-relay: evicted stale tx from the mempool: {e}");
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                // Nothing buildable in this batch; the mempool may
+                // still hold more (it shrank: the stale ones are gone).
+                continue;
+            }
+            // 3. Greedy assembly: full list first, shrink from the
+            //    end on rejection. Bounded by the candidate count.
+            while !candidates.is_empty() {
+                let block = {
+                    let mut builder =
+                        BlockBuilder::after(self.chain.height(), self.chain.tip_hash())
+                            .with_timestamp(unix_now());
+                    for tx in &candidates {
+                        builder.push_tx(tx.clone())?;
+                    }
+                    builder.build()?
+                };
+                match self.chain.push_block(&block) {
+                    Ok(hash) => {
+                        // Same treatment as accept_block, minus the
+                        // now-redundant re-validation: the block was
+                        // just pushed; store it and relay it.
+                        store_integration::store_block(&mut self.store, &self.chain, &block, hash)?;
+                        eprintln!(
+                            "scone-relay: produced block {} (height {}, {} txs)",
+                            hex(hash.as_bytes()),
+                            block.header.height,
+                            block.transactions.len(),
+                        );
+                        let message = Message::Block(Box::new(block));
+                        for peer in &self.peers {
+                            self.swarm
+                                .behaviour_mut()
+                                .reqres
+                                .send_request(peer, message.clone());
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        candidates.pop();
+                        eprintln!("scone-relay: dropped conflicting tx from block production: {e}");
+                    }
+                }
+            }
         }
-        let txs = self
-            .mempool
-            .drain_up_to(scone_protocol::limits::MAX_TXS_PER_BLOCK);
-        let mut builder = BlockBuilder::after(self.chain.height(), self.chain.tip_hash())
-            .with_timestamp(unix_now());
-        for tx in txs {
-            builder.push_tx(tx)?;
-        }
-        let block = builder.build()?;
-        self.accept_block(block, None)?;
         Ok(())
     }
 

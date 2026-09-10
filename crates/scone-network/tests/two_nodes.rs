@@ -223,7 +223,82 @@ async fn two_nodes_sync_blocks_and_records() {
     assert_eq!(resolved_record, record, "round-tripped record");
 }
 
+/// M5 fix-up, F1 (crash prouvé) : deux `Register` concurrents pour le
+/// même nom — le second mis en mempool avant que le premier ne soit
+/// miné — ne doivent JAMAIS tuer le producteur. Avant le correctif,
+/// `push_block` rejetait le bloc entier (`DomainAlreadyRegistered`)
+/// et `produce_if_ready` propageait l'erreur hors de `run()` : mort
+/// du relay. Le relay doit rester vivant, extraire le bloc à hauteur
+/// 1 (gagnant = premier tx miné) et laisser le perdant au mempool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_registers_never_kill_the_producer() {
+    let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpc_port = free_port().await;
+    let mut config = Config::new(dir.path().to_path_buf());
+    // Long interval: both transactions sit in the mempool at the same
+    // production tick (precheck accepts both against the genesis
+    // state), which is exactly the crash window.
+    config.produce_interval = Duration::from_secs(3);
+    config.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port));
+    let relay = Relay::new(config).expect("relay init");
+    tokio::spawn(async move {
+        if let Err(e) = relay.run().await {
+            eprintln!("relay ended: {e}");
+        }
+    });
+
+    let client = wait_rpc(rpc_port, deadline).await;
+
+    // Two DIFFERENT owners race for the same name; both pass the
+    // precheck while the domain is still free.
+    let winner = SigningKey::from_bytes([0x11; 32]);
+    let loser = SigningKey::from_bytes([0x22; 32]);
+    let name = "race.uip";
+    for sk in [&winner, &loser] {
+        let tx_hex = hex(&encode_to_vec(&register_tx_sk(sk, name)).expect("encode tx"));
+        let response = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
+        assert!(response["txid"].is_string(), "{response}");
+    }
+
+    // Height 1 gets mined with EXACTLY one of the two (the block must
+    // apply cleanly); the relay stays alive and keeps answering. The
+    // loser is either still pooled or already evicted by a later
+    // production tick (both are non-fatal outcomes).
+    let status = wait_for_height(&client, 1, deadline).await;
+    assert_eq!(status["domain_count"], 1, "{status}");
+    assert!(
+        status["mempool"].as_u64().is_some_and(|m| m <= 1),
+        "loser pooled or evicted, never fatal: {status}"
+    );
+
+    // The on-chain owner is one of the two racers, with a valid hex id.
+    let lookup = request(&client, RpcRequest::Lookup { name: name.into() }, deadline).await;
+    assert_eq!(lookup["registered"], true, "{lookup}");
+    let owner = lookup["owner"].as_str().expect("owner hex");
+    assert_eq!(owner.len(), 64);
+    assert!(
+        owner == hex(owner_of(&winner).as_bytes()) || owner == hex(owner_of(&loser).as_bytes()),
+        "owner must be one of the racers: {lookup}"
+    );
+
+    // The relay must still work afterwards: a fresh register of a
+    // DIFFERENT name goes through (height 2, still alive).
+    let third = SigningKey::from_bytes([0x33; 32]);
+    let tx_hex = hex(&encode_to_vec(&register_tx_sk(&third, "after.uip")).expect("encode"));
+    let response = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
+    assert!(response["txid"].is_string(), "{response}");
+    let status = wait_for_height(&client, 2, deadline).await;
+    assert_eq!(status["domain_count"], 2, "{status}");
+}
+
 // ---- helpers ---------------------------------------------------------
+
+/// Signs an arbitrary register with the given key (race test).
+fn register_tx_sk(sk: &SigningKey, name: &str) -> Transaction {
+    register_tx(sk, name)
+}
 
 async fn request(
     client: &RpcClient,
