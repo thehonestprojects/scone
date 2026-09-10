@@ -1,15 +1,15 @@
 [package]
-name = "scone"
+name = "scone-keystore"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-scone-core.workspace = true
 scone-crypto.workspace = true
-scone-keystore.workspace = true
-clap.workspace = true
-rpassword.workspace = true
+thiserror.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
 zeroize = { version = "1.8", features = ["derive"] }
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

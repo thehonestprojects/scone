@@ -13,13 +13,20 @@
 //! ## Current API
 //!
 //! - [`hash256`]: BLAKE3-256, used for `DomainId` and record hashes.
+//! - [`keys`]: Ed25519 signing keys, public keys and signatures
+//!   (RFC 8032), with `verify_strict` semantics for untrusted data.
 //!
 //! ## Planned API (not implemented yet)
 //!
-//! - signatures: Ed25519 over canonical records/transactions
-//! - public/private key types and derivation
 //! - registration proof of work
 //! - Merkle trees for block commitments
+
+pub mod keys;
+
+pub use keys::{
+    InvalidKeyError, PUBLIC_KEY_SIZE, PublicKey, SIGNATURE_SIZE, SIGNING_KEY_SIZE, Signature,
+    SigningKey,
+};
 
 /// Hashes the concatenation of `parts` with BLAKE3 and returns the 32-byte
 /// digest.
