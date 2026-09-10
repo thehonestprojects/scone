@@ -1,0 +1,24 @@
+[package]
+name = "scone-network"
+description = "P2P relay of Scone: libp2p swarm, block sync, Kademlia record store and local control RPC"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+scone-blockchain = { workspace = true }
+scone-core = { workspace = true }
+scone-crypto = { workspace = true }
+scone-keystore = { workspace = true }
+scone-protocol = { workspace = true }
+scone-storage = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

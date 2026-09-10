@@ -367,3 +367,150 @@ fn identity_generate_creates_keyfile_with_0600_permissions() {
         .mode();
     assert_eq!(mode & 0o777, 0o600, "keyfile must be 0600, got {mode:o}");
 }
+
+// ---- relay / rpc commands -------------------------------------------
+
+/// A port that is (almost certainly) closed: bind + drop.
+fn closed_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind probe")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+#[test]
+fn status_without_relay_is_a_clear_error() {
+    let port = closed_port();
+    let out = scone()
+        .args(["status", "--rpc", &format!("127.0.0.1:{port}")])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("cannot reach the relay") && stderr.contains("scone relay"),
+        "stderr must point at the missing relay: {stderr}"
+    );
+}
+
+#[test]
+fn submit_without_relay_is_a_clear_error() {
+    let port = closed_port();
+    let out = scone()
+        .args([
+            "submit",
+            "tx",
+            "--hex",
+            "00",
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("cannot reach the relay"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn lookup_without_relay_is_a_clear_error() {
+    let port = closed_port();
+    let out = scone()
+        .args([
+            "lookup",
+            "example.uip",
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .expect("stderr")
+            .contains("cannot reach the relay")
+    );
+}
+
+#[test]
+fn record_get_without_relay_is_a_clear_error() {
+    let port = closed_port();
+    let out = scone()
+        .args([
+            "record",
+            "get",
+            "example.uip",
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .expect("stderr")
+            .contains("cannot reach the relay")
+    );
+}
+
+#[test]
+fn invalid_rpc_address_is_rejected_before_dialing() {
+    let out = scone()
+        .args(["status", "--rpc", "not-an-addr"])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .expect("stderr")
+            .contains("invalid rpc address")
+    );
+}
+
+#[test]
+fn record_put_reads_the_file_or_fails_cleanly() {
+    let port = closed_port();
+    let out = scone()
+        .args([
+            "record",
+            "put",
+            "example.uip",
+            "--file",
+            "/nonexistent/record.hex",
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .expect("stderr")
+            .contains("cannot read file")
+    );
+}
+
+#[test]
+fn relay_rejects_a_bad_bootstrap_multiaddr() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let out = scone()
+        .args([
+            "relay",
+            "--data-dir",
+            home.path().to_str().expect("utf-8 path"),
+            "--bootstrap",
+            "not-a-multiaddr",
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .expect("stderr")
+            .contains("multiaddr")
+    );
+}

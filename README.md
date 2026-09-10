@@ -39,16 +39,17 @@ données DNS elles-mêmes sont servies depuis une DHT par des nœuds pairs.
 | `scone-crypto` | Primitives cryptographiques (hash BLAKE3, clés/signatures Ed25519 RFC 8032) |
 | `scone-protocol` | Format binaire canonique wire/blockchain : encodage/décodage des transactions, records DNS, blocs et messages P2P |
 | `scone-blockchain` | Logique de chaîne et état canonique en RAM (validation des transactions, Merkle, chaîne de blocs) |
-| `scone-storage` | Abstraction stockage local (backend redb à venir) |
+| `scone-storage` | Persistance locale (trait `NodeStore` + backend redb) |
 | `scone-keystore` | Clés Ed25519 chiffrées sur disque (Argon2id + XChaCha20-Poly1305) |
-| `scone` | Binaire / CLI (`scone show`, `scone identity …`, `scone tx build/sign/verify`) |
+| `scone-network` | Relay P2P libp2p (swarm QUIC, sync blocs, DHT Kademlia, RPC de contrôle) |
+| `scone` | Binaire / CLI (`scone relay/status/submit/lookup/record`, `scone identity …`, `scone tx build/sign/verify`) |
 
 Documentation détaillée : [`docs/architecture.md`](docs/architecture.md),
 [`docs/protocol.md`](docs/protocol.md), [`docs/naming.md`](docs/naming.md).
 
 ## Status
 
-Early development — **Jalon M2 (transactions signées) atteint**.
+Early development — **Jalon M4 (relay réseau) atteint**.
 
 En place :
 
@@ -70,12 +71,36 @@ En place :
 - **Keystore chiffré** (`scone-keystore`) : keyfiles `.sconekey`
   (Argon2id + XChaCha20-Poly1305), voir
   [`docs/development/keystore.md`](docs/development/keystore.md).
+- **Stockage persistant** (`scone-storage`, M3) : trait `NodeStore` +
+  backend redb (appends delta atomiques, états paginés), voir
+  [`docs/development/storage.md`](docs/development/storage.md).
+- **Relay réseau** (`scone-network`, M4) : nœud libp2p complet —
+  QUIC, identify, ping, Kademlia (records DNS signés), sync de blocs
+  bornée, mempool, production devnet, RPC de contrôle local. Voir
+  [`docs/development/relay.md`](docs/development/relay.md).
 - **CLI** (`scone`) : `scone show <name>`, `scone identity …`,
-  **`scone tx build/sign/verify`** (hors-ligne, pour tests et debug),
-  voir [`docs/transactions.md`](docs/transactions.md).
+  `scone tx build/sign/verify`, **`scone relay`** (daemon) et
+  **`scone status / submit tx / lookup / record put|get`** (parlent
+  au RPC du relay).
 
-Non implémentés : PoW/consensus réel, DHT, réseau P2P, serveur DNS,
-stockage persistant (redb).
+Non implémentés : PoW/consensus réel, serveur DNS, gouvernance des
+forks, identité réseau persistante du relay.
+
+## Essayer le relay (devnet)
+
+```bash
+# Terminal 1 — le nœud
+scone relay --data-dir /tmp/node-a
+
+# Terminal 2 — enregistrer un nom
+scone identity generate --name alice
+scone tx build register --name example.uip | tail -1   # payload à signer
+scone tx sign <payload> --identity alice | tail -1      # hex de la tx signée
+scone submit tx --hex <tx-hex>
+sleep 2                                                  # production devnet
+scone status                                             # height: 1
+scone lookup example.uip
+```
 
 ## Développement
 

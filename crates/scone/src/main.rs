@@ -92,6 +92,51 @@ enum Command {
         name: String,
     },
 
+    /// Run a relay node (foreground daemon; logs to stderr).
+    Relay {
+        /// Data directory (chain database lives here).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// P2P listen multiaddr (default `/ip4/0.0.0.0/udp/0/quic-v1`).
+        #[arg(long)]
+        listen: Option<String>,
+
+        /// Bootstrap multiaddr (repeatable); must end with
+        /// `/p2p/<peer-id>`.
+        #[arg(long = "bootstrap")]
+        bootstrap: Vec<String>,
+    },
+
+    /// Relay status (tip, height, peers, domains).
+    Status {
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+
+    /// Submit a signed transaction (hex) to a relay.
+    Submit {
+        #[command(subcommand)]
+        command: SubmitCommand,
+    },
+
+    /// Look up the on-chain state of a domain name.
+    Lookup {
+        /// Domain name.
+        name: String,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+
+    /// Publish / resolve signed DNS records in the DHT.
+    Record {
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
+
     /// Manage local signing identities.
     Identity {
         #[command(subcommand)]
@@ -103,6 +148,49 @@ enum Command {
     Tx {
         #[command(subcommand)]
         command: TxCommand,
+    },
+}
+
+/// Subcommands of `scone submit`.
+#[derive(Debug, Subcommand)]
+enum SubmitCommand {
+    /// Submit a signed transaction given as canonical hex.
+    Tx {
+        /// Hex of the complete signed transaction.
+        #[arg(long = "hex")]
+        hex: String,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+}
+
+/// Subcommands of `scone record`.
+#[derive(Debug, Subcommand)]
+enum RecordCommand {
+    /// Publish a signed record (canonical hex) in the DHT.
+    Put {
+        /// Domain name the record belongs to.
+        name: String,
+
+        /// File containing the canonical hex of the signed record.
+        #[arg(long)]
+        file: PathBuf,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
+    },
+
+    /// Resolve a domain's record from the DHT and verify it.
+    Get {
+        /// Domain name.
+        name: String,
+
+        /// RPC address of the relay (default 127.0.0.1:7474).
+        #[arg(long)]
+        rpc: Option<String>,
     },
 }
 
@@ -251,6 +339,14 @@ enum CliError {
     InvalidTransaction(scone_blockchain::BlockchainError),
     /// A 32-byte value was expected but the hex length is wrong.
     InvalidHashLength(usize),
+    /// The relay is not reachable at its RPC address.
+    RelayUnreachable(String),
+    /// The relay answered with an error.
+    RelayError(String),
+    /// An invalid RPC address was given.
+    InvalidRpcAddr(String),
+    /// A file needed by a command could not be read.
+    FileRead(std::io::Error),
 }
 
 impl std::fmt::Display for CliError {
@@ -285,6 +381,13 @@ impl std::fmt::Display for CliError {
             Self::InvalidHashLength(len) => {
                 write!(f, "expected 64 hex chars (32 bytes), got {len}")
             }
+            Self::RelayUnreachable(addr) => write!(
+                f,
+                "cannot reach the relay at {addr} — is 'scone relay' running?"
+            ),
+            Self::RelayError(message) => write!(f, "relay: {message}"),
+            Self::InvalidRpcAddr(addr) => write!(f, "invalid rpc address '{addr}'"),
+            Self::FileRead(e) => write!(f, "cannot read file: {e}"),
         }
     }
 }
@@ -377,6 +480,15 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
         }
         Command::Identity { command } => run_identity(command),
         Command::Tx { command } => run_tx(command),
+        Command::Relay {
+            data_dir,
+            listen,
+            bootstrap,
+        } => run_relay(data_dir, listen, bootstrap),
+        Command::Status { rpc } => run_status(rpc),
+        Command::Submit { command } => run_submit(command),
+        Command::Lookup { name, rpc } => run_lookup(name, rpc),
+        Command::Record { command } => run_record(command),
     }
 }
 
@@ -708,6 +820,154 @@ fn run_identity(command: IdentityCommand) -> Result<Vec<String>, CliError> {
                 format!("public key: {public}"),
                 format!("owner id: {}", hex_lower(owner.as_bytes())),
             ])
+        }
+    }
+}
+
+/// Default relay RPC address.
+const DEFAULT_RPC_ADDR: &str = "127.0.0.1:7474";
+
+/// Builds an RPC client for the given `--rpc` value (or the default).
+fn rpc_client(rpc: Option<&str>) -> Result<scone_network::RpcClient, CliError> {
+    let text = rpc.unwrap_or(DEFAULT_RPC_ADDR);
+    let addr: std::net::SocketAddr = text
+        .parse()
+        .map_err(|_| CliError::InvalidRpcAddr(text.to_string()))?;
+    Ok(scone_network::RpcClient::new(addr))
+}
+
+/// Runs one async RPC round trip on a fresh tokio runtime (the CLI
+/// stays synchronous everywhere else).
+fn rpc_call(
+    client: &scone_network::RpcClient,
+    request: scone_network::RpcRequest,
+) -> Result<Vec<String>, CliError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::RelayUnreachable(e.to_string()))?;
+    let response = rt.block_on(client.request(request)).map_err(|e| match e {
+        scone_network::NetworkError::Io(_) | scone_network::NetworkError::Timeout(_) => {
+            CliError::RelayUnreachable(client_addr(client))
+        }
+        other => CliError::RelayError(other.to_string()),
+    })?;
+    match response {
+        scone_network::RpcResponse::Ok { data } => Ok(render_json(&data)),
+        scone_network::RpcResponse::Error { message } => Err(CliError::RelayError(message)),
+    }
+}
+
+/// The client's address as a display string.
+fn client_addr(client: &scone_network::RpcClient) -> String {
+    client.addr().to_string()
+}
+
+/// Renders a JSON value as aligned `key: value` lines (objects) or a
+/// single line otherwise.
+fn render_json(value: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", render_flat(v)))
+            .collect(),
+        other => vec![render_flat(other)],
+    }
+}
+
+/// Renders a JSON scalar/array as one flat string.
+fn render_flat(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Runs `scone relay …` (foreground daemon).
+fn run_relay(
+    data_dir: Option<PathBuf>,
+    listen: Option<String>,
+    bootstrap: Vec<String>,
+) -> Result<Vec<String>, CliError> {
+    let data_dir = data_dir.unwrap_or_else(|| match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".scone"),
+        None => PathBuf::from(".scone"),
+    });
+    let mut config = scone_network::Config::new(data_dir);
+    if let Some(listen) = listen {
+        config.listen = Some(listen);
+    }
+    config.bootstrap = bootstrap;
+    // Devnet defaults: fixed RPC port so the CLI can find us.
+    config.rpc_addr = DEFAULT_RPC_ADDR
+        .parse()
+        .map_err(|_| CliError::InvalidRpcAddr(DEFAULT_RPC_ADDR.into()))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::RelayUnreachable(e.to_string()))?;
+    rt.block_on(async move {
+        let relay =
+            scone_network::Relay::new(config).map_err(|e| CliError::RelayError(e.to_string()))?;
+        eprintln!("scone-relay[{}]: starting", relay.peer_id());
+        relay
+            .run()
+            .await
+            .map_err(|e| CliError::RelayError(e.to_string()))
+    })?;
+    Ok(Vec::new())
+}
+
+/// Runs `scone status`.
+fn run_status(rpc: Option<String>) -> Result<Vec<String>, CliError> {
+    let client = rpc_client(rpc.as_deref())?;
+    rpc_call(&client, scone_network::RpcRequest::Status)
+}
+
+/// Runs `scone submit tx …`.
+fn run_submit(command: SubmitCommand) -> Result<Vec<String>, CliError> {
+    let SubmitCommand::Tx { hex, rpc } = command;
+    let client = rpc_client(rpc.as_deref())?;
+    rpc_call(
+        &client,
+        scone_network::RpcRequest::SubmitTx {
+            tx_hex: hex.to_lowercase(),
+        },
+    )
+}
+
+/// Runs `scone lookup <name>`.
+fn run_lookup(name: String, rpc: Option<String>) -> Result<Vec<String>, CliError> {
+    let client = rpc_client(rpc.as_deref())?;
+    rpc_call(&client, scone_network::RpcRequest::Lookup { name })
+}
+
+/// Runs `scone record put|get …`.
+fn run_record(command: RecordCommand) -> Result<Vec<String>, CliError> {
+    match command {
+        RecordCommand::Put { name, file, rpc } => {
+            let record_hex = std::fs::read_to_string(file)
+                .map_err(CliError::FileRead)?
+                .trim()
+                .to_string();
+            // Validate the name early (fail before hitting the relay).
+            DomainName::new(&name).map_err(CliError::Domain)?;
+            let client = rpc_client(rpc.as_deref())?;
+            rpc_call(
+                &client,
+                scone_network::RpcRequest::PutRecord {
+                    record_hex: record_hex.to_lowercase(),
+                },
+            )
+        }
+        RecordCommand::Get { name, rpc } => {
+            let client = rpc_client(rpc.as_deref())?;
+            rpc_call(&client, scone_network::RpcRequest::GetRecord { name })
         }
     }
 }
