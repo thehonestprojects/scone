@@ -59,6 +59,14 @@ pub enum BlockchainError {
     /// implementation).
     #[error("consensus rejection: {0}")]
     Consensus(String),
+    /// The `owner` field of a transaction is not the identity derived
+    /// from its embedded `public_key` (recomputed — never trusted).
+    #[error("transaction owner does not match its public key")]
+    OwnerKeyMismatch,
+    /// The signature of a transaction does not verify (strict Ed25519)
+    /// over the recomputed canonical signing payload.
+    #[error("invalid transaction signature")]
+    InvalidSignature,
     /// A transaction violates a `scone-core` invariant.
     #[error(transparent)]
     Core(#[from] SconeError),

@@ -150,7 +150,7 @@ impl std::fmt::Display for PublicKey {
 }
 
 /// An Ed25519 signature (64 bytes).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Signature([u8; SIGNATURE_SIZE]);
 
 impl Signature {

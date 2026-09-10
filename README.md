@@ -41,36 +41,41 @@ données DNS elles-mêmes sont servies depuis une DHT par des nœuds pairs.
 | `scone-blockchain` | Logique de chaîne et état canonique en RAM (validation des transactions, Merkle, chaîne de blocs) |
 | `scone-storage` | Abstraction stockage local (backend redb à venir) |
 | `scone-keystore` | Clés Ed25519 chiffrées sur disque (Argon2id + XChaCha20-Poly1305) |
-| `scone` | Binaire / CLI (`scone show`, `scone identity generate/list/show`) |
+| `scone` | Binaire / CLI (`scone show`, `scone identity …`, `scone tx build/sign/verify`) |
 
 Documentation détaillée : [`docs/architecture.md`](docs/architecture.md),
 [`docs/protocol.md`](docs/protocol.md), [`docs/naming.md`](docs/naming.md).
 
 ## Status
 
-Early development — **Jalon M1 (clés & identités) atteint**.
+Early development — **Jalon M2 (transactions signées) atteint**.
 
 En place :
 
 - **Types purs** (`scone-core`) : noms, `DomainId`, records DNS,
-  transactions, `OwnerId`.
-- **Primitives cryptographiques** (`scone-crypto`) : `hash256` (BLAKE3),
-  clés et signatures **Ed25519** (`ed25519-dalek` 3.0, vecteurs de test
-  RFC 8032, vérification stricte).
-- **Format binaire canonique** (`scone-protocol`) : transactions,
-  records DNS, blocs, messages P2P, limites, version.
-- **Blockchain** (`scone-blockchain`) : chaîne, état canonique en RAM,
-  racines Merkle, bloc genesis, cadre de consensus (le consensus réel —
-  PoW/difficulté/fork choice — reste à implémenter).
+  transactions **signées v2** (`public_key` + `signature`,
+  owner recomputé), `OwnerId`.
+- **Primitives cryptographiques** (`scone-crypto`) : `hash256`
+  (BLAKE3), clés et signatures **Ed25519** (`ed25519-dalek` 3.0,
+  vecteurs de test RFC 8032, vérification stricte).
+- **Format binaire canonique** (`scone-protocol`) : transactions
+  **signées v2** (payload `SCONE-TX-SIG-V1`, bornes strictes pk
+  32 o / signature 64 o, rejet explicite du format v1), records DNS,
+  blocs, messages P2P, limites, version 2.
+- **Blockchain** (`scone-blockchain`) : chaîne, état canonique en
+  RAM, racines Merkle, bloc genesis, **validation cryptographique des
+  transactions** (binding owner/clé + `verify_strict`), BlockBuilder,
+  cadre de consensus (le consensus réel — PoW/difficulté/fork choice
+  — reste à implémenter).
 - **Keystore chiffré** (`scone-keystore`) : keyfiles `.sconekey`
   (Argon2id + XChaCha20-Poly1305), voir
   [`docs/development/keystore.md`](docs/development/keystore.md).
-- **CLI** (`scone`) : `scone show <name>`, `scone identity generate
-  --name <n>`, `scone identity list`, `scone identity show --name <n>`.
+- **CLI** (`scone`) : `scone show <name>`, `scone identity …`,
+  **`scone tx build/sign/verify`** (hors-ligne, pour tests et debug),
+  voir [`docs/transactions.md`](docs/transactions.md).
 
-Non implémentés : signatures appliquées aux transactions de la chaîne,
-PoW/consensus réel, DHT, réseau P2P, serveur DNS, stockage persistant
-(redb).
+Non implémentés : PoW/consensus réel, DHT, réseau P2P, serveur DNS,
+stockage persistant (redb).
 
 ## Développement
 

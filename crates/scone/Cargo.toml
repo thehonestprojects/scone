@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 scone-core.workspace = true
 scone-crypto.workspace = true
+scone-blockchain.workspace = true
+scone-protocol.workspace = true
 scone-keystore.workspace = true
 clap.workspace = true
 rpassword.workspace = true

@@ -187,24 +187,55 @@ Deux transactions ne sont pas interchangeables : dans un même bloc,
 ## Validation d'un bloc (push_block)
 
 Tout est **recalculé**, rien n'est cru sur parole — un `tx_root`, un
-hash ou un champ fourni par un pair n'est jamais pris pour argent
-comptant :
+hash, une signature ou un champ fourni par un pair n'est jamais pris
+pour argent comptant :
 
 1. `prev_hash` == hash de la pointe canonique (sinon `UnknownParent`
    si le parent est inconnu, `ParentNotTip` s'il est connu mais pas la
    pointe : détection de fork minimale) ;
 2. `height` == hauteur pointe + 1 ;
-3. `version` non nulle et ≤ `PROTOCOL_VERSION` ;
+3. `version` == `PROTOCOL_VERSION` **exactement** (un bloc v1 —
+   format antérieur aux transactions signées — est rejeté, pas
+   réinterprété) ;
 4. nombre de transactions ≤ `MAX_TXS_PER_BLOCK` (4096) ;
 5. `tx_root` recalculé sur les transactions dans l'ordre du bloc ;
 6. crochets du consensus (`validate_header`, `validate_tx`) ;
-7. pour chaque transaction, dans l'ordre : validation `scone-core`,
-   puis application à un état de travail ;
+7. pour chaque transaction, dans l'ordre : validation
+   **cryptographique** (`validate_transaction` : binding
+   owner/clé recomputé + `verify_strict` sur le payload signé
+   recomputé de zéro, voir `/docs/transactions.md`), puis
+   application à un état de travail ;
 8. commit atomique : tout passe ⇒ bloc ajouté, état remplacé ; la
    moindre erreur ⇒ chaîne rigoureusement inchangée.
 
 Aucune fonction de validation ne panique ; toute entrée malformée ou
-hostile produit une `BlockchainError`.
+hostile produit une `BlockchainError` typée
+(`OwnerKeyMismatch`, `InvalidSignature`, …).
+
+## Assemblage de blocs (BlockBuilder)
+
+`BlockBuilder` (`scone-blockchain::builder`) assemble un bloc depuis
+une queue de transactions validées :
+
+```text
+BlockBuilder::after(hauteur_parent, prev_hash)
+    .with_timestamp(t) .with_consensus(payload)
+    .push_tx(tx)… .build() -> Block
+```
+
+- `tx_root` **recalculé** sur la liste ordonnée des transactions
+  queued (jamais fourni) ;
+- `prev_hash`/`height` chaînés sur le parent (le hash parent est
+  calculé par l'appelant via `block_hash`, jamais pris d'un pair) ;
+- `version` = `PROTOCOL_VERSION` ;
+- borne `MAX_TXS_PER_BLOCK` appliquée à l'ajout
+  (`TooManyTransactions`) ;
+- le payload `consensus` (champs PoW futurs) et le `timestamp` sont
+  fournis par l'appelant : le consensus concret s'insère via le trait
+  [`Consensus`](#abstraction-du-consensus) existant, symétriquement à
+  la validation.
+
+Un bloc assemblé passe `push_block` sans réencodage (testé).
 
 ## Forks
 

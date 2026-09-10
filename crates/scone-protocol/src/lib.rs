@@ -53,6 +53,7 @@ pub use codec::{Decode, Encode, decode_complete, encode_to_vec};
 pub use error::{ProtocolError, Result};
 pub use hash::record_hash;
 pub use message::Message;
+pub use transaction::{TX_FORMAT_VERSION, TX_SIG_PREFIX, UnsignedTransaction, signing_payload};
 
 /// Protocol version. Bumped on any breaking wire-format change.
 ///
@@ -60,6 +61,8 @@ pub use message::Message;
 ///
 /// - a version received that is **greater** than the local one (or zero)
 ///   is rejected with [`ProtocolError::UnsupportedVersion`];
-/// - a lower version is accepted (none exists yet);
+/// - version **1** is the pre-signature transaction format (milestone
+///   M1): transactions are rejected explicitly (see
+///   [`transaction`]), blocks are rejected on their header version;
 /// - there is no major/minor split yet: one integer, bumped on break.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

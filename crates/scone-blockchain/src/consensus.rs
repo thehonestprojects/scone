@@ -74,12 +74,14 @@ mod tests {
         };
         assert!(PermissiveConsensus.validate_header(&header).is_ok());
 
-        let tx = scone_core::Transaction::Register(scone_core::Register {
-            domain_id: scone_core::DomainId::from_bytes([1; 32]),
-            owner: scone_core::OwnerId::from_bytes([2; 32]),
-            timestamp: 0,
-            proof: scone_core::Proof::from_bytes(Vec::new()),
-        });
+        let sk = scone_crypto::SigningKey::from_bytes([2u8; 32]);
+        let tx = scone_core::Transaction::Register(scone_core::Register::register_signed(
+            scone_core::DomainId::from_bytes([1; 32]),
+            0,
+            scone_core::Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            sk.sign(b"t"),
+        ));
         assert!(PermissiveConsensus.validate_tx(&tx).is_ok());
     }
 }

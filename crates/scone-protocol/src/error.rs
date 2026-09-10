@@ -35,6 +35,10 @@ pub enum ProtocolError {
     /// A string payload is not valid UTF-8.
     #[error("invalid UTF-8")]
     InvalidUtf8,
+    /// An embedded Ed25519 public key does not decode to a valid curve
+    /// point.
+    #[error("invalid transaction public key")]
+    InvalidTransactionKey,
     /// Extra bytes remain after a complete value was decoded.
     #[error("{0} trailing bytes after value")]
     TrailingBytes(usize),

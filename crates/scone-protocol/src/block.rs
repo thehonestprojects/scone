@@ -117,6 +117,12 @@ fn check_version(version: u32) -> Result<()> {
     if version == 0 || version > PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion(u64::from(version)));
     }
+    // Format v1 (pre-signature transactions, milestone M1) is a
+    // different, incompatible block format: rejected explicitly
+    // rather than mis-parsed.
+    if version < PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(u64::from(version)));
+    }
     Ok(())
 }
 
@@ -203,25 +209,33 @@ impl Decode for Block {
 mod tests {
     use super::*;
     use crate::codec::{decode_complete, encode_to_vec};
-    use scone_core::{DomainName, OwnerId, Proof, RecordHash, Register, Update};
+    use scone_core::{DomainName, Proof, RecordHash, Register, Update};
+    use scone_crypto::SigningKey;
+
+    fn signer() -> SigningKey {
+        SigningKey::from_bytes([1u8; 32])
+    }
 
     fn register_tx() -> Transaction {
-        Transaction::Register(Register {
-            domain_id: scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
-            owner: OwnerId::from_bytes([1; 32]),
-            timestamp: 1_700_000_000,
-            proof: Proof::from_bytes(Vec::new()),
-        })
+        let sk = signer();
+        Transaction::Register(Register::register_signed(
+            scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            sk.sign(b"fixture"),
+        ))
     }
 
     fn update_tx() -> Transaction {
-        Transaction::Update(Update {
-            domain_id: scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
-            owner: OwnerId::from_bytes([1; 32]),
-            sequence: 1,
-            record_hash: RecordHash::from_bytes([9; 32]),
-            timestamp: 1_700_000_000,
-        })
+        let sk = signer();
+        Transaction::Update(Update::update_signed(
+            scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
+            1,
+            RecordHash::from_bytes([9; 32]),
+            sk.public_key(),
+            sk.sign(b"fixture"),
+        ))
     }
 
     fn header() -> BlockHeader {
@@ -288,8 +302,25 @@ mod tests {
         header.version = PROTOCOL_VERSION + 1;
         assert!(encode_to_vec(&header).is_err());
         assert!(matches!(
-            decode_complete::<BlockHeader>(&[0x02]),
-            Err(ProtocolError::UnsupportedVersion(2))
+            decode_complete::<BlockHeader>(&[0x03]),
+            Err(ProtocolError::UnsupportedVersion(3))
+        ));
+    }
+
+    #[test]
+    fn v1_block_format_rejected_explicitly() {
+        // Format v1 (pre-signature transactions) must be rejected as a
+        // version error, not mis-parsed: `0x01` is a valid minimal
+        // varint on the wire.
+        assert!(matches!(
+            decode_complete::<BlockHeader>(&[0x01]),
+            Err(ProtocolError::UnsupportedVersion(1))
+        ));
+        let mut header = header();
+        header.version = 1;
+        assert!(matches!(
+            encode_to_vec(&header),
+            Err(ProtocolError::UnsupportedVersion(1))
         ));
     }
 

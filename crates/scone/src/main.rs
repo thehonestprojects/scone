@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use scone_core::{DomainId, DomainName, OwnerId, PublicKeyRef};
-use scone_crypto::SigningKey;
+use scone_core::{DomainId, DomainName, OwnerId, PublicKeyRef, Register, Update};
+use scone_crypto::{Signature, SigningKey};
 use zeroize::Zeroize;
 
 /// Extension of keystore files (re-exported for path building).
@@ -97,6 +97,83 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+
+    /// Offline transaction tools (build, sign, verify) — testing and
+    /// debugging helpers for the signed transaction format v2.
+    Tx {
+        #[command(subcommand)]
+        command: TxCommand,
+    },
+}
+
+/// Subcommands of `scone tx`.
+#[derive(Debug, Subcommand)]
+enum TxCommand {
+    /// Build an unsigned transaction and print the hex payload to
+    /// sign (the signing payload, prefix included).
+    Build {
+        /// Transaction kind: `register` or `update`.
+        #[command(subcommand)]
+        kind: TxKind,
+    },
+
+    /// Sign a built transaction with a keystore identity and print
+    /// the complete signed transaction as hex.
+    Sign {
+        /// Hex output of a previous `scone tx build` (unsigned
+        /// payload — actually any transaction hex; the signature is
+        /// recomputed over the canonical payload).
+        tx: String,
+
+        /// Local name of the signing identity.
+        #[arg(long)]
+        identity: String,
+
+        /// Keystore directory (default: `$HOME/.scone/keys`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Read the passphrase from this environment variable instead
+        /// of prompting.
+        #[arg(long = "passphrase-env", value_name = "VAR")]
+        passphrase_env: Option<String>,
+    },
+
+    /// Run the full local validation of a signed transaction hex
+    /// (decode, owner/key binding, signature).
+    Verify {
+        /// Hex of a complete signed transaction.
+        tx: String,
+    },
+}
+
+/// Transaction kinds for `scone tx build`.
+#[derive(Debug, Clone, Subcommand)]
+enum TxKind {
+    /// Claim a domain.
+    Register {
+        /// Domain name to register.
+        #[arg(long)]
+        name: String,
+        /// Unix timestamp (seconds).
+        #[arg(long, default_value_t = 0)]
+        timestamp: u64,
+        /// Hex of the registration proof (default: empty).
+        #[arg(long)]
+        proof_hex: Option<String>,
+    },
+    /// Publish a new version of a domain's DNS data.
+    Update {
+        /// Domain name to update.
+        #[arg(long)]
+        name: String,
+        /// Sequence number (must be current + 1).
+        #[arg(long)]
+        sequence: u64,
+        /// Hex of the record hash commitment (64 hex chars).
+        #[arg(long)]
+        record_hash: String,
+    },
 }
 
 /// Subcommands of `scone identity`.
@@ -165,6 +242,15 @@ enum CliError {
     PassphraseRead,
     /// Passphrases did not match on `identity generate`.
     PassphraseMismatch,
+    /// Invalid hex input.
+    InvalidHex(String),
+    /// The transaction bytes are malformed (decode failure).
+    MalformedTransaction(scone_protocol::ProtocolError),
+    /// The transaction failed validation (owner/key binding or
+    /// signature).
+    InvalidTransaction(scone_blockchain::BlockchainError),
+    /// A 32-byte value was expected but the hex length is wrong.
+    InvalidHashLength(usize),
 }
 
 impl std::fmt::Display for CliError {
@@ -193,6 +279,12 @@ impl std::fmt::Display for CliError {
             }
             Self::PassphraseRead => write!(f, "failed to read the passphrase"),
             Self::PassphraseMismatch => write!(f, "passphrases do not match"),
+            Self::InvalidHex(context) => write!(f, "invalid hex ({context})"),
+            Self::MalformedTransaction(e) => write!(f, "malformed transaction: {e}"),
+            Self::InvalidTransaction(e) => write!(f, "invalid transaction: {e}"),
+            Self::InvalidHashLength(len) => {
+                write!(f, "expected 64 hex chars (32 bytes), got {len}")
+            }
         }
     }
 }
@@ -284,6 +376,268 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
             Ok(vec![format!("{} → {id}", domain.canonical())])
         }
         Command::Identity { command } => run_identity(command),
+        Command::Tx { command } => run_tx(command),
+    }
+}
+
+/// Decodes a lowercase-or-uppercase hex string into bytes.
+fn hex_decode(context: &str, hex: &str) -> Result<Vec<u8>, CliError> {
+    let hex = hex.trim();
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CliError::InvalidHex(context.to_string()));
+    }
+    (0..hex.len() / 2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                .map_err(|_| CliError::InvalidHex(context.to_string()))
+        })
+        .collect()
+}
+
+/// Opens the signing key of a keystore identity (shared by
+/// `identity show` and `tx sign`).
+fn open_identity(
+    name: &str,
+    dir: Option<&Path>,
+    passphrase_env: Option<&str>,
+) -> Result<SigningKey, CliError> {
+    validate_identity_name(name)?;
+    let dir = keystore_dir(dir);
+    let path = keyfile_path(&dir, name);
+    if !path.is_file() {
+        return Err(CliError::UnknownIdentity(name.to_string()));
+    }
+    let passphrase = get_passphrase(passphrase_env, false)?;
+    scone_keystore::open(&path, passphrase.expose()).map_err(CliError::Keystore)
+}
+
+/// Dispatches `scone tx …`.
+fn run_tx(command: TxCommand) -> Result<Vec<String>, CliError> {
+    match command {
+        TxCommand::Build { kind } => {
+            let (tx, describe) = build_unsigned(kind)?;
+            let payload =
+                scone_protocol::signing_payload(&tx).map_err(CliError::MalformedTransaction)?;
+            Ok(vec![
+                describe,
+                format!("signing payload: {}", hex_lower(&payload)),
+            ])
+        }
+        TxCommand::Sign {
+            tx,
+            identity,
+            dir,
+            passphrase_env,
+        } => {
+            // Input may be either the raw signing payload (output of
+            // `tx build`) or a full transaction hex; both carry the
+            // tx fields, the payload just lacks... actually the
+            // payload IS prefix+tx-minus-signature. Decode strategy:
+            // try transaction first, then payload.
+            let bytes = hex_decode("transaction", &tx)?;
+            let unsigned = decode_tx_or_payload(&bytes)?;
+            let sk = open_identity(&identity, dir.as_deref(), passphrase_env.as_deref())?;
+            // Rebind the transaction to this identity: owner and key
+            // are recomputed from the signing key (never trusted),
+            // then the canonical payload is signed.
+            let rebound = rebind(&unsigned, &sk);
+            let payload = scone_protocol::signing_payload(&rebound)
+                .map_err(CliError::MalformedTransaction)?;
+            let signature = sk.sign(&payload);
+            let signed = attach_signature(rebound, signature);
+            let encoded =
+                scone_protocol::encode_to_vec(&signed).map_err(CliError::MalformedTransaction)?;
+            Ok(vec![
+                format!("signed by identity '{identity}'"),
+                format!("transaction: {}", hex_lower(&encoded)),
+            ])
+        }
+        TxCommand::Verify { tx } => {
+            let bytes = hex_decode("transaction", &tx)?;
+            let decoded = scone_protocol::decode_complete::<scone_core::Transaction>(&bytes)
+                .map_err(CliError::MalformedTransaction)?;
+            scone_blockchain::validate_transaction(&decoded)
+                .map_err(CliError::InvalidTransaction)?;
+            let kind = match decoded {
+                scone_core::Transaction::Register(_) => "register",
+                scone_core::Transaction::Update(_) => "update",
+            };
+            let owner = decoded.owner();
+            Ok(vec![
+                format!("kind: {kind}"),
+                format!("domain: {}", decoded.domain_id()),
+                format!("owner: {}", hex_lower(owner.as_bytes())),
+                "signature: valid".to_string(),
+            ])
+        }
+    }
+}
+
+/// Decodes either a full transaction or a signing payload (output of
+/// `scone tx build`: `"SCONE-TX-SIG-V1" || unsigned tx`) into the
+/// unsigned transaction it describes.
+fn decode_tx_or_payload(bytes: &[u8]) -> Result<scone_core::Transaction, CliError> {
+    // Try a complete transaction first.
+    if let Ok(tx) = scone_protocol::decode_complete::<scone_core::Transaction>(bytes) {
+        return Ok(tx);
+    }
+    // Then a signing payload: strip the prefix and decode the
+    // unsigned encoding.
+    if let Some(rest) = bytes.strip_prefix(scone_protocol::TX_SIG_PREFIX)
+        && let Ok(unsigned) =
+            scone_protocol::decode_complete::<scone_protocol::UnsignedTransaction>(rest)
+    {
+        return Ok(unsigned_into_transaction(unsigned));
+    }
+    Err(CliError::MalformedTransaction(
+        scone_protocol::ProtocolError::Truncated,
+    ))
+}
+
+/// Converts an [`UnsignedTransaction`] into a placeholder-signed
+/// [`scone_core::Transaction`].
+fn unsigned_into_transaction(
+    unsigned: scone_protocol::UnsignedTransaction,
+) -> scone_core::Transaction {
+    use scone_core::{Register, Update};
+    use scone_protocol::UnsignedTransaction as U;
+    match unsigned {
+        U::Register {
+            domain_id,
+            owner: _,
+            timestamp,
+            proof,
+            public_key,
+        } => scone_core::Transaction::Register(Register::register_signed(
+            domain_id,
+            timestamp,
+            proof,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::Update {
+            domain_id,
+            owner: _,
+            sequence,
+            record_hash,
+            public_key,
+        } => scone_core::Transaction::Update(Update::update_signed(
+            domain_id,
+            sequence,
+            record_hash,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+    }
+}
+
+/// Builds an unsigned (placeholder-signature) transaction from CLI
+/// args; returns it with a human description line.
+fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), CliError> {
+    use scone_core::{Proof, RecordHash, Register, Update};
+    use scone_crypto::Signature;
+    let placeholder = Signature::from_bytes([0; 64]);
+    // Any valid key works here: the payload to sign does not include
+    // owner/key binding choices of the eventual signer... except it
+    // DOES include the public_key field, so `build` uses a fixed
+    // derived-from-seed key and `sign` rebinds to the real identity.
+    let build_key = SigningKey::from_bytes([0x42; 32]);
+    match kind {
+        TxKind::Register {
+            name,
+            timestamp,
+            proof_hex,
+        } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let proof = match proof_hex {
+                Some(hex) => Proof::from_bytes(hex_decode("proof", &hex)?),
+                None => Proof::from_bytes(Vec::new()),
+            };
+            let tx = scone_core::Transaction::Register(Register::register_signed(
+                DomainId::from_name(&domain),
+                timestamp,
+                proof,
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((
+                tx,
+                format!(
+                    "unsigned register: {} (timestamp {timestamp})",
+                    domain.canonical()
+                ),
+            ))
+        }
+        TxKind::Update {
+            name,
+            sequence,
+            record_hash,
+        } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let hash_bytes = hex_decode("record hash", &record_hash)?;
+            if hash_bytes.len() != 32 {
+                return Err(CliError::InvalidHashLength(hash_bytes.len() * 2));
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&hash_bytes);
+            let tx = scone_core::Transaction::Update(Update::update_signed(
+                DomainId::from_name(&domain),
+                sequence,
+                RecordHash::from_bytes(raw),
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((
+                tx,
+                format!(
+                    "unsigned update: {} (sequence {sequence})",
+                    domain.canonical()
+                ),
+            ))
+        }
+    }
+}
+
+/// Rebinds a transaction to `sk`: owner and public key are recomputed
+/// from the signing key — the values carried by the input are never
+/// trusted.
+fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transaction {
+    match tx {
+        scone_core::Transaction::Register(r) => {
+            scone_core::Transaction::Register(Register::register_signed(
+                r.domain_id,
+                r.timestamp,
+                r.proof.clone(),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+        scone_core::Transaction::Update(u) => {
+            scone_core::Transaction::Update(Update::update_signed(
+                u.domain_id,
+                u.sequence,
+                u.record_hash,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+    }
+}
+
+/// Attaches `signature` to an unsigned (placeholder) transaction.
+fn attach_signature(
+    tx: scone_core::Transaction,
+    signature: scone_crypto::Signature,
+) -> scone_core::Transaction {
+    match tx {
+        scone_core::Transaction::Register(mut r) => {
+            r.signature = signature;
+            scone_core::Transaction::Register(r)
+        }
+        scone_core::Transaction::Update(mut u) => {
+            u.signature = signature;
+            scone_core::Transaction::Update(u)
+        }
     }
 }
 
@@ -652,5 +1006,118 @@ mod tests {
         let dbg = format!("{p:?}");
         assert_eq!(dbg, "Passphrase(\"<redacted>\")");
         assert!(!dbg.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn tx_build_sign_verify_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_flag = dir.path().to_str().expect("utf-8 path").to_string();
+        unsafe {
+            std::env::set_var("SCONE_TEST_PASS_TX", "unit-test-passphrase");
+        }
+        let var = "SCONE_TEST_PASS_TX";
+
+        run(cli(&[
+            "identity",
+            "generate",
+            "--name",
+            "alice",
+            "--dir",
+            &dir_flag,
+            "--passphrase-env",
+            var,
+        ]))
+        .expect("generate works");
+
+        // build
+        let built = run(cli(&[
+            "tx",
+            "build",
+            "register",
+            "--name",
+            "example.uip",
+            "--timestamp",
+            "42",
+        ]))
+        .expect("build works");
+        let payload = built
+            .iter()
+            .find(|l| l.starts_with("signing payload: "))
+            .expect("payload line")
+            .strip_prefix("signing payload: ")
+            .expect("hex");
+        // The payload starts with the ASCII domain-separation prefix.
+        assert!(payload.starts_with("53434f4e452d54582d5349472d5631"));
+
+        // sign
+        let signed_lines = run(cli(&[
+            "tx",
+            "sign",
+            payload,
+            "--identity",
+            "alice",
+            "--dir",
+            &dir_flag,
+            "--passphrase-env",
+            var,
+        ]))
+        .expect("sign works");
+        let signed_hex = signed_lines
+            .iter()
+            .find(|l| l.starts_with("transaction: "))
+            .expect("tx line")
+            .strip_prefix("transaction: ")
+            .expect("hex");
+
+        // verify: the exact tx passes
+        let verified = run(cli(&["tx", "verify", signed_hex])).expect("verify works");
+        assert!(verified.contains(&"signature: valid".to_string()));
+
+        // verify: a tampered tx fails cleanly
+        let mut tampered = signed_hex.to_string();
+        tampered.replace_range(4..6, if &tampered[4..6] == "ff" { "00" } else { "ff" });
+        let err = run(cli(&["tx", "verify", &tampered])).expect_err("tampered must fail");
+        assert!(matches!(
+            err,
+            CliError::MalformedTransaction(_) | CliError::InvalidTransaction(_)
+        ));
+
+        unsafe { std::env::remove_var(var) }
+    }
+
+    #[test]
+    fn tx_verify_rejects_v1_and_garbage() {
+        // Garbage hex.
+        assert!(matches!(
+            run(cli(&["tx", "verify", "zzzz"])),
+            Err(CliError::InvalidHex(_))
+        ));
+        // Valid hex, garbage bytes.
+        assert!(matches!(
+            run(cli(&["tx", "verify", "0100"])),
+            Err(CliError::MalformedTransaction(_))
+        ));
+        // Odd length.
+        assert!(matches!(
+            run(cli(&["tx", "verify", "010"])),
+            Err(CliError::InvalidHex(_))
+        ));
+    }
+
+    #[test]
+    fn tx_build_update_requires_32_byte_record_hash() {
+        let err = run(cli(&[
+            "tx",
+            "build",
+            "update",
+            "--name",
+            "example.uip",
+            "--sequence",
+            "1",
+            "--record-hash",
+            "aabb",
+        ]))
+        .expect_err("short hash must fail");
+        assert!(matches!(err, CliError::InvalidHashLength(4)));
     }
 }

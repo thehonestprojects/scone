@@ -80,29 +80,53 @@ pub fn tx_root(transactions: &[Transaction]) -> Result<MerkleRoot> {
 mod tests {
     use super::*;
     use crate::txid::TX_ID_VERSION;
-    use scone_core::{DomainId, DomainName, OwnerId, Proof, RecordHash, Register, Update};
+    use scone_core::{DomainId, DomainName, RecordHash, Register, Update};
+    use scone_crypto::{Signature, SigningKey};
 
     fn txid(byte: u8) -> TxId {
         TxId::from_bytes([byte; 32])
     }
 
+    fn key() -> SigningKey {
+        SigningKey::from_bytes([1u8; 32])
+    }
+
     fn register_tx(name: &str) -> scone_core::Transaction {
-        scone_core::Transaction::Register(Register {
-            domain_id: DomainId::from_name(&DomainName::new(name).unwrap()),
-            owner: OwnerId::from_bytes([1; 32]),
-            timestamp: 1,
-            proof: Proof::from_bytes(Vec::new()),
-        })
+        let sk = key();
+        let unsigned = scone_core::Transaction::Register(Register::register_signed(
+            DomainId::from_name(&DomainName::new(name).unwrap()),
+            1,
+            scone_core::Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        scone_core::Transaction::Register(Register::register_signed(
+            DomainId::from_name(&DomainName::new(name).unwrap()),
+            1,
+            scone_core::Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            sk.sign(&payload),
+        ))
     }
 
     fn update_tx(name: &str, sequence: u64) -> scone_core::Transaction {
-        scone_core::Transaction::Update(Update {
-            domain_id: DomainId::from_name(&DomainName::new(name).unwrap()),
-            owner: OwnerId::from_bytes([1; 32]),
+        let sk = key();
+        let unsigned = scone_core::Transaction::Update(Update::update_signed(
+            DomainId::from_name(&DomainName::new(name).unwrap()),
             sequence,
-            record_hash: RecordHash::from_bytes([sequence as u8; 32]),
-            timestamp: 1,
-        })
+            RecordHash::from_bytes([sequence as u8; 32]),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        scone_core::Transaction::Update(Update::update_signed(
+            DomainId::from_name(&DomainName::new(name).unwrap()),
+            sequence,
+            RecordHash::from_bytes([sequence as u8; 32]),
+            sk.public_key(),
+            sk.sign(&payload),
+        ))
     }
 
     #[test]

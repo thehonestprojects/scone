@@ -11,6 +11,7 @@ use crate::error::{BlockchainError, Result};
 use crate::genesis::{genesis, genesis_hash};
 use crate::merkle::tx_root;
 use crate::state::ChainState;
+use crate::validate::validate_transaction;
 
 /// An in-memory canonical blockchain: genesis + accepted blocks, with
 /// the authoritative [`ChainState`].
@@ -141,8 +142,10 @@ impl<C: Consensus> Blockchain<C> {
                 got: header.height,
             });
         }
-        // Version: same rule as the wire format (non-zero, not future).
-        if header.version == 0 || header.version > PROTOCOL_VERSION {
+        // Version: exactly the local protocol version. Lower (v1,
+        // pre-signature format) is a different, incompatible block
+        // format; higher is unknown.
+        if header.version != PROTOCOL_VERSION {
             return Err(BlockchainError::InvalidVersion(header.version));
         }
         // Bounded transaction list.
@@ -162,11 +165,14 @@ impl<C: Consensus> Blockchain<C> {
         // Consensus hooks (PoW etc. — future).
         self.consensus.validate_header(header)?;
 
-        // Transactions: consensus validation and deterministic
-        // application, on a scratch state (atomic per block).
+        // Transactions: cryptographic validation (owner/key binding
+        // recomputed, signature over the recomputed canonical
+        // payload), consensus hooks and deterministic application, on
+        // a scratch state (atomic per block).
         // ponytail: full state clone per block; revert-journal if the domain count makes it costly
         let mut next_state = self.state.clone();
         for tx in &block.transactions {
+            validate_transaction(tx)?;
             self.consensus.validate_tx(tx)?;
             next_state.apply(tx)?;
         }
@@ -184,9 +190,8 @@ mod tests {
     use super::*;
     use crate::error::BlockchainError;
     use crate::txid::transaction_id;
-    use scone_core::{
-        DomainId, DomainName, OwnerId, Proof, RecordHash, Register, Transaction, Update,
-    };
+    use scone_core::{DomainId, DomainName, Proof, RecordHash, Register, Transaction, Update};
+    use scone_crypto::{Signature, SigningKey};
     use scone_protocol::codec::{decode_complete, encode_to_vec};
     use scone_protocol::{BlockHeader, MerkleRoot};
 
@@ -194,23 +199,53 @@ mod tests {
         DomainId::from_name(&DomainName::new(name).unwrap())
     }
 
-    fn register_tx(name: &str, owner_byte: u8) -> Transaction {
-        Transaction::Register(Register {
-            domain_id: domain_id(name),
-            owner: OwnerId::from_bytes([owner_byte; 32]),
-            timestamp: 1,
-            proof: Proof::from_bytes(Vec::new()),
-        })
+    /// Re-signs a transaction over its canonical signing payload.
+    fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        match unsigned {
+            Transaction::Register(mut r) => {
+                r.signature = sk.sign(&payload);
+                Transaction::Register(r)
+            }
+            Transaction::Update(mut u) => {
+                u.signature = sk.sign(&payload);
+                Transaction::Update(u)
+            }
+        }
     }
 
-    fn update_tx(name: &str, owner_byte: u8, sequence: u64) -> Transaction {
-        Transaction::Update(Update {
-            domain_id: domain_id(name),
-            owner: OwnerId::from_bytes([owner_byte; 32]),
+    fn unsigned_register(name: &str, seed: u8) -> Transaction {
+        Transaction::Register(Register::register_signed(
+            domain_id(name),
+            1,
+            Proof::from_bytes(Vec::new()),
+            SigningKey::from_bytes([seed; 32]).public_key(),
+            Signature::from_bytes([0; 64]),
+        ))
+    }
+
+    fn register_tx(name: &str, seed: u8) -> Transaction {
+        sign(
+            unsigned_register(name, seed),
+            &SigningKey::from_bytes([seed; 32]),
+        )
+    }
+
+    fn unsigned_update(name: &str, seed: u8, sequence: u64) -> Transaction {
+        Transaction::Update(Update::update_signed(
+            domain_id(name),
             sequence,
-            record_hash: RecordHash::from_bytes([sequence as u8; 32]),
-            timestamp: 1,
-        })
+            RecordHash::from_bytes([sequence as u8; 32]),
+            SigningKey::from_bytes([seed; 32]).public_key(),
+            Signature::from_bytes([0; 64]),
+        ))
+    }
+
+    fn update_tx(name: &str, seed: u8, sequence: u64) -> Transaction {
+        sign(
+            unsigned_update(name, seed, sequence),
+            &SigningKey::from_bytes([seed; 32]),
+        )
     }
 
     fn make_block(prev: BlockHash, height: u64, txs: Vec<Transaction>) -> Block {
@@ -286,7 +321,11 @@ mod tests {
             .unwrap();
 
         let domain = chain.state().domain(&domain_id("example.uip")).unwrap();
-        assert_eq!(domain.owner, OwnerId::from_bytes([1; 32]));
+        let sk = SigningKey::from_bytes([1; 32]);
+        assert_eq!(
+            domain.owner,
+            crate::validate::owner_from_public_key(&sk.public_key())
+        );
         assert_eq!(domain.sequence, 1);
         assert_eq!(domain.record_hash, Some(RecordHash::from_bytes([1; 32])));
     }
@@ -380,7 +419,8 @@ mod tests {
     #[test]
     fn invalid_version_rejected() {
         let mut chain = Blockchain::new();
-        for version in [0u32, PROTOCOL_VERSION + 1] {
+        // 0, future versions AND the old v1 format are all rejected.
+        for version in [0u32, 1, PROTOCOL_VERSION + 1] {
             let mut block = child(&chain, vec![]);
             block.header.version = version;
             assert_eq!(
@@ -656,5 +696,119 @@ mod tests {
             transaction_id(&block.transactions[0]).unwrap(),
             transaction_id(&tx).unwrap()
         );
+    }
+
+    // ---- Signed-transaction forgery tests (M2) ----
+
+    #[test]
+    fn forged_signature_is_rejected() {
+        let mut chain = Blockchain::new();
+        let mut tx = register_tx("example.uip", 1);
+        if let Transaction::Register(r) = &mut tx {
+            let mut raw = r.signature.to_bytes();
+            raw[0] ^= 0x01;
+            r.signature = Signature::from_bytes(raw);
+        }
+        let block = child(&chain, vec![tx]);
+        assert_eq!(
+            chain.push_block(&block),
+            Err(BlockchainError::InvalidSignature)
+        );
+        assert_eq!(chain.height(), 0);
+        assert!(chain.state().is_empty());
+    }
+
+    #[test]
+    fn signature_by_non_matching_key_is_rejected() {
+        // owner/public_key consistent (owner of seed 2), but the
+        // signature was produced by the key of seed 1.
+        let mut chain = Blockchain::new();
+        let mut tx = unsigned_register("example.uip", 2);
+        tx = sign(tx, &SigningKey::from_bytes([1; 32]));
+        let block = child(&chain, vec![tx]);
+        assert_eq!(
+            chain.push_block(&block),
+            Err(BlockchainError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn tampered_payload_after_signing_is_rejected() {
+        // Sign correctly, then modify a protected field: the
+        // recomputed payload no longer matches the signature.
+        let mut chain = Blockchain::new();
+        let mut tx = register_tx("example.uip", 1);
+        if let Transaction::Register(r) = &mut tx {
+            r.timestamp = 999; // protected by the signature
+        }
+        let block = child(&chain, vec![tx]);
+        assert_eq!(
+            chain.push_block(&block),
+            Err(BlockchainError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn owner_not_derived_from_embedded_key_is_rejected() {
+        let tx = unsigned_register("example.uip", 2);
+        // Consistent signature by seed 2's key…
+        let tx = sign(tx, &SigningKey::from_bytes([2; 32]));
+        // …but a forged owner field. The forgery is built at the WIRE
+        // level (encode valid → flip the owner bytes → decode): the
+        // in-memory API cannot construct an owner-forged Register
+        // anymore (Encode validates the binding, docs/transactions.md).
+        let mut raw = scone_protocol::encode_to_vec(&tx).unwrap();
+        // Layout: disc(1) version(1) domain_id(32) owner(32) ...
+        raw[2 + 32..2 + 64].copy_from_slice(
+            crate::validate::owner_from_public_key(&SigningKey::from_bytes([9; 32]).public_key())
+                .as_bytes(),
+        );
+        let forged_result = scone_protocol::decode_complete::<Transaction>(&raw);
+        assert!(
+            forged_result.is_err(),
+            "owner-forged Register must be rejected on decode (binding owner/pk)"
+        );
+        // Defense in depth: the chain itself also refuses a forged owner
+        // if one ever reaches push (e.g. built in memory then validated).
+        // (Covered by `signature_by_non_matching_key_is_rejected` path.)
+    }
+
+    #[test]
+    fn forged_update_for_someone_elses_domain_is_rejected() {
+        // The attacker (seed 2) correctly signs an Update but the
+        // domain belongs to seed 1: NotOwner at application time.
+        let mut chain = Blockchain::new();
+        chain
+            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .unwrap();
+        let attack = update_tx("example.uip", 2, 1);
+        let block = child(&chain, vec![attack]);
+        assert_eq!(chain.push_block(&block), Err(BlockchainError::NotOwner));
+    }
+
+    #[test]
+    fn signed_chain_genesis_block1_block2_deterministic_replay() {
+        let assemble = || {
+            let sk = SigningKey::from_bytes([5; 32]);
+            let mut chain = Blockchain::new();
+            chain
+                .push_block(&child(&chain, vec![register_tx("example.uip", 5)]))
+                .unwrap();
+            let _ = sk;
+            chain
+                .push_block(&child(&chain, vec![update_tx("example.uip", 5, 1)]))
+                .unwrap();
+            chain
+                .push_block(&child(&chain, vec![update_tx("example.uip", 5, 2)]))
+                .unwrap();
+            chain
+        };
+        let left = assemble();
+        let right = assemble();
+        assert_eq!(left.height(), 3);
+        assert_eq!(left.tip_hash(), right.tip_hash());
+        assert_eq!(left.state(), right.state());
+        let domain = left.state().domain(&domain_id("example.uip")).unwrap();
+        assert_eq!(domain.sequence, 2);
     }
 }

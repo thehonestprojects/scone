@@ -127,32 +127,41 @@ impl ChainState {
 mod tests {
     use super::*;
     use scone_core::{DomainName, Proof, Register, Update};
+    use scone_crypto::{Signature, SigningKey};
 
     fn domain_id(name: &str) -> DomainId {
         DomainId::from_name(&DomainName::new(name).unwrap())
     }
 
-    fn owner(byte: u8) -> OwnerId {
-        OwnerId::from_bytes([byte; 32])
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes([seed; 32])
     }
 
-    fn register(name: &str, owner_byte: u8) -> Transaction {
-        Transaction::Register(Register {
-            domain_id: domain_id(name),
-            owner: owner(owner_byte),
-            timestamp: 1,
-            proof: Proof::from_bytes(Vec::new()),
-        })
+    /// Note: these fixtures carry a placeholder signature; `apply`
+    /// checks state rules and the owner/key binding, not the crypto
+    /// (that is `validate_transaction`, exercised in `validate.rs`).
+    fn register(name: &str, seed: u8) -> Transaction {
+        Transaction::Register(Register::register_signed(
+            domain_id(name),
+            1,
+            Proof::from_bytes(Vec::new()),
+            key(seed).public_key(),
+            Signature::from_bytes([0; 64]),
+        ))
     }
 
-    fn update(name: &str, owner_byte: u8, sequence: u64) -> Transaction {
-        Transaction::Update(Update {
-            domain_id: domain_id(name),
-            owner: owner(owner_byte),
+    fn update(name: &str, seed: u8, sequence: u64) -> Transaction {
+        Transaction::Update(Update::update_signed(
+            domain_id(name),
             sequence,
-            record_hash: RecordHash::from_bytes([sequence as u8; 32]),
-            timestamp: 1,
-        })
+            RecordHash::from_bytes([sequence as u8; 32]),
+            key(seed).public_key(),
+            Signature::from_bytes([0; 64]),
+        ))
+    }
+
+    fn owner(seed: u8) -> OwnerId {
+        crate::validate::owner_from_public_key(&key(seed).public_key())
     }
 
     #[test]

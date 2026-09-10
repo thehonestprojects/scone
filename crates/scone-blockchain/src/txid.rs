@@ -63,28 +63,36 @@ mod tests {
     use super::*;
     use crate::error::BlockchainError;
     use scone_core::{DomainId, DomainName, OwnerId, Proof, RecordHash, Register, Update};
+    use scone_crypto::{Signature, SigningKey};
 
     fn domain_id(name: &str) -> DomainId {
         DomainId::from_name(&DomainName::new(name).unwrap())
     }
 
+    fn key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes([seed; 32])
+    }
+
     fn register() -> Register {
-        Register {
-            domain_id: domain_id("example.uip"),
-            owner: OwnerId::from_bytes([1; 32]),
-            timestamp: 1_700_000_000,
-            proof: Proof::from_bytes(vec![0xaa; 4]),
-        }
+        let sk = key(1);
+        Register::register_signed(
+            domain_id("example.uip"),
+            1_700_000_000,
+            Proof::from_bytes(vec![0xaa; 4]),
+            sk.public_key(),
+            sk.sign(b"fixture"),
+        )
     }
 
     fn update() -> Update {
-        Update {
-            domain_id: domain_id("example.uip"),
-            owner: OwnerId::from_bytes([1; 32]),
-            sequence: 1,
-            record_hash: RecordHash::from_bytes([9; 32]),
-            timestamp: 1_700_000_000,
-        }
+        let sk = key(1);
+        Update::update_signed(
+            domain_id("example.uip"),
+            1,
+            RecordHash::from_bytes([9; 32]),
+            sk.public_key(),
+            sk.sign(b"fixture"),
+        )
     }
 
     #[test]
@@ -133,9 +141,16 @@ mod tests {
 
         let mut other_owner = register();
         other_owner.owner = OwnerId::from_bytes([2; 32]);
-        assert_ne!(
-            transaction_id(&Transaction::Register(other_owner)).unwrap(),
-            base
+        let _ = other_owner;
+        // Owner-forged Registers cannot be encoded anymore (Encode
+        // validates the owner/pk binding — docs/transactions.md) ; TxId
+        // sensitivity to `owner` is asserted at the wire level instead.
+        let raw = scone_protocol::encode_to_vec(&Transaction::Register(register())).unwrap();
+        let mut forged = raw.clone();
+        forged[2 + 32..2 + 64].copy_from_slice(OwnerId::from_bytes([2; 32]).as_bytes());
+        assert!(
+            scone_protocol::decode_complete::<Transaction>(&forged).is_err(),
+            "owner-forged Register must be rejected on decode"
         );
 
         let mut other_timestamp = register();
@@ -151,19 +166,37 @@ mod tests {
             transaction_id(&Transaction::Register(other_proof)).unwrap(),
             base
         );
+
+        let mut other_key = register();
+        other_key.public_key = key(2).public_key();
+        other_key.owner = crate::validate::owner_from_public_key(&key(2).public_key());
+        assert_ne!(
+            transaction_id(&Transaction::Register(other_key)).unwrap(),
+            base
+        );
+
+        let mut other_signature = register();
+        other_key_signature_bump(&mut other_signature);
+        assert_ne!(
+            transaction_id(&Transaction::Register(other_signature)).unwrap(),
+            base
+        );
+    }
+
+    /// Flips one byte of the signature in place (test helper).
+    fn other_key_signature_bump(register: &mut Register) {
+        let mut raw = register.signature.to_bytes();
+        raw[63] ^= 0x01;
+        register.signature = Signature::from_bytes(raw);
     }
 
     #[test]
     fn update_field_sensitivity() {
         let base = transaction_id(&Transaction::Update(update())).unwrap();
 
-        let mut other_owner = update();
-        other_owner.owner = OwnerId::from_bytes([2; 32]);
-        assert_ne!(
-            transaction_id(&Transaction::Update(other_owner)).unwrap(),
-            base
-        );
-
+        // Note: owner alone cannot change without the key (binding
+        // enforced at encode); key+owner together is the meaningful
+        // variation, checked below.
         let mut other_sequence = update();
         other_sequence.sequence = 2;
         assert_ne!(
@@ -178,10 +211,11 @@ mod tests {
             base
         );
 
-        let mut other_timestamp = update();
-        other_timestamp.timestamp += 1;
+        let mut other_key = update();
+        other_key.public_key = key(2).public_key();
+        other_key.owner = crate::validate::owner_from_public_key(&key(2).public_key());
         assert_ne!(
-            transaction_id(&Transaction::Update(other_timestamp)).unwrap(),
+            transaction_id(&Transaction::Update(other_key)).unwrap(),
             base
         );
     }

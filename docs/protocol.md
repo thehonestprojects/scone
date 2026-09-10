@@ -9,14 +9,19 @@ Les éléments marqués **(provisoire)** ne sont pas figés.
 
 ## Version du protocole
 
-- constante : `PROTOCOL_VERSION: u32 = 1` (`scone-protocol`) ;
+- constante : `PROTOCOL_VERSION: u32 = 2` (`scone-protocol`) ;
 - transportée par `Hello.version` (handshake) et `BlockHeader.version` ;
 - règles de compatibilité :
   - version reçue **supérieure** à la version locale → rejet
     (`ProtocolError::UnsupportedVersion`) ; le nœud ne devine pas le
     format d'une version qu'il ne connaît pas ;
   - version `0` → invalide ;
-  - version inférieure → acceptée (aucune n'existe encore) ;
+  - version **1** (transactions non signées, jalon M1) → rejet
+    **explicite** pour les transactions (octet de version du format
+    tx, voir `/docs/transactions.md`) et pour les blocs
+    (`BlockHeader.version` doit être exactement la version locale) ;
+    le handshake `Hello` v1 reste accepté (un pair en retard sera
+    rejeté par les règles de format) ;
 - pas de découpage majeur/mineur à ce stade : un entier unique,
   incrémenté à toute rupture de format wire.
 
@@ -87,7 +92,7 @@ restent définies par `scone-core` (voir `/docs/naming.md`).
 ## Transactions
 
 ```text
-Transaction = disc u8 || payload
+Transaction = disc u8 || version u8 || payload
 ```
 
 | Discriminant | Type |
@@ -95,24 +100,34 @@ Transaction = disc u8 || payload
 | `0x01` | `Register` |
 | `0x02` | `Update` |
 
+L'octet `version` (valeur courante `0x02`) suit le discriminant : un
+flux v1 (sans cet octet) est rejeté explicitement
+(`UnsupportedVersion(1)`). **Toutes les transactions sont signées**
+(Ed25519) : spécification complète, payload signé et règles de
+validation dans **`/docs/transactions.md`** (normatif).
+
 ### REGISTER (0x01)
 
 ```text
-domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256)
+domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
-`proof` est opaque : réservé au futur PoW de registration. Les
-invariants métier restent ceux de `scone-core`.
+`proof` est opaque : réservé au futur PoW de registration.
+`public_key` est la clé Ed25519 du signataire (32 octets exactement) ;
+`owner` doit être la dérivation BLAKE3 de cette clé (recomputé,
+jamais cru) ; `signature` fait exactement 64 octets.
 
 ### UPDATE (0x02)
 
 ```text
-domain_id[32] owner[32] sequence.v record_hash[32] timestamp.v
+domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
 ```
 
-Invariant re-vérifié au décodage : `sequence > 0`. La transaction ne
-porte que des références compactes — le contenu DNS complet reste dans
-la DHT (voir ci-dessous).
+Invariant re-vérifié au décodage : `sequence > 0` et `owner` ==
+dérivation de `public_key`. Pas de `timestamp` en v2 : l'ordre passe
+par `sequence`. La transaction ne porte que des références
+compactes — le contenu DNS complet reste dans la DHT (voir
+ci-dessous).
 
 ## Records DNS (côté DHT)
 
@@ -305,13 +320,21 @@ objet canonique → encodage binaire canonique → hash / signature
 
 Le décodage ne panique jamais sur des données réseau.
 
-## Signatures (futur)
+## Signatures
 
-- schéma prévu : **Ed25519 (provisoire)** via `scone-crypto` ;
-- le payload signé est l'encodage canonique produit par
-  `scone-protocol` (ex. `DnsRecord` pour un `SignedDnsRecord`) ;
-- la vérification croise `record + owner + signature` avec l'identité
-  enregistrée dans la blockchain.
+- schéma : **Ed25519** (RFC 8032) via `scone-crypto`
+  (`ed25519-dalek`, vérification `verify_strict` — signatures
+  malléables et clés faibles rejetées) ;
+- **transactions de la chaîne** (format v2) : chaque `Register` /
+  `Update` embarque `public_key` (32 o) + `signature` (64 o) sur le
+  payload `"SCONE-TX-SIG-V1" || canonical_encode(tx_sans_signature)` ;
+  spécification normative complète : `/docs/transactions.md` ;
+- **records DHT** (`SignedDnsRecord`) : le payload signé est
+  l'encodage canonique du `DnsRecord` ; la vérification croise
+  `record + owner + signature` avec l'identité enregistrée dans la
+  blockchain ;
+- règle transversale : `owner` et tous les hashs/engagements sont
+  **recomputés**, jamais pris d'une valeur fournie.
 
 ## Règles de consensus (futur)
 
