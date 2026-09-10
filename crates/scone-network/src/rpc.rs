@@ -48,6 +48,12 @@ pub enum RpcRequest {
     /// a chain-valid record is locally cached, its decoded DNS
     /// records. Never hits the network.
     DomainInfo { name: String },
+    /// Synchronous verified resolution for the DNS server (M6):
+    /// on-chain state plus the chain-valid record from the LOCAL
+    /// cache, as wire DNS rdata. Never parks a DHT waiter — the DNS
+    /// path must answer in one round trip (SERVFAIL semantics on a
+    /// missing record are the caller's business).
+    ResolveLocal { name: String },
 }
 
 /// Control response returned to the CLI.

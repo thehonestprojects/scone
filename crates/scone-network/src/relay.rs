@@ -46,6 +46,7 @@ use scone_core::{DomainId, DomainName, SignedDnsRecord, Transaction};
 use scone_protocol::{Block, BlockHash, Message, PROTOCOL_VERSION, decode_complete, encode_to_vec};
 use scone_storage::{NodeStore, RedbStore, integration as store_integration};
 use serde_json::{Value, json};
+use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
@@ -272,6 +273,70 @@ impl Relay {
         // RPC → relay command channel.
         let (command_tx, mut command_rx) = mpsc::channel::<RelayCommand>(64);
 
+        // ---- UDP DNS surface (M6), optional -------------------------
+        // The DNS server talks to the relay core through the same
+        // local RPC as the CLI (`ResolveLocal`: one round trip,
+        // verified, no parked DHT waiter) — the verified path stays
+        // single and identical for every consumer.
+        let dns_task: Option<tokio::task::JoinHandle<()>> = match self.config.dns_addr {
+            Some(dns_addr) => {
+                let upstreams = crate::dns::parse_upstreams(&self.config.dns_upstreams)?;
+                let socket = Arc::new(UdpSocket::bind(dns_addr).await?);
+                let dns_listen = socket.local_addr()?;
+                info!(
+                    peer = %self.peer_id(),
+                    dns_addr = %dns_listen,
+                    upstreams = upstreams.len(),
+                    "dns listening (udp)"
+                );
+                // Machine-readable contract, mirroring `p2p:`.
+                println!("dns: {dns_listen}");
+                let rpc_client = crate::rpc::RpcClient::new(self.rpc_addr);
+                let resolver: crate::dns::Resolver = Arc::new(move |name| {
+                    let client = rpc_client.clone();
+                    Box::pin(async move {
+                        match client
+                            .request(crate::rpc::RpcRequest::ResolveLocal { name })
+                            .await
+                        {
+                            Ok(crate::rpc::RpcResponse::Ok { data }) => {
+                                let registered = data["registered"].as_bool().unwrap_or(false);
+                                let mut rdata = Vec::new();
+                                for entry in data["dns"].as_array().unwrap_or(&Vec::new()) {
+                                    if let (Some(tc), Some(hex)) =
+                                        (entry["type"].as_u64(), entry["rdata"].as_str())
+                                        && let Ok(bytes) = decode_hex_static(hex)
+                                        && let Ok(tc) = u16::try_from(tc)
+                                    {
+                                        rdata.push((tc, bytes));
+                                    }
+                                }
+                                if registered {
+                                    Ok(Some(crate::dns::Resolved {
+                                        rdata,
+                                        registered: true,
+                                    }))
+                                } else {
+                                    Ok(None)
+                                }
+                            }
+                            Ok(crate::rpc::RpcResponse::Error { message }) => {
+                                Err(format!("relay rpc: {message}"))
+                            }
+                            Err(e) => Err(format!("relay rpc unreachable: {e}")),
+                        }
+                    })
+                });
+                let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::Cache::new()));
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::dns::run_udp(socket, resolver, upstreams, cache).await {
+                        warn!("dns server ended: {e}");
+                    }
+                }))
+            }
+            None => None,
+        };
+
         // RPC accept loop (one task per connection, M2: at most
         // MAX_RPC_CONNECTIONS concurrent — extra connections wait for
         // a slot instead of exhausting fds/memory).
@@ -316,6 +381,7 @@ impl Relay {
         // The accept loop runs for the life of the process; hold the
         // join handle so the task is not detached silently.
         tokio::pin!(rpc_task);
+        let _dns_task = dns_task; // held for the life of the relay
 
         let mut produce_ticker = tokio::time::interval(self.config.produce_interval);
         produce_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -452,6 +518,10 @@ impl Relay {
                 Ok(data) => RpcResponse::ok(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             }),
+            RpcRequest::ResolveLocal { name } => Dispatched::Now(match self.resolve_local(&name) {
+                Ok(data) => RpcResponse::ok(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }),
         }
     }
 
@@ -570,6 +640,46 @@ impl Relay {
             "owner": hex(state.owner.as_bytes()),
             "sequence": state.sequence,
             "record_hash": state.record_hash.map(|h| hex(h.as_bytes())),
+            "dns": dns,
+        }))
+    }
+
+    // ---- DNS (M6) ------------------------------------------------------
+
+    /// `resolve_local`: the DNS server's one-round-trip verified
+    /// resolution. Shape: `{registered, owner, sequence, dns}` where
+    /// `dns` is one `{type, ttl, rdata_hex}` object per record — the
+    /// DNS module owns the wire encoding, this owns the verification.
+    /// An unregistered domain answers `registered: false`; a
+    /// registered one without a chain-valid cached record answers
+    /// `dns: []` (NODATA) — availability is never authority.
+    fn resolve_local(&self, name: &str) -> Result<Value> {
+        let domain = DomainName::new(name).map_err(|e| NetworkError::Blockchain(e.into()))?;
+        let id = DomainId::from_name(&domain);
+        let Some(state) = self.chain.state().domain(&id) else {
+            return Ok(json!({
+                "name": domain.canonical(),
+                "registered": false,
+                "dns": [],
+            }));
+        };
+        let dns = match self.store.dht_cache(&id)? {
+            Some(bytes) => match decode_complete::<SignedDnsRecord>(&bytes) {
+                Ok(record) if self.verify_record_against_chain(&record)? => record
+                    .record
+                    .records
+                    .iter()
+                    .filter_map(crate::dns::encode_rdata_pub)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        Ok(json!({
+            "name": domain.canonical(),
+            "registered": true,
+            "owner": hex(state.owner.as_bytes()),
+            "sequence": state.sequence,
             "dns": dns,
         }))
     }
@@ -1030,6 +1140,16 @@ fn hex(bytes: &[u8]) -> String {
         out.push(HEX[usize::from(b & 0x0f)] as char);
     }
     out
+}
+
+/// Strict lowercase-hex decode used by the DNS resolver closure.
+fn decode_hex_static(text: &str) -> std::result::Result<Vec<u8>, ()> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(|_| ()))
+        .collect()
 }
 
 /// Renders the record set of a [`SignedDnsRecord`] as one JSON object

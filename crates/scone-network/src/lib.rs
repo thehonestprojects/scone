@@ -30,6 +30,7 @@
 
 pub mod behaviour;
 pub mod config;
+pub mod dns;
 pub mod error;
 pub mod mempool;
 pub mod relay;
@@ -41,6 +42,7 @@ pub use config::{
     Config, DEFAULT_MEMPOOL_CAPACITY, DEFAULT_PRODUCE_INTERVAL, MAX_DHT_WAITERS,
     MAX_RPC_CONNECTIONS,
 };
+pub use dns::{ANSWER_TTL, Cache, CacheEntry, MAX_INFLIGHT_UDP, MAX_PACKET_LEN, Resolved};
 pub use error::{NetworkError, Result};
 pub use mempool::Mempool;
 pub use relay::Relay;

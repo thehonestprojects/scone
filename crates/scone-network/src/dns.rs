@@ -1,0 +1,892 @@
+//! UDP DNS server (milestone M6): authoritative for names the local
+//! chain state knows, optional recursive fallback (`addr:port`
+//! upstreams) for everything else. Built strictly on the existing
+//! verified path: the relay is the only resolver — this module never
+//! touches the chain, the store or the DHT itself.
+//!
+//! # Wire codec (RFC 1035 subset, strict)
+//!
+//! - Query: 12-byte header, exactly **one** question, **no** name
+//!   compression (compression pointers in a question are refused),
+//!   QCLASS = IN. QNAME labels are lowercased and validated against
+//!   the Scone charset (strict subset of LDH: `[a-z0-9-]`, hyphen
+//!   neither first nor last — `_` accepted for SRV-style lookups but
+//!   rejected by `DomainName` on the authoritative path).
+//! - Response: QR|AA|RD(echo)|RA bits, the question echoed verbatim,
+//!   answers with **uncompressed** owner names (the qname), TTL 60,
+//!   bounded by [`MAX_PACKET_LEN`] (a truncated answer set is better
+//!   than an oversized datagram; real resolvers retry over TCP which
+//!   this devnet milestone does not serve).
+//! - Anything unparseable is answered with **silence** (garbage must
+//!   cost nothing); `REFUSED` is returned for a QCLASS we refuse.
+//!
+//! # Resolution model
+//!
+//! ```text
+//! UDP query → in-DNS-cache? → answer (bounded TTL)
+//!          → Scone-charset qname? → authoritative path:
+//!               longest-suffix apex search → Resolver (the relay):
+//!                 chain state + chain-verified record → answers
+//!                 unknown/unregistered apex chain-wide → NXDOMAIN
+//!                 registered apex, no matching rdata → NODATA
+//!                 registered apex, no record published → NODATA
+//!          → else → fallback upstreams (if configured) → answer
+//!          → else → REFUSED
+//! ```
+//!
+//! The cache is keyed by (qname, qtype), bounded (LRU-ish: random
+//! eviction through an index map — see [`Cache`]) and only ever holds
+//! `authoritative: true` answers computed by the verified path, plus
+//! fallback answers with their own (clamped) TTL.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use scone_core::{DomainName, RecordData};
+use tokio::net::UdpSocket;
+use tracing::{debug, info, warn};
+
+use crate::error::{NetworkError, Result};
+
+// ---- protocol constants -------------------------------------------------
+
+const CLASS_IN: u16 = 1;
+pub const TYPE_A: u16 = 1;
+pub const TYPE_NS: u16 = 2;
+pub const TYPE_CNAME: u16 = 5;
+pub const TYPE_MX: u16 = 15;
+pub const TYPE_TXT: u16 = 16;
+pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_ANY: u16 = 255;
+
+const RCODE_NOERROR: u8 = 0;
+const RCODE_SERVFAIL: u8 = 2;
+const RCODE_NXDOMAIN: u8 = 3;
+const RCODE_REFUSED: u8 = 5;
+
+/// Hard cap on a DNS datagram (query or response).
+pub const MAX_PACKET_LEN: usize = 4096;
+/// TTL served on authoritative answers (devnet: short, chain-sequenced).
+pub const ANSWER_TTL: u32 = 60;
+/// Maximum TTL accepted on a cached fallback answer.
+pub const MAX_FALLBACK_TTL: u32 = 600;
+/// Maximum names cached (positive and negative).
+pub const CACHE_CAPACITY: usize = 1024;
+/// Maximum simultaneously in-flight UDP queries (anti-flood bound).
+pub const MAX_INFLIGHT_UDP: usize = 256;
+/// Per-upstream forward timeout.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ---- resolver abstraction -----------------------------------------------
+
+/// Answer of the authoritative path for one apex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// Chain-valid record set of the apex, as `(type_code, rdata)`
+    /// wire pairs (already DNS-encoded; empty = NODATA).
+    pub rdata: Vec<(u16, Vec<u8>)>,
+    /// True when the apex is registered on-chain.
+    pub registered: bool,
+}
+
+/// The authoritative resolver — the relay, behind one async closure.
+/// `Ok(None)` = apex not registered on-chain (→ NXDOMAIN);
+/// `Ok(Some)` = apex state (records possibly empty → NODATA);
+/// `Err` = local failure (→ SERVFAIL).
+pub type Resolver = Arc<
+    dyn Fn(
+            String,
+        )
+            -> futures::future::BoxFuture<'static, std::result::Result<Option<Resolved>, String>>
+        + Send
+        + Sync,
+>;
+
+// ---- server -------------------------------------------------------------
+
+/// Runs the UDP DNS loop on an already-bound socket.
+///
+/// # Errors
+///
+/// [`NetworkError::Io`] only on a fatal socket failure (the loop
+/// itself never returns on individual packet errors).
+pub async fn run_udp(
+    socket: Arc<UdpSocket>,
+    resolver: Resolver,
+    upstreams: Vec<SocketAddr>,
+    cache: Arc<tokio::sync::Mutex<Cache>>,
+) -> Result<()> {
+    let listen = socket.local_addr()?;
+    info!(%listen, upstreams = upstreams.len(), "dns: listening udp");
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_UDP));
+    let mut buf = vec![0u8; MAX_PACKET_LEN];
+    loop {
+        let (n, peer) = socket.recv_from(&mut buf).await?;
+        if n == 0 || n > MAX_PACKET_LEN {
+            continue;
+        }
+        let data = buf[..n].to_vec();
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            continue; // at capacity: drop, the client retries
+        };
+        let socket = socket.clone();
+        let resolver = resolver.clone();
+        let upstreams = upstreams.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            if let Some(resp) =
+                handle_packet(&resolver, &data, &upstreams, &mut *cache.lock().await).await
+                && resp.len() <= MAX_PACKET_LEN
+            {
+                let _ = socket.send_to(&resp, peer).await;
+            }
+            drop(permit);
+        });
+    }
+}
+
+/// Handles one datagram: cache → authoritative → fallback. Returns
+/// `None` for garbage (silence). Pure-ish entry point (the cache is
+/// injected), fully covered by tests.
+pub async fn handle_packet(
+    resolver: &Resolver,
+    data: &[u8],
+    upstreams: &[SocketAddr],
+    cache: &mut Cache,
+) -> Option<Vec<u8>> {
+    let q = parse_query(data)?;
+    // Cache hit (positive or negative).
+    if let Some(entry) = cache.get(&q.name, q.qtype) {
+        return Some(build_response(&q, data, &entry.answers, entry.rcode));
+    }
+    let (answers, rcode) = if scone_candidate(&q.name) {
+        authoritative(resolver, &q).await
+    } else if upstreams.is_empty() {
+        (Vec::new(), RCODE_REFUSED)
+    } else {
+        match forward(data, upstreams).await {
+            Some(resp) => {
+                // Pass the upstream answer through unchanged (it is a
+                // well-formed reply to our exact question) and cache
+                // its answers for the fallback path.
+                if let Some(extracted) = extract_answers(&resp, &q) {
+                    cache.put(
+                        q.name.clone(),
+                        q.qtype,
+                        CacheEntry {
+                            answers: extracted.0,
+                            rcode: RCODE_NOERROR,
+                            ttl: extracted.1.min(MAX_FALLBACK_TTL),
+                        },
+                    );
+                }
+                return Some(resp);
+            }
+            None => (Vec::new(), RCODE_SERVFAIL),
+        }
+    };
+    cache.put(
+        q.name.clone(),
+        q.qtype,
+        CacheEntry {
+            answers: answers.clone(),
+            rcode,
+            ttl: ANSWER_TTL,
+        },
+    );
+    Some(build_response(&q, data, &answers, rcode))
+}
+
+/// Longest-suffix apex search + record selection.
+async fn authoritative(resolver: &Resolver, q: &Query) -> (Vec<(u16, u32, Vec<u8>)>, u8) {
+    let labels: Vec<&str> = q.name.split('.').collect();
+    if labels.len() < 2 {
+        return (Vec::new(), RCODE_NXDOMAIN);
+    }
+    // Try the full name, then shorter suffixes, down to 2 labels.
+    for keep in (2..=labels.len()).rev() {
+        let apex: String = labels[labels.len() - keep..].join(".");
+        let rel: Vec<&str> = if keep == labels.len() {
+            Vec::new()
+        } else {
+            labels[..labels.len() - keep].to_vec()
+        };
+        match resolver(apex.clone()).await {
+            Ok(Some(resolved)) => {
+                let answers = select_answers(q, &resolved, &rel);
+                if !answers.is_empty() {
+                    debug!(apex = %apex, "dns: authoritative hit");
+                }
+                return (answers, RCODE_NOERROR);
+            }
+            Ok(None) => {
+                // Not registered at this suffix: try the parent.
+            }
+            Err(e) => {
+                // Local failure at a potentially-valid apex: SERVFAIL.
+                warn!(apex = %apex, "dns: resolver error: {e}");
+                return (Vec::new(), RCODE_SERVFAIL);
+            }
+        }
+    }
+    // No suffix registered anywhere: NXDOMAIN (also cached).
+    (Vec::new(), RCODE_NXDOMAIN)
+}
+
+/// Is the qname even a Scone candidate? Strict charset + valid TLD
+/// shape (cheap pre-filter; `DomainName` does the real validation on
+/// the resolver side).
+fn scone_candidate(name: &str) -> bool {
+    name.split('.').all(|label| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }) && name.len() <= DomainName::MAX_TOTAL_LEN
+        && name.split('.').count() >= 2
+        && name.rsplit('.').next().is_some_and(|tld| {
+            (1..=5).contains(&tld.len())
+                && tld
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// Filters a resolved record set down to wire answers for the query.
+/// A/AAAA queries also receive CNAMEs (alias following); the wildcard
+/// label `*` matches any relative name when nothing better exists.
+/// Unknown-to-wire types simply do not answer → NODATA.
+fn select_answers(q: &Query, resolved: &Resolved, rel: &[&str]) -> Vec<(u16, u32, Vec<u8>)> {
+    let _rel = rel; // scone record sets carry no per-record name: all match
+    let addr_query = q.qtype == TYPE_A || q.qtype == TYPE_AAAA;
+    resolved
+        .rdata
+        .iter()
+        .filter(|(tc, _)| {
+            q.qtype == TYPE_ANY || *tc == q.qtype || (addr_query && *tc == TYPE_CNAME)
+        })
+        .map(|(tc, rd)| (*tc, ANSWER_TTL, rd.clone()))
+        .collect()
+}
+
+// ---- codec: read --------------------------------------------------------
+
+struct Query {
+    id: u16,
+    rd: bool,
+    name: String,
+    qtype: u16,
+}
+
+fn parse_query(b: &[u8]) -> Option<Query> {
+    if b.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([b[0], b[1]]);
+    let flags = u16::from_be_bytes([b[2], b[3]]);
+    if flags & 0x8000 != 0 {
+        return None; // a response, not a query
+    }
+    if u16::from_be_bytes([b[4], b[5]]) != 1 {
+        return None; // exactly one question
+    }
+    let mut i = 12;
+    let mut labels: Vec<String> = Vec::new();
+    loop {
+        let len = *b.get(i)? as usize;
+        i += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 != 0 {
+            return None; // compression pointer: refused
+        }
+        let lab = b.get(i..i + len)?;
+        i += len;
+        if !(1..=63).contains(&lab.len())
+            || !lab
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            return None;
+        }
+        labels.push(String::from_utf8(lab.to_vec()).ok()?.to_lowercase());
+    }
+    if labels.len() < 2 || labels.len() > 16 {
+        return None;
+    }
+    let qtype = u16::from_be_bytes(b.get(i..i + 2)?.try_into().ok()?);
+    let qclass = u16::from_be_bytes(b.get(i + 2..i + 4)?.try_into().ok()?);
+    if qclass != CLASS_IN {
+        return None;
+    }
+    Some(Query {
+        id,
+        rd: flags & 0x0100 != 0,
+        name: labels.join("."),
+        qtype,
+    })
+}
+
+// ---- codec: write -------------------------------------------------------
+
+fn build_response(
+    q: &Query,
+    original: &[u8],
+    answers: &[(u16, u32, Vec<u8>)],
+    rcode: u8,
+) -> Vec<u8> {
+    let question = question_bytes(original).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(12 + question.len() + 16 * answers.len());
+    out.extend_from_slice(&q.id.to_be_bytes());
+    // QR | AA | RD(echo) | RA | RCODE
+    let flags: u16 = 0x8000 | 0x0400 | (u16::from(q.rd) << 8) | 0x0080 | u16::from(rcode);
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&(u16::try_from(answers.len()).unwrap_or(u16::MAX)).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(question);
+    let Some(question) = question_bytes(original) else {
+        return out;
+    };
+    let qname = &question[..question.len() - 4]; // without QTYPE/QCLASS
+    for (tc, ttl, rdata) in answers {
+        out.extend_from_slice(qname);
+        out.extend_from_slice(&tc.to_be_bytes());
+        out.extend_from_slice(&CLASS_IN.to_be_bytes());
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&(u16::try_from(rdata.len()).unwrap_or(u16::MAX)).to_be_bytes());
+        out.extend_from_slice(rdata);
+    }
+    out
+}
+
+/// The raw question section (QNAME+QTYPE+QCLASS) of the original
+/// datagram, for verbatim echo.
+fn question_bytes(b: &[u8]) -> Option<&[u8]> {
+    let mut i = 12;
+    loop {
+        let len = *b.get(i)? as usize;
+        i += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        i += len;
+    }
+    b.get(12..i + 4)
+}
+
+/// Uncompressed wire name.
+fn encode_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in name.trim_end_matches('.').split('.') {
+        out.push(u8::try_from(label.len()).unwrap_or(0));
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+/// RDATA of a supported record type (`None` = not encodable).
+fn encode_rdata(r: &RecordData) -> Option<(u16, Vec<u8>)> {
+    match r {
+        RecordData::A(ip) => Some((TYPE_A, ip.octets().to_vec())),
+        RecordData::Aaaa(ip) => Some((TYPE_AAAA, ip.octets().to_vec())),
+        RecordData::Cname(n) | RecordData::Ns(n) => {
+            let tc = if matches!(r, RecordData::Cname(_)) {
+                TYPE_CNAME
+            } else {
+                TYPE_NS
+            };
+            Some((tc, encode_name(n.canonical())))
+        }
+        RecordData::Mx {
+            preference,
+            exchange,
+        } => {
+            let mut v = preference.to_be_bytes().to_vec();
+            v.extend_from_slice(&encode_name(exchange.canonical()));
+            Some((TYPE_MX, v))
+        }
+        RecordData::Txt(s) => Some((TYPE_TXT, char_strings(s))),
+        RecordData::Unknown { type_code, data } => {
+            Some((*type_code, data.clone())) // ≤ 4096 at decode
+        }
+    }
+}
+
+/// TXT character-strings: ≤255-byte chunks, each length-prefixed.
+fn char_strings(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return vec![0];
+    }
+    b.chunks(255)
+        .flat_map(|c| std::iter::once(c.len() as u8).chain(c.iter().copied()))
+        .collect()
+}
+
+/// Public wrapper for the relay's `resolve_local`: one record →
+/// `{type, ttl, rdata_hex}` (rdata in lowercase hex, ready for JSON).
+#[must_use]
+pub fn encode_rdata_pub(r: &RecordData) -> Option<serde_json::Value> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |bytes: &[u8]| -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0x0f)] as char);
+        }
+        out
+    };
+    encode_rdata(r)
+        .map(|(tc, rd)| serde_json::json!({ "type": tc, "ttl": ANSWER_TTL, "rdata": hex(&rd) }))
+}
+
+// ---- fallback -----------------------------------------------------------
+
+async fn forward(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    for up in upstreams {
+        let bind_addr = if up.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let Ok(sock) = UdpSocket::bind(bind_addr).await else {
+            continue;
+        };
+        if sock.send_to(query, up).await.is_ok() {
+            let mut buf = vec![0u8; MAX_PACKET_LEN];
+            if let Ok(Ok(n)) = tokio::time::timeout(FORWARD_TIMEOUT, sock.recv(&mut buf)).await {
+                buf.truncate(n);
+                return Some(buf);
+            }
+        }
+        warn!("dns: upstream {up} timed out");
+    }
+    None
+}
+
+/// One wire answer: `(type_code, ttl, rdata)`.
+pub type WireAnswer = (u16, u32, Vec<u8>);
+
+/// Extracts (answers, max-ttl) from a fallback reply to our question
+/// (uncompressed names assumed; anything odd → no caching).
+fn extract_answers(resp: &[u8], _q: &Query) -> Option<(Vec<WireAnswer>, u32)> {
+    if resp.len() < 12 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    let mut i = 12;
+    while resp.get(i).is_some_and(|&b| b != 0) {
+        i += 1 + resp[i] as usize;
+    }
+    i += 5; // root + QTYPE + QCLASS
+    let mut out = Vec::with_capacity(ancount);
+    let mut max_ttl = 0;
+    for _ in 0..ancount {
+        while resp.get(i).is_some_and(|&b| b != 0) {
+            i += 1 + resp[i] as usize;
+        }
+        i += 1; // root
+        let tc = u16::from_be_bytes([*resp.get(i)?, *resp.get(i + 1)?]);
+        let ttl = u32::from_be_bytes(resp.get(i + 4..i + 8)?.try_into().ok()?);
+        let rdlen = u16::from_be_bytes([*resp.get(i + 8)?, *resp.get(i + 9)?]) as usize;
+        let rdata = resp.get(i + 10..i + 10 + rdlen)?.to_vec();
+        out.push((tc, ttl.min(MAX_FALLBACK_TTL), rdata));
+        max_ttl = max_ttl.max(ttl.min(MAX_FALLBACK_TTL));
+        i += 10 + rdlen;
+    }
+    Some((out, max_ttl))
+}
+
+// ---- cache --------------------------------------------------------------
+
+/// One cached answer (positive: answers + NOERROR/NXDOMAIN; the
+/// rcode travels with it so negative caching works).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub answers: Vec<(u16, u32, Vec<u8>)>,
+    pub rcode: u8,
+    pub ttl: u32,
+}
+
+/// Bounded (qname, qtype) cache. Eviction: FIFO of keys when over
+/// capacity (simple, bounded, deterministic enough for a devnet
+/// resolver; no LRU bookkeeping to keep the hot path allocation-free).
+pub struct Cache {
+    entries: HashMap<(String, u16), (CacheEntry, std::time::Instant)>,
+    order: std::collections::VecDeque<(String, u16)>,
+    capacity: usize,
+    ttl_cap: u32,
+}
+
+impl Cache {
+    /// Cache with the default bounds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_bounds(CACHE_CAPACITY, MAX_FALLBACK_TTL)
+    }
+
+    /// Cache with explicit bounds (tests).
+    #[must_use]
+    pub fn with_bounds(capacity: usize, ttl_cap: u32) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+            ttl_cap,
+        }
+    }
+
+    /// Cached entry if present and not expired.
+    #[must_use]
+    pub fn get(&self, name: &str, qtype: u16) -> Option<CacheEntry> {
+        let (entry, at) = self.entries.get(&(name.to_string(), qtype))?;
+        if at.elapsed().as_secs() >= u64::from(entry.ttl.min(self.ttl_cap).max(1)) {
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    /// Inserts/refreshes an entry, evicting oldest keys over capacity.
+    pub fn put(&mut self, name: String, qtype: u16, entry: CacheEntry) {
+        let key = (name.clone(), qtype);
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(key, (entry, std::time::Instant::now()));
+        while self.entries.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Number of live entries (diagnostics/tests).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builds a DNS server config from raw strings (CLI path).
+///
+/// # Errors
+///
+/// [`NetworkError::InvalidRpc`] on an unparsable `addr:port`.
+pub fn parse_upstreams(list: &[String]) -> Result<Vec<SocketAddr>> {
+    list.iter()
+        .map(|s| {
+            s.parse::<SocketAddr>()
+                .map_err(|_| NetworkError::InvalidRpc(format!("bad dns upstream: {s}")))
+        })
+        .collect()
+}
+
+// ---- tests --------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(id: u16, rd: bool, name: &str, qtype: u16) -> Vec<u8> {
+        let mut b = vec![0; 12];
+        b[0..2].copy_from_slice(&id.to_be_bytes());
+        b[2..4].copy_from_slice(&(u16::from(rd) << 8).to_be_bytes()); // RD bit = 0x0100
+        b[4..6].copy_from_slice(&1u16.to_be_bytes());
+        for label in name.split('.') {
+            b.push(u8::try_from(label.len()).unwrap());
+            b.extend_from_slice(label.as_bytes());
+        }
+        b.push(0);
+        b.extend_from_slice(&qtype.to_be_bytes());
+        b.extend_from_slice(&CLASS_IN.to_be_bytes());
+        b
+    }
+
+    fn rcode_of(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[2], resp[3]]) & 0x000F
+    }
+
+    fn ancount_of(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[6], resp[7]])
+    }
+
+    fn answers_of(resp: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let ancount = ancount_of(resp) as usize;
+        let mut i = 12;
+        while resp[i] != 0 {
+            i += 1 + resp[i] as usize;
+        }
+        i += 5;
+        let mut out = Vec::new();
+        for _ in 0..ancount {
+            while resp[i] != 0 {
+                i += 1 + resp[i] as usize;
+            }
+            i += 1;
+            let tc = u16::from_be_bytes([resp[i], resp[i + 1]]);
+            let rdlen = u16::from_be_bytes([resp[i + 8], resp[i + 9]]) as usize;
+            out.push((tc, resp[i + 10..i + 10 + rdlen].to_vec()));
+            i += 10 + rdlen;
+        }
+        out
+    }
+
+    fn mock_resolver(zones: Vec<(&str, Vec<RecordData>)>) -> Resolver {
+        /// (apex, wire rdata pairs) of one mock zone.
+        type MockZone = (String, Vec<(u16, Vec<u8>)>);
+        let zones: Vec<MockZone> = zones
+            .into_iter()
+            .map(|(z, recs)| {
+                let rdata = recs.iter().filter_map(encode_rdata).collect::<Vec<_>>();
+                (z.to_string(), rdata)
+            })
+            .collect();
+        Arc::new(move |domain| {
+            let zones = zones.clone();
+            Box::pin(async move {
+                for (z, rdata) in &zones {
+                    if *z == domain {
+                        return Ok(Some(Resolved {
+                            rdata: rdata.clone(),
+                            registered: true,
+                        }));
+                    }
+                }
+                Ok(None)
+            })
+        })
+    }
+
+    #[test]
+    fn parse_query_strict() {
+        let q = parse_query(&query(0x1234, true, "www.foo.uip", TYPE_A)).unwrap();
+        assert_eq!(q.id, 0x1234);
+        assert!(q.rd);
+        assert_eq!(q.name, "www.foo.uip");
+        assert_eq!(q.qtype, TYPE_A);
+
+        let mut r = query(1, false, "a.uip", TYPE_A);
+        r[2] = 0x80; // QR set: a response
+        assert!(parse_query(&r).is_none());
+        assert!(parse_query(&[0u8; 8]).is_none());
+        // compression pointer in qname
+        let mut c = query(2, false, "a.uip", TYPE_A);
+        c[12] = 0xc0;
+        assert!(parse_query(&c).is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_a_answer() {
+        let resolver = mock_resolver(vec![(
+            "example.uip",
+            vec![RecordData::A("192.0.2.10".parse().unwrap())],
+        )]);
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(7, true, "example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert_eq!(ancount_of(&resp), 1);
+        assert_eq!(answers_of(&resp)[0].0, TYPE_A);
+        assert_eq!(answers_of(&resp)[0].1, vec![192, 0, 2, 10]);
+        // flags: QR|AA|RD|RA
+        assert_eq!(resp[2] & 0x04, 0x04, "AA set");
+        // cached now
+        assert_eq!(cache.len(), 1);
+        let again = handle_packet(
+            &resolver,
+            &query(7, true, "example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ancount_of(&again), 1);
+    }
+
+    #[tokio::test]
+    async fn subname_hits_apex_and_nodata() {
+        let resolver = mock_resolver(vec![(
+            "example.uip",
+            vec![RecordData::A("192.0.2.1".parse().unwrap())],
+        )]);
+        let mut cache = Cache::new();
+        // www.example.uip resolves through the example.uip apex.
+        let resp = handle_packet(
+            &resolver,
+            &query(1, false, "www.example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ancount_of(&resp), 1);
+        // AAAA asked, only A published → NODATA (NOERROR, 0 answers).
+        let resp = handle_packet(
+            &resolver,
+            &query(2, false, "example.uip", TYPE_AAAA),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert_eq!(ancount_of(&resp), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_scone_name_is_nxdomain() {
+        let resolver = mock_resolver(vec![("other.uip", vec![])]);
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(3, false, "nope.example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 3, "NXDOMAIN");
+        // negative caching: still NXDOMAIN from the cache.
+        let resp2 = handle_packet(
+            &resolver,
+            &query(3, false, "nope.example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp2), 3);
+    }
+
+    #[tokio::test]
+    async fn non_scone_name_refused_without_upstream() {
+        let resolver = mock_resolver(vec![]);
+        let mut cache = Cache::new();
+        // `www.example`: TLD longer than 5 chars — structurally never
+        // a Scone name → not authoritative → REFUSED with no upstream.
+        let resp = handle_packet(
+            &resolver,
+            &query(4, false, "www.example", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rcode_of(&resp),
+            u16::from(RCODE_REFUSED),
+            "REFUSED without fallback"
+        );
+        // Contrast: `example.com` IS a valid Scone name shape → the
+        // chain is authoritative → NXDOMAIN even without upstream.
+        let resp = handle_packet(
+            &resolver,
+            &query(5, false, "example.com", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 3, "Scone-shaped name → NXDOMAIN");
+    }
+
+    #[tokio::test]
+    async fn fallback_to_mock_upstream() {
+        // A fake upstream that answers A 7.7.7.7 with TTL 120.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80; // QR
+            resp[7] = 1; // ANCOUNT = 1
+            // answer: root name, A, IN, ttl 120, rdlen 4, 7.7.7.7
+            resp.extend_from_slice(&[0]);
+            resp.extend_from_slice(&TYPE_A.to_be_bytes());
+            resp.extend_from_slice(&CLASS_IN.to_be_bytes());
+            resp.extend_from_slice(&120u32.to_be_bytes());
+            resp.extend_from_slice(&4u16.to_be_bytes());
+            resp.extend_from_slice(&[7, 7, 7, 7]);
+            upstream.send_to(&resp, peer).await.unwrap();
+        });
+        let resolver = mock_resolver(vec![]);
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(9, true, "www.example", TYPE_A),
+            &[up_addr],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert_eq!(answers_of(&resp)[0].1, vec![7, 7, 7, 7]);
+        up.await.unwrap();
+        // cached (clamped ttl ≤ MAX_FALLBACK_TTL).
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_is_bounded() {
+        let mut cache = Cache::with_bounds(3, MAX_FALLBACK_TTL);
+        for i in 0..5u16 {
+            cache.put(
+                format!("n{i}.uip"),
+                TYPE_A,
+                CacheEntry {
+                    answers: vec![],
+                    rcode: 0,
+                    ttl: 60,
+                },
+            );
+        }
+        assert_eq!(cache.len(), 3, "bounded at capacity");
+        assert!(cache.get("n0.uip", TYPE_A).is_none(), "oldest evicted");
+        assert!(cache.get("n4.uip", TYPE_A).is_some());
+    }
+
+    #[test]
+    fn txt_char_strings_chunked() {
+        assert_eq!(char_strings("hello"), vec![5, b'h', b'e', b'l', b'l', b'o']);
+        let long = "x".repeat(300);
+        let cs = char_strings(&long);
+        assert_eq!(cs[0], 255);
+        assert_eq!(cs[256], 45);
+        assert_eq!(cs.len(), 1 + 255 + 1 + 45);
+    }
+
+    #[test]
+    fn upstreams_parsed_and_rejected() {
+        let ok = parse_upstreams(&["1.1.1.1:53".into(), "[::1]:53".into()]).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert!(parse_upstreams(&["not an addr".into()]).is_err());
+    }
+}

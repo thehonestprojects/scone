@@ -43,6 +43,12 @@ pub struct Config {
     pub produce_interval: Duration,
     /// Local control RPC bind address.
     pub rpc_addr: std::net::SocketAddr,
+    /// Optional UDP DNS server bind address (M6). `None` = no DNS
+    /// surface. Defaults to OFF; binding 0.0.0.0:53 needs privileges.
+    pub dns_addr: Option<std::net::SocketAddr>,
+    /// Optional recursive DNS fallback upstreams (`addr:port`).
+    /// Empty = Scone-unknown names get REFUSED.
+    pub dns_upstreams: Vec<String>,
 }
 
 impl Config {
@@ -56,6 +62,8 @@ impl Config {
             mempool_capacity: DEFAULT_MEMPOOL_CAPACITY,
             produce_interval: DEFAULT_PRODUCE_INTERVAL,
             rpc_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            dns_addr: None,
+            dns_upstreams: Vec::new(),
         }
     }
 }
