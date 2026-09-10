@@ -2,3 +2,6 @@
 name = "scone"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+scone-core.workspace = true

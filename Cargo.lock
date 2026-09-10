@@ -85,6 +85,9 @@ dependencies = [
 [[package]]
 name = "scone"
 version = "0.1.0"
+dependencies = [
+ "scone-core",
+]
 
 [[package]]
 name = "scone-blockchain"

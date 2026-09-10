@@ -60,6 +60,22 @@ DomainId = BLAKE3-256("SCONE-DOMAIN-V1" || nom_canonique)
   la règle (alphabet, normalisation) revient à créer un nouvel espace de
   noms versionné (`SCONE-DOMAIN-V2`), sans réécrire l'existant.
 
+### Représentation textuelle
+
+Encodage hexadécimal **minuscule** (`0-9a-f`) des 32 octets bruts :
+exactement 64 caractères, sans préfixe (`0x`), jamais tronqué.
+
+```text
+DomainId([0xab; 32]) → "ababababababababababababababababababababababababababababababababab"
+DomainId([0x00; 32]) → "0000000000000000000000000000000000000000000000000000000000000000"
+```
+
+Cette forme est produite par `Display` (le `Debug` Rust affiche
+`DomainId(<hex>)`, même chaîne). Toute sortie consommée par un humain ou
+une machine hors du format binaire canonique — journaux, messages
+d'erreur, CLI (`scone show`) — DOIT utiliser cette représentation et
+aucune autre (pas de troncature, pas de préfixe, pas de majuscules).
+
 ## Limites et règles futures (non figées)
 
 - noms internationalisés (IDN) via punycode ;

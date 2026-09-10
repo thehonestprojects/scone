@@ -17,7 +17,12 @@ pub const DOMAIN_ID_VERSION: &[u8] = b"SCONE-DOMAIN-V1";
 ///
 /// This is the primary internal identifier used by the future blockchain
 /// and DHT. Raw domain names must never be used as map/storage keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Textual representation ([`std::fmt::Display`] and [`std::fmt::Debug`]):
+/// the full 32 raw bytes encoded as 64 lowercase hexadecimal characters
+/// (`0-9a-f`), with no prefix and never truncated. `Debug` wraps the same
+/// hex string in `DomainId(<hex>)`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DomainId([u8; 32]);
 
 impl DomainId {
@@ -37,6 +42,29 @@ impl DomainId {
     /// Wraps raw bytes (decoded from storage or the wire).
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    /// Full lowercase hex encoding of the 32 raw bytes (64 chars).
+    fn to_hex(self) -> String {
+        const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for &byte in self.0.iter() {
+            out.push(HEX_TABLE[usize::from(byte >> 4)] as char);
+            out.push(HEX_TABLE[usize::from(byte & 0x0f)] as char);
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for DomainId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl std::fmt::Debug for DomainId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DomainId({})", self.to_hex())
     }
 }
 
@@ -94,5 +122,32 @@ mod tests {
         map.insert(DomainId::from_name(&name("example.uip")), 1u8);
         assert_eq!(map[&DomainId::from_name(&name("example.uip"))], 1);
         assert!(!map.contains_key(&DomainId::from_name(&name("other.uip"))));
+    }
+
+    #[test]
+    fn display_is_full_lowercase_hex() {
+        let id = DomainId::from_bytes([0xab; 32]);
+        let s = id.to_string();
+        assert_eq!(s, "ab".repeat(32));
+        assert_eq!(s.len(), 64);
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn debug_contains_the_same_hex() {
+        let id = DomainId::from_bytes([0xab; 32]);
+        let dbg = format!("{id:?}");
+        assert!(dbg.contains(&id.to_string()));
+        assert!(dbg.starts_with("DomainId("));
+        assert!(dbg.ends_with(')'));
+    }
+
+    #[test]
+    fn display_of_all_zero_bytes_is_64_zeroes() {
+        let id = DomainId::from_bytes([0x00; 32]);
+        assert_eq!(id.to_string(), "0".repeat(64));
     }
 }
