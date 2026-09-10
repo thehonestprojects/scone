@@ -61,6 +61,24 @@ impl ChainState {
         self.domains.get(domain)
     }
 
+    /// Restores the persisted state of one domain (storage
+    /// integration, see `scone-storage`). No rule is applied: the
+    /// bytes were validated when the block was accepted; the decoded
+    /// [`DomainState`] comes from the node's own store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockchainError::DomainAlreadyRegistered`] if the
+    /// domain is already restored (duplicate), which the caller treats
+    /// as corrupted storage.
+    pub fn restore_domain(&mut self, domain: DomainId, state: DomainState) -> Result<()> {
+        if self.domains.contains_key(&domain) {
+            return Err(BlockchainError::DomainAlreadyRegistered);
+        }
+        self.domains.insert(domain, state);
+        Ok(())
+    }
+
     /// Applies `tx` to the state, deterministically and atomically (on
     /// error the state is left unchanged).
     ///

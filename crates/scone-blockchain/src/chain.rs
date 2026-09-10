@@ -32,7 +32,17 @@ use crate::validate::validate_transaction;
 /// validation. Real fork choice belongs to the future consensus.
 #[derive(Debug)]
 pub struct Blockchain<C: Consensus = PermissiveConsensus> {
-    /// Canonical blocks; index == height, `canonical[0]` is genesis.
+    /// Height of the oldest non-genesis block held in RAM. `0` on a
+    /// live chain (`canonical` is dense: index == height, genesis at
+    /// index 0). On a chain restored via [`Blockchain::restore`] only
+    /// genesis and the tip window are in RAM: historical heights in
+    /// `1..base_height` are served from the node store and
+    /// [`block`](Self::block) returns `None` for them.
+    base_height: u64,
+    /// Canonical blocks held in RAM: dense from genesis on a live
+    /// chain (`canonical[0]` is genesis, index == height), or
+    /// `[genesis, restored tip, blocks pushed since]` on a restored
+    /// chain (see `base_height`).
     canonical: Vec<Block>,
     /// Hashes of every accepted block (parent classification for fork
     /// detection).
@@ -56,12 +66,46 @@ impl Default for Blockchain<PermissiveConsensus> {
     }
 }
 
+impl Blockchain<PermissiveConsensus> {
+    /// Restores a chain from persistent storage **without replaying**
+    /// blocks (storage integration; see `scone-storage`).
+    ///
+    /// `tip_block` is the stored canonical tip (already validated when
+    /// it was accepted; only its height is re-checked against
+    /// `tip_height`), `tip` its recomputed hash, `state` the persisted
+    /// domain states. Memory-bounded by design: only genesis and the
+    /// tip block are held in RAM — historical blocks stay in the store.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tip_block.header.height != tip_height` — caller
+    /// error, not untrusted data (storage bytes are checked before
+    /// this call).
+    #[must_use]
+    pub fn restore(tip_height: u64, tip: BlockHash, tip_block: Block, state: ChainState) -> Self {
+        assert_eq!(
+            tip_block.header.height, tip_height,
+            "restore: tip block height mismatch"
+        );
+        let genesis_h = genesis_hash();
+        Self {
+            base_height: tip_height,
+            canonical: vec![genesis(), tip_block],
+            known_hashes: HashSet::from([genesis_h, tip]),
+            tip,
+            state,
+            consensus: PermissiveConsensus,
+        }
+    }
+}
+
 impl<C: Consensus> Blockchain<C> {
     /// New chain at genesis with a custom consensus.
     #[must_use]
     pub fn with_consensus(consensus: C) -> Self {
         let hash = genesis_hash();
         Self {
+            base_height: 0,
             canonical: vec![genesis()],
             known_hashes: HashSet::from([hash]),
             tip: hash,
@@ -94,12 +138,34 @@ impl<C: Consensus> Blockchain<C> {
         self.tip().header.height
     }
 
-    /// Canonical block at `height`, if it exists.
+    /// Canonical block at `height`, if it exists — O(1) window
+    /// lookup.
+    ///
+    /// Blocks of the current session are in RAM; on a chain restored
+    /// from storage (see [`Blockchain::restore`]) only genesis, the
+    /// restored tip and blocks pushed since are — historical blocks
+    /// are served from the node store, and this returns [`None`]
+    /// for them.
     #[must_use]
     pub fn block(&self, height: u64) -> Option<&Block> {
-        usize::try_from(height)
-            .ok()
-            .and_then(|i| self.canonical.get(i))
+        if height == 0 {
+            // Genesis is always in RAM (`canonical[0]` on a live
+            // chain, prepended by `restore`).
+            return self.canonical.first().filter(|g| g.header.height == 0);
+        }
+        // Heights below `base_height` (a restored chain's historical
+        // window) are not in RAM. On a restored chain the genesis
+        // slot prepended by `restore` shifts the window by one; a
+        // live chain (`base_height == 0`) is dense (index == height).
+        let offset: usize = height.checked_sub(self.base_height)?.try_into().ok()?;
+        let index = if self.base_height == 0 {
+            offset
+        } else {
+            offset + 1
+        };
+        self.canonical
+            .get(index)
+            .filter(|b| b.header.height == height)
     }
 
     /// Authoritative state after all applied blocks.
@@ -810,5 +876,56 @@ mod tests {
         assert_eq!(left.state(), right.state());
         let domain = left.state().domain(&domain_id("example.uip")).unwrap();
         assert_eq!(domain.sequence, 2);
+    }
+
+    // ---- restore window (M3) ----
+
+    #[test]
+    fn restored_chain_serves_tip_and_genesis_only_from_ram() {
+        // Height-8 chain stored, then restored without replay: only
+        // genesis (0) and the tip (8) are in RAM; historical heights
+        // are the node store's job.
+        let mut chain = Blockchain::new();
+        chain
+            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .unwrap();
+        for height in 2..=8 {
+            chain
+                .push_block(&child(
+                    &chain,
+                    vec![update_tx("example.uip", 1, height - 1)],
+                ))
+                .unwrap();
+        }
+        assert_eq!(chain.height(), 8);
+        let tip_hash = chain.tip_hash();
+        let tip_block = chain.block(8).unwrap().clone();
+
+        let restored = Blockchain::restore(8, tip_hash, tip_block.clone(), chain.state().clone());
+
+        assert_eq!(restored.block(8), Some(&tip_block), "tip is in RAM");
+        assert_eq!(restored.block(0), Some(&genesis()), "genesis is in RAM");
+        assert!(
+            restored.block(7).is_none(),
+            "historical blocks are not in RAM after restore"
+        );
+        for height in 1..=7 {
+            assert!(
+                restored.block(height).is_none(),
+                "height {height} must not be in RAM after restore"
+            );
+        }
+        assert!(restored.block(9).is_none(), "beyond tip");
+        assert_eq!(restored.tip_hash(), tip_hash);
+        assert_eq!(restored.height(), 8);
+
+        // Blocks pushed after restore keep being served: the window
+        // extends from the restored tip onward.
+        let mut extended = restored;
+        let b9 = child(&extended, vec![update_tx("example.uip", 1, 8)]);
+        extended.push_block(&b9).unwrap();
+        assert_eq!(extended.block(8), Some(&tip_block));
+        assert_eq!(extended.block(9), Some(&b9));
+        assert!(extended.block(7).is_none());
     }
 }

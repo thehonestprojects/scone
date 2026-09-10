@@ -2,3 +2,14 @@
 name = "scone-storage"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+scone-core.workspace = true
+scone-blockchain.workspace = true
+scone-protocol.workspace = true
+thiserror.workspace = true
+redb.workspace = true
+
+[dev-dependencies]
+scone-crypto.workspace = true
+tempfile.workspace = true

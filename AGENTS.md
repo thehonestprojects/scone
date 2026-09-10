@@ -16,7 +16,7 @@ scone-crypto    ← primitives (BLAKE3 hash256 ; signatures/PoW/Merkle à venir)
 scone-core      ← types purs : noms, DomainId (32 o), records DNS, transactions
 scone-protocol  ← format binaire canonique wire/blockchain
 scone-blockchain← logique chaîne, état canonique en RAM
-scone-storage   ← abstraction stockage local (backend redb à venir)
+scone-storage   ← persistance locale (trait NodeStore + backend redb)
 scone           ← binaire
 ```
 
