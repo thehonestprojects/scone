@@ -82,17 +82,26 @@ genesis_hash)` ; le premier bloc appendu a la hauteur 1. Le hash de
 genèse est toujours re-dérivé (`scone_blockchain::genesis_hash()`),
 jamais lu.
 
-## Format d'encodage `DomainStateBytes`
+## Format d'encodage `DomainStateBytes` (v2, M8b)
 
-41 ou 73 octets selon le tag de version en tête, entiers big-endian à
+57 ou 89 octets selon le tag de version en tête, entiers big-endian à
 largeur fixe (canoniques, comparables octet par octet) :
 
 ```text
-DomainStateBytes = tag ‖ owner(32) ‖ sequence(8 BE) [‖ record_hash(32)]
+DomainStateBytes = tag ‖ owner(32) ‖ sequence(8 BE) ‖ registered_at(8 BE)
+                   ‖ valid_until(8 BE) [‖ record_hash(32)]
 
-tag = 0x01 : record_hash présent → 73 octets exactement
-tag = 0x02 : record_hash absent  → 41 octets exactement
+tag = 0x01 : record_hash présent → 89 octets exactement
+tag = 0x02 : record_hash absent  → 57 octets exactement
 ```
+
+- `registered_at` / `valid_until` (M8b) : l'expiration de
+  l'enregistrement (1 an à la claim, renouvelable, voir
+  `/docs/technical/blockchain.md`).
+
+Les encodages M7 (41/73 octets, sans expiration) sont **illégitimes**
+depuis M8b : décodage strict → `Corrupted`. (Un store M7 se régénère
+par replay : `load_chain_replay`.)
 
 - `owner` : `OwnerId` (32 o) ;
 - `sequence` : dernière séquence `UpdateDomain` appliquée (0 juste après
@@ -104,20 +113,26 @@ Décodage **strict** (`DomainStateBytes::decode`) : tag inconnu,
 longueur erronée ou octets en excès → `StorageError::Corrupted`,
 jamais de panic.
 
-## Format d'encodage `TldStateBytes` (M7d)
+## Format d'encodage `TldStateBytes` (v2, M8b)
 
-Toujours exactement 33 octets (le registre TLD v1 est claim-only :
-un owner, ni séquence ni record hash) :
+Toujours exactement 34 octets (un owner + le drapeau d'ouverture du
+namespace ; ni séquence ni record hash) :
 
 ```text
-TldStateBytes = tag(0x01) ‖ owner(32)
+TldStateBytes = tag(0x02) ‖ owner(32) ‖ open(0x00|0x01)
 ```
+
+- `open` (M8b) : `false` = assign-only, `true` = auto-enregistrement
+  avec PoW. Strictement canonique — tout autre octet → `Corrupted`.
+
+Les encodages M7d (33 octets, tag `0x01`, sans `open`) sont
+**illégitimes** : décodage strict → `Corrupted`.
 
 Le tag n'existe que pour l'évolution du format : un futur layout
 bump le tag et les vieux lecteurs échouent en `Corrupted` au lieu de
 deviner. Décodage **strict** (`TldStateBytes::decode`) : tag inconnu,
-longueur erronée ou octets en excès → `StorageError::Corrupted`,
-jamais de panic.
+longueur erronée, octets en excès ou booléen non canonique →
+`StorageError::Corrupted`, jamais de panic.
 
 ## Garanties d'atomicité
 
@@ -132,11 +147,15 @@ redb :
 4. le compteur `domain_count` (incrémenté du nombre de domaines
    **nouveaux** seulement ; un `UpdateDomain` d'un domaine existant ne
    l'incrémente pas) ;
-5. chaque delta du registre TLD (`tlds`, M7d) — **dans la même
-   transaction** : un bloc écrit sans ses claims TLD est
-   structurellement impossible ;
+5. chaque delta du registre TLD (`tlds`, M8b : claims, transfers,
+   open/close) — **dans la même transaction** : un bloc écrit sans ses
+   changements TLD est structurellement impossible ;
 6. le compteur `tld_count` (nouveaux TLDs seulement) ;
-7. `tip` et `tip_height`.
+7. chaque **retrait** (M8b) : domaines expirés par le GC déterministe
+   (`removed_domains`) et TLDs révoqués (`removed_tlds`) quittent le
+   store dans la même transaction, compteurs décrémentés — un
+   redémarrage ne peut jamais ressusciter un enregistrement expiré ;
+8. `tip` et `tip_height`.
 
 redb commite en style WAL : un crash en pleine écriture laisse l'état
 cohérent **précédent**. **Un bloc écrit sans son état est donc
@@ -185,8 +204,12 @@ complet reste possible et sert de contrôle/repair.
   doit égaler le tip stocké, sinon `Corrupted`.
 - `touched_domains(block)` : ids des domaines modifiés par les
   transactions du bloc, dédupliqués, ordre du bloc.
-- `touched_tlds(block)` : ids des TLDs claimés par les
-  `RegisterTld` du bloc, dédupliqués, ordre du bloc (M7d).
+- `touched_tlds(block)` : ids des TLDs mutés par le bloc
+  (`RegisterTld`, `TransferTld`, `RevokeTld`, `SetTldOpen`),
+  dédupliqués, ordre du bloc (M8b).
+- `store_block_with_removals(...)` : variante de `store_block`
+  recevant aussi les domaines retirés par le GC du bloc (M8b) pour
+  l'écriture atomique décrite ci-dessus.
 
 Le relay (M4) utilisera : `load_chain` au démarrage, puis pour chaque
 bloc accepté `push_block` (RAM) puis `store_block` (disque).

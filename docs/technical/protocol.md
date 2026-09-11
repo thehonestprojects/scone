@@ -109,35 +109,42 @@ toute autre valeur est rejetée explicitement
 signées** (Ed25519) : spécification complète, payload signé et règles
 de validation dans **`/docs/technical/transactions.md`** (normatif).
 
+Depuis M8b, **le premier champ de chaque payload est le
+`network_id`** (`str` ≤ 16, signé) : `scone-testnet` /
+`scone-mainnet` (voir `/docs/technical/blockchain.md`).
+
 ### REGISTER_DOMAIN (0x21)
 
 ```text
-name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+network(str ≤ 16) name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
 Le `RegisterDomain` porte le **nom canonique en clair**, suivi de
 son `DomainId` — la cohérence `domain_id == DomainId(name)` est
-re-vérifiée au décodage (recomputée, jamais crue). `proof` est
-opaque : réservé au futur PoW de registration. `public_key` est la
-clé Ed25519 du signataire (32 octets exactement) ; `owner` doit être
-la dérivation BLAKE3 de cette clé (recomputé, jamais cru) ;
+re-vérifiée au décodage (recomputée, jamais crue). `proof` porte le
+PoW de registration (12 octets : nonce + difficulté, vérifié à
+l'application contre la constante du réseau — M8b). `public_key` est
+la clé Ed25519 du signataire (32 octets exactement) ; `owner` doit
+être la dérivation BLAKE3 de cette clé (recomputé, jamais cru) ;
 `signature` fait exactement 64 octets.
 
 ### REGISTER_TLD (0x93)
 
 ```text
-tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+network(str ≤ 16) tld(str ≤ 63) tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
-Claim d'un TLD (registre séparé de celui des domaines, M7) : le
-`tld_id` est la dérivation `SCONE-TLD-V1` du TLD claimé, disjointe de
-tout `DomainId` par construction. Règle d'état : le TLD doit être
-libre.
+Claim d'un TLD (registre séparé de celui des domaines, M7) : le TLD
+est **porté en clair** comme le nom d'un domaine (M8b — le challenge
+PoW se dérive du nom), et le `tld_id` est la dérivation
+`SCONE-TLD-V1` de ce nom, disjointe de tout `DomainId` par
+construction. Règles d'état (M8b) : TLD libre + PoW à la difficulté
+réseau ; claimed fermé (assign-only).
 
 ### UPDATE_DOMAIN (0x52)
 
 ```text
-domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
+network(str ≤ 16) domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
 ```
 
 Invariant re-vérifié au décodage : `sequence > 0` et `owner` ==

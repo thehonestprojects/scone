@@ -32,9 +32,11 @@ scone           ← binaire
 - Les hashs fournis (tx_root, etc.) sont toujours recalculés, jamais crus.
 - Déterminisme : deux nœuds qui appliquent les mêmes blocs atteignent le même
   état bit à bit.
-- Domaines : Register (nom libre requis) / Update (owner + séquence exacte
-  current+1). Pas de Transfer ni d'expiration pour l'instant — décisions
-  ouvertes.
+- Domaines : Register (TLD enregistré+ouvert, PoW, 1 an) / Update (owner +
+  séquence exacte current+1) / Renew (≤ 3 ans d'avance) / expiration + grâce
+  30 j + GC déterministe (M8b). TLD : claim fermée par défaut, SetTldOpen /
+  Transfer / Revoke / Assign. Réseaux testnet/mainnet disjoints (genesis,
+  signature, PoW) depuis M8b.
 
 ## Commandes de validation (preuves exigées)
 

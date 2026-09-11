@@ -115,5 +115,9 @@ porte parallèlement le nom canonique en clair.
 ## Réservation/gouvernance des TLDs
 
 Ouverte par M7a : `RegisterTld` réclame un TLD libre au profit de
-l'identité dérivée de la clé signataire. Règles de gouvernance
-(dépôt, expiration, révocation) : non figées.
+l'identité dérivée de la clé signataire. Depuis M8b la gouvernance
+est complète : claim avec PoW (difficulté par réseau), namespace
+**fermé** par défaut (assign-only), ouverture explicite
+(`SetTldOpen`), transfert (`TransferTld`), abandon (`RevokeTld`,
+re-claimable). Les domaines expirent après 1 an (renouvelables,
+grâce 30 j — voir `/docs/technical/blockchain.md`).

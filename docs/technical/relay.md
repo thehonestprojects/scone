@@ -77,9 +77,13 @@ borné : jamais plus d'un bloc en vol par pair.
 
 ### Démarrage
 
+0. résolution du réseau (`--network testnet|mainnet`, défaut testnet
+   tant que le projet est en dev — M8b). Le data-dir est **par
+   réseau** (`~/.scone/<réseau>/`) : un store non vide qui tient une
+   chaîne d'un autre réseau est refusé (`Corrupted`) ;
 1. ouverture/creation du store redb (`<data-dir>/chain.redb`) ;
-2. `load_chain` : tip en O(1) + états de domaines paginés
-   (fenêtre RAM : genesis + tip) ;
+2. `load_chain(store, réseau)` : tip en O(1) + états de domaines
+   paginés (fenêtre RAM : genesis + tip) ;
 3. construction du swarm (identité Ed25519 éphémère par session —
    la persistance de l'identité réseau est une décision ouverte) ;
 4. dial des multiaddrs `--bootstrap` (doivent finir par
@@ -91,10 +95,16 @@ borné : jamais plus d'un bloc en vol par pair.
 1. décodage strict borné (`MAX_MESSAGE_LEN`) ;
 2. validation cryptographique complète (`validate_transaction` :
    binding owner/clé, `verify_strict` sur le payload canonique) ;
-3. pré-contrôle d'état : `RegisterDomain` → TLD du nom enregistré
-   (`UnknownTld` sinon, D1/M7c) puis nom libre ; `UpdateDomain` → domaine
-   connu, séquence exacte `current + 1`, propriétaire ; `RegisterTld` →
-   TLD libre ;
+3. pré-contrôle d'état (miroir bon marché des règles `push_block`,
+   le PoW — coûteux — n'est vérifié qu'au push) : **toutes** → champ
+   `network` == réseau du relay (`WrongNetwork` sinon, avant toute
+   autre règle — M8b) ; `RegisterDomain` → TLD du nom enregistré
+   (`UnknownTld` sinon, D1/M7c) **et ouvert** (`TldClosed` sinon,
+   M8b) puis nom libre ; `UpdateDomain` → domaine connu, séquence
+   exacte `current + 1`, propriétaire ; `RegisterTld` → TLD libre ;
+   `TransferTld`/`RevokeTld`/`SetTldOpen` → TLD connu + signataire
+   owner ; `AssignDomain` → owner du TLD + nom libre ;
+   `RenewDomain` → domaine connu + propriétaire ;
 4. insertion au mempool (capacité fixe, dédup par `TxId` —
    re-soumettre une tx déjà en pool est un no-op) ;
 5. broadcast aux pairs (sauf l'émetteur).
@@ -105,7 +115,8 @@ borné : jamais plus d'un bloc en vol par pair.
    hauteur, Merkle recalculée, chaque transaction validée puis
    appliquée — atomique par bloc) ;
 2. si accepté : `store_block` (append delta atomique : bloc + tip +
-   états modifiés) ;
+   états modifiés — upserts ET retraits : domaines expirés par le GC
+   déterministe, TLDs révoqués) ;
 3. réconciliation du mempool (les tx incluses sont retirées) ;
 4. broadcast aux pairs (sauf l'émetteur).
 
@@ -203,7 +214,8 @@ Toutes en JSON, discriminées par `"method"` :
 
 Formes de `data` par méthode :
 
-- **status** : `{"peer_id", "tip" (hex 64), "height", "peers",
+- **status** : `{"peer_id", "network" ("scone-testnet" |
+  "scone-mainnet", M8b), "tip" (hex 64), "height", "peers",
   "domain_count", "mempool"}`
 - **submit_tx** : `{"txid": "<hex 64>"}` (tx acceptée au mempool ; la
   production intervient au tick suivant)
@@ -234,7 +246,7 @@ asynchrone : la connexion RPC reste ouverte jusqu'à résolution
 ## CLI
 
 ```
-scone relay [--data-dir DIR] [--listen MULTIADDR] [--bootstrap MULTIADDR]... [--rpc ADDR]
+scone relay [--network testnet|mainnet] [--data-dir DIR] [--listen MULTIADDR] [--bootstrap MULTIADDR]... [--rpc ADDR]
 scone status [--rpc ADDR]
 scone submit tx --hex HEX [--rpc ADDR]
 scone lookup NAME [--rpc ADDR]
@@ -249,6 +261,16 @@ scone record get NAME [--rpc ADDR]
 défaut ; deux relays sur une même machine passent chacun leur
 `--rpc`). Relay absent → message clair « cannot reach the relay — is
 'scone relay' running? », exit non nul.
+
+`--network` (M8b) : `testnet` par défaut (projet en dev), `mainnet`
+explicite. Fixe la genèse, les difficultés PoW et le data-dir par
+défaut (`~/.scone/<réseau>/`) ; une tx d'un autre réseau est refusée
+de façon typée (`WrongNetwork`).
+
+La surface offline `scone tx build` couvre la famille complète M8b
+(`set-tld-open`, `assign-domain`, `renew-domain`, `transfer-tld`,
+`revoke-tld`) ; les claims `register`/`register-tld` minent leur PoW
+à la difficulté testnet par défaut (quelques ms).
 
 ### `domain register|update` (M5) — transactions signées en une commande
 

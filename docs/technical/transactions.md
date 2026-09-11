@@ -374,53 +374,49 @@ enchaîné sur le hash parent (`prev_hash`), `version` =
 sont fournis par l'appelant ; le trait `Consensus` existant est
 utilisé symétriquement à la validation.
 
-## Exemples hex (vecteurs réels, reproductibles)
+## Exemples hex (vecteurs réels, reproductibles — M8b)
 
-### RegisterDomain `example.uip`, timestamp 42, preuve vide
+### RegisterDomain `example.uip`, timestamp 42, testnet
 
-```text
-21                                    disc REGISTER_DOMAIN (0x21)
-01                                    version format
-0b 6578616d706c652e756970             name (str, longueur 11)
-e6a2cbe264f81ed7da4d901c4deec6a3579224b8080fad01cb7461b8c264f181  domain_id
-<owner 32 o>                          dérivation de la pk embarquée
-2a                                   timestamp (varint, 42)
-00                                    proof (vide, longueur 0)
-<pk 32 o>                             public_key
-<64 octets de signature Ed25519>
-```
-
-Payload signé correspondant (vecteur épinglé, généré par
-`scone tx build register-domain --name example.uip --timestamp 42`) :
+Payload signé (vecteur épinglé, généré par `scone tx build
+register-domain --name example.uip --timestamp 42`) :
 
 ```text
 53434f4e452d54582d5349472d5631       préfixe SCONE-TX-SIG-V1
-21010b6578616d706c652e756970
-e6a2cbe264f81ed7da4d901c4deec6a3579224b8080fad01cb7461b8c264f181
+21                                    disc REGISTER_DOMAIN (0x21)
+01                                    version format
+0d 73636f6e652d746573746e6574         network (str, "scone-testnet")
+0b 6578616d706c652e756970             name (str, longueur 11)
+e6a2cbe264f81ed7da4d901c4deec6a3579224b8080fad01cb7461b8c264f181  domain_id
 7b2446dadddf640244ac8677a401f148b2b23d1c836d5ad3dd340f8ef2edbed8   owner (clé de build fixe)
-2a
-00
+2a                                    timestamp (varint, 42)
+0c 010000000000000004000000           proof (12 o : nonce 1, difficulté 4 — testnet)
 2a002152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12  pk + début sig
 ```
 
 ### RegisterTld `uip`, timestamp 42
 
-Payload signé (vecteur épinglé) — le `TldId` visible en tête est le
-vecteur de dérivation épinglé dans `/docs/general/naming.md` :
+Payload signé (vecteur épinglé) — le `TldId` est le vecteur de
+dérivation épinglé dans `/docs/general/naming.md` :
 
 ```text
 53434f4e452d54582d5349472d5631       préfixe SCONE-TX-SIG-V1
-9301
+93 01                                 disc REGISTER_TLD + version
+0d 73636f6e652d746573746e6574         network (str, "scone-testnet")
+03 756970                             tld (str, "uip")
 ad5a86d68643d5c22d6a959bb1a315530c77dfda241f1ac1a8107450f3fab25e  tld_id ("uip")
 7b2446dadddf640244ac8677a401f148b2b23d1c836d5ad3dd340f8ef2edbed8   owner
-2a 00
+2a                                    timestamp (varint, 42)
+0c 740400000000000008000000           proof (12 o : nonce 0x474, difficulté 8 — testnet)
 2a002152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12  pk
 ```
 
 (Les valeurs complètes sont reproductibles via `scone tx build
 register-domain --name example.uip --timestamp 42`,
 `scone tx build register-tld --tld uip --timestamp 42` puis
-`scone tx sign`.)
+`scone tx sign`. Depuis M8b le PoW est miné automatiquement à la
+difficulté testnet — les nonces varient d'un run à l'autre, seuls
+network/nom/id/owner/pk sont stables.)
 
 ## CLI de test et debug
 
