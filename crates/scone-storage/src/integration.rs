@@ -182,13 +182,26 @@ pub fn store_block_with_removals(
     store.append_block_with_state(block.header.height, hash.as_bytes(), &bytes, &delta)
 }
 
-/// Loads the chain from `store` **without replay**: reads the tip
-/// metadata and the tip block only (O(1) block reads). The stored
-/// tip hash is never trusted: it is **recomputed** from the tip
-/// block header and must match (`Corrupted` otherwise). The RAM
-/// state is restored from the persisted domain states, paged by
-/// [`DOMAIN_PAGE`] (memory-bounded). Historical blocks stay in the
-/// store and are served from there.
+/// Loads the chain from `store` **without replaying the full
+/// history**: reads the tip metadata and the tip block only (O(1)
+/// block reads). The stored tip hash is never trusted: it is
+/// **recomputed** from the tip block header and must match
+/// (`Corrupted` otherwise). The RAM state is restored from the
+/// persisted domain states, paged by [`DOMAIN_PAGE`]
+/// (memory-bounded). Historical blocks stay in the store and are
+/// served from there.
+///
+/// # M6b fast boot via state snapshot
+///
+/// When the store holds a state snapshot ([`NodeStore::snapshot_meta`])
+/// strictly below the persisted tip, the snapshot state is restored
+/// (paged) and ONLY the blocks above the snapshot height are
+/// replayed — O(tip − H) instead of O(tip). The snapshot is anchored
+/// before use: the hash of the stored block at the snapshot height is
+/// RECOMPUTED and must equal the snapshot's `tip_hash` (mismatch, a
+/// snapshot above the tip, or any decode failure along the way → the
+/// snapshot is ignored and the plain full-state load runs —
+/// fail-safe, never a boot failure).
 ///
 /// # Errors
 ///
@@ -233,6 +246,129 @@ pub fn load_chain(
             "meta tip hash {stored} != recomputed tip hash {actual}"
         )));
     }
+    if let Some(chain) = try_load_from_snapshot(store, network, tip_height, &tip_block, recomputed)
+    {
+        return Ok(chain);
+    }
+    load_from_full_state(store, network, tip_height, &tip_block, recomputed)
+}
+
+/// Snapshot boot path (M6b): restore the frozen state and replay only
+/// the suffix above it. Returns `None` when the snapshot is unusable
+/// (absent, above the tip, foreign to the persisted chain, or failing
+/// any strict decode) — the caller then falls back to the plain
+/// full-state load. A bad snapshot must degrade the boot, never break
+/// it.
+fn try_load_from_snapshot(
+    store: &impl NodeStore,
+    network: scone_core::NetworkParams,
+    tip_height: u64,
+    tip_block: &Block,
+    tip: BlockHash,
+) -> Option<Blockchain> {
+    // Backends without snapshot support return None/empty pages (the
+    // trait defaults) — plain full-state load for them.
+    let meta = store.snapshot_meta().ok()?;
+    let meta = meta?;
+    // Usable only strictly below the persisted tip: a snapshot at (or
+    // above) the tip would leave nothing to anchor it and the suffix
+    // replay empty — the full load is the correct path then.
+    if meta.height == 0 || meta.height >= tip_height {
+        return None;
+    }
+    // Anchor check (fail-safe): the hash of the canonical block at
+    // the snapshot height is RECOMPUTED from its header and must
+    // equal the snapshot's tip_hash. A snapshot from another chain
+    // (or a tampered one) is silently ignored — full load decides.
+    let anchor_bytes = store.block_at_height(meta.height).ok()??;
+    let anchor_block: Block = decode_complete(&anchor_bytes).ok()?;
+    if anchor_block.header.height != meta.height {
+        return None;
+    }
+    let anchor_hash = block_hash(&anchor_block.header).ok()?;
+    if anchor_hash.as_bytes() != &meta.tip_hash {
+        return None;
+    }
+
+    // Restore the frozen state, paged (memory-bounded).
+    let mut state = scone_blockchain::ChainState::new();
+    let mut cursor: Option<DomainId> = None;
+    loop {
+        let (page, next) = store.snapshot_domains(cursor, DOMAIN_PAGE).ok()?;
+        let page_len = page.len();
+        if page_len == 0 && cursor.is_some() {
+            // Exhausted mid-iteration (backend default or truncation).
+            break;
+        }
+        for (domain, encoded) in page {
+            let Ok(domain_state) = DomainStateBytes::decode(encoded.as_encoded()) else {
+                return None;
+            };
+            state.restore_domain(domain, domain_state).ok()?;
+        }
+        cursor = next;
+        if page_len < DOMAIN_PAGE {
+            break;
+        }
+    }
+    let mut tld_cursor: Option<TldId> = None;
+    loop {
+        let (page, next) = store.snapshot_tlds(tld_cursor, TLD_PAGE).ok()?;
+        let page_len = page.len();
+        if page_len == 0 && tld_cursor.is_some() {
+            break;
+        }
+        for (tld, encoded) in page {
+            let Ok(tld_state) = TldStateBytes::decode(encoded.as_encoded()) else {
+                return None;
+            };
+            state.restore_tld(tld, tld_state).ok()?;
+        }
+        tld_cursor = next;
+        if page_len < TLD_PAGE {
+            break;
+        }
+    }
+
+    // Replay ONLY the suffix above the snapshot height, with the
+    // exact same validation as live blocks. Any failure falls back to
+    // the plain full-state load (the full load re-derives everything
+    // from the live tables and reports the underlying error if the
+    // store is genuinely corrupt).
+    let mut chain = Blockchain::restore(meta.height, anchor_hash, anchor_block, state);
+    for height in (meta.height + 1)..=tip_height {
+        let Ok(Some(bytes)) = store.block_at_height(height) else {
+            return None;
+        };
+        let Ok(block) = decode_complete::<Block>(&bytes) else {
+            return None;
+        };
+        if block.header.height != height {
+            return None;
+        }
+        chain.push_block(&block).ok()?;
+    }
+    debug_assert_eq!(chain.height(), tip_height);
+    let _ = tip_block; // tip block already validated by the caller
+    if chain.tip_hash() != tip {
+        return None;
+    }
+    // Same network binding check as the full path.
+    if chain.network().network_id != network.network_id {
+        return None;
+    }
+    Some(chain)
+}
+
+/// Plain full-state load (pre-M6b path): tip + the persisted live
+/// domain/TLD tables, no block replay.
+fn load_from_full_state(
+    store: &impl NodeStore,
+    network: scone_core::NetworkParams,
+    tip_height: u64,
+    tip_block: &Block,
+    recomputed: BlockHash,
+) -> Result<Blockchain> {
     let mut state = scone_blockchain::ChainState::new();
     let mut cursor: Option<DomainId> = None;
     loop {
@@ -268,7 +404,7 @@ pub fn load_chain(
             break;
         }
     }
-    let chain = Blockchain::restore(tip_height, recomputed, tip_block, state);
+    let chain = Blockchain::restore(tip_height, recomputed, tip_block.clone(), state);
     // M8b network separation: a non-empty data directory holds
     // exactly one network's chain. The restored chain's network
     // is derived from its genesis hash — the strongest possible

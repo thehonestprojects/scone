@@ -961,3 +961,342 @@ fn restart_restores_tld_registry_and_admits_new_domains() {
     assert_eq!(replayed.state().tld_len(), 1);
     assert!(replayed.state().tld(&uip).is_some());
 }
+
+// ------------------------------------------------- M6b boot snapshots
+
+use redb::ReadableTable;
+use scone_storage::integration::store_block_with_removals;
+use scone_storage::{SNAPSHOT_INTERVAL, SnapshotMeta};
+
+/// Builds and stores one block registering one domain (no TLD dance:
+/// the `uip` TLD is claimed+opened in block 1 by `build_block`).
+fn extend_with_block(
+    store: &mut RedbStore,
+    chain: &mut scone_blockchain::Blockchain,
+    sk: &scone_crypto::SigningKey,
+    name: &str,
+) -> scone_protocol::BlockHash {
+    let (block, hash) = build_block(chain, sk, name);
+    store_block(store, chain, &block, hash).unwrap();
+    hash
+}
+
+/// A chain of 65+ blocks: block 65 (= SNAPSHOT_INTERVAL + 1) triggers
+/// a snapshot of the state after block 64. The snapshot must sit at
+/// height 64, strictly below the tip.
+fn chain_with_snapshot(path: &std::path::Path, extra_blocks: u64) -> scone_crypto::SigningKey {
+    let mut store = RedbStore::open(path).unwrap();
+    let mut chain = scone_blockchain::Blockchain::new();
+    let sk = scone_crypto::SigningKey::from_bytes([0x5a; 32]);
+    let total = SNAPSHOT_INTERVAL + 1 + extra_blocks;
+    for i in 1..=total {
+        extend_with_block(&mut store, &mut chain, &sk, &format!("s{i}.uip"));
+    }
+    assert_eq!(chain.height(), total);
+    sk
+}
+
+#[test]
+fn snapshot_written_at_interval_strictly_below_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    let store = RedbStore::open(&path).unwrap();
+    let (tip_height, _) = store.tip().unwrap();
+    assert_eq!(tip_height, SNAPSHOT_INTERVAL + 1);
+    let meta = store.snapshot_meta().unwrap().expect("snapshot exists");
+    assert_eq!(
+        meta.height, SNAPSHOT_INTERVAL,
+        "snapshot at the interval block"
+    );
+    assert!(meta.height < tip_height, "snapshot strictly below the tip");
+    // The frozen state holds exactly the 64 domains registered by
+    // blocks 1..=64 (block 65's domain is NOT in the snapshot).
+    let mut count = 0u64;
+    let mut cursor: Option<DomainId> = None;
+    loop {
+        let (page, next) = store.snapshot_domains(cursor, 10).unwrap();
+        count += page.len() as u64;
+        cursor = next;
+        if page.len() < 10 {
+            break;
+        }
+    }
+    assert_eq!(count, SNAPSHOT_INTERVAL);
+    // The snapshot TLD registry holds the one `uip` TLD.
+    let (tlds, _) = store.snapshot_tlds(None, 10).unwrap();
+    assert_eq!(tlds.len(), 1);
+    assert_eq!(tlds[0].0, tld_id("uip"));
+}
+
+#[test]
+fn boot_from_snapshot_equals_full_replay_bit_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    // 3 extra blocks above the snapshot block: the suffix replay
+    // covers 65..=67.
+    chain_with_snapshot(&path, 3);
+    let store = RedbStore::open(&path).unwrap();
+    let meta = store.snapshot_meta().unwrap().unwrap();
+    let (tip_height, _) = store.tip().unwrap();
+    assert_eq!(meta.height, SNAPSHOT_INTERVAL);
+    assert_eq!(tip_height, SNAPSHOT_INTERVAL + 4);
+
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    let replay = load_chain_replay(&store).unwrap();
+
+    // Bit-exact equality of the logical state.
+    assert_eq!(fast.height(), replay.height());
+    assert_eq!(fast.tip_hash(), replay.tip_hash());
+    assert_eq!(fast.state().len(), replay.state().len());
+    assert_eq!(fast.state().tld_len(), replay.state().tld_len());
+    for i in 1..=(SNAPSHOT_INTERVAL + 4) {
+        let d = domain_id(&format!("s{i}.uip"));
+        assert_eq!(
+            fast.state().domain(&d),
+            replay.state().domain(&d),
+            "state diverged for s{i}.uip"
+        );
+    }
+    assert!(fast.state().domain(&domain_id("s10.uip")).is_some());
+    // Canonical state root (SCONE-STATE-V2) equality — the strongest
+    // bit-exact check available.
+    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(
+        fast.state().state_root_smt(),
+        replay.state().state_root_smt()
+    );
+    // And the loaded chain keeps working: a new block extends it.
+    let sk = scone_crypto::SigningKey::from_bytes([0x5a; 32]);
+    let mut fast = fast;
+    let (block, hash) = build_block(&mut fast, &sk, "post-boot.uip");
+    store_block_with_removals(&mut store.clone(), &fast, &block, hash, &[]).unwrap();
+    assert_eq!(fast.tip_hash(), hash);
+    assert_eq!(store.tip().unwrap().0, SNAPSHOT_INTERVAL + 5);
+}
+
+#[test]
+fn snapshot_replays_fewer_blocks_than_interval() {
+    // The suffix replay is bounded by SNAPSHOT_INTERVAL: count the
+    // blocks above the snapshot height.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    let store = RedbStore::open(&path).unwrap();
+    let meta = store.snapshot_meta().unwrap().unwrap();
+    let (tip_height, _) = store.tip().unwrap();
+    let replayed = tip_height - meta.height;
+    assert!(replayed < SNAPSHOT_INTERVAL || replayed == 1);
+    assert_eq!(replayed, 1, "one block above the snapshot");
+    // Boot still works and lands on the stored tip.
+    let chain = load_chain(&store, scone_core::TESTNET).unwrap();
+    assert_eq!(chain.height(), tip_height);
+    // With extra blocks the suffix stays under the interval.
+    let dir2 = tempfile::tempdir().unwrap();
+    let path2 = dir2.path().join("node.redb");
+    chain_with_snapshot(&path2, 10);
+    let store2 = RedbStore::open(&path2).unwrap();
+    let meta2 = store2.snapshot_meta().unwrap().unwrap();
+    let (tip2, _) = store2.tip().unwrap();
+    assert_eq!(tip2 - meta2.height, 11);
+    assert!(tip2 - meta2.height <= SNAPSHOT_INTERVAL);
+}
+
+#[test]
+fn tampered_snapshot_tip_hash_falls_back_to_full_load() {
+    // Fail-safe: a snapshot whose tip_hash does not match the stored
+    // chain at its height is IGNORED — the boot silently degrades to
+    // the plain full-state load, same final chain.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        {
+            type SnapMeta = redb::TableDefinition<'static, u64, &'static [u8]>;
+            let mut meta = wtxn.open_table(SnapMeta::new("snapshot_v3_meta")).unwrap();
+            let mut value = meta.get(0).unwrap().unwrap().value().to_vec();
+            value[8] ^= 0xff; // corrupt the tip_hash
+            meta.insert(0, &value[..]).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    let store = RedbStore::open(&path).unwrap();
+    let meta = store.snapshot_meta().unwrap().unwrap();
+    let (tip_height, tip_hash) = store.tip().unwrap();
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    assert_eq!(fast.height(), tip_height);
+    assert_eq!(*fast.tip_hash().as_bytes(), tip_hash);
+    // Same state as the full replay (the fallback path ran).
+    let replay = load_chain_replay(&store).unwrap();
+    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_ne!(
+        meta.tip_hash, tip_hash,
+        "sanity: the snapshot really was corrupted"
+    );
+}
+
+#[test]
+fn corrupted_snapshot_state_falls_back_to_full_load() {
+    // A snapshot domain that does not decode → snapshot ignored,
+    // plain load, same final chain.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        {
+            type SnapDomains = redb::TableDefinition<'static, &'static [u8], &'static [u8]>;
+            let mut domains = wtxn
+                .open_table(SnapDomains::new("snapshot_v3_domains"))
+                .unwrap();
+            // Replace one stored state with garbage bytes.
+            let key: Vec<u8> = domains
+                .iter()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .0
+                .value()
+                .to_vec();
+            domains.insert(&key[..], &[0xffu8; 3][..]).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    let store = RedbStore::open(&path).unwrap();
+    assert!(store.snapshot_meta().unwrap().is_some(), "meta is intact");
+    // Reading the snapshot tables now fails strictly...
+    assert!(store.snapshot_domains(None, 10).is_err());
+    // ...but the boot still works via the fallback.
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    let replay = load_chain_replay(&store).unwrap();
+    assert_eq!(fast.tip_hash(), replay.tip_hash());
+    assert_eq!(fast.state().state_root(), replay.state().state_root());
+}
+
+#[test]
+fn snapshot_above_tip_is_ignored() {
+    // A snapshot whose height is above the persisted tip (e.g. a
+    // truncated block store) must be ignored, not trusted.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    let (tip_height, _) = {
+        let store = RedbStore::open(&path).unwrap();
+        store.tip().unwrap()
+    };
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        {
+            type SnapMeta = redb::TableDefinition<'static, u64, &'static [u8]>;
+            let mut meta = wtxn.open_table(SnapMeta::new("snapshot_v3_meta")).unwrap();
+            let mut value = meta.get(0).unwrap().unwrap().value().to_vec();
+            // Announce a height far above the tip, keep the hash.
+            let bogus_height = tip_height + 10;
+            value[..8].copy_from_slice(&bogus_height.to_be_bytes());
+            meta.insert(0, &value[..]).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    let store = RedbStore::open(&path).unwrap();
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    assert_eq!(fast.height(), tip_height);
+    let replay = load_chain_replay(&store).unwrap();
+    assert_eq!(fast.state().state_root(), replay.state().state_root());
+}
+
+#[test]
+fn legacy_store_without_snapshot_loads_unchanged() {
+    // Format compatibility: a store written before M6b (no snapshot
+    // tables) opens, has no snapshot, and boots through the plain
+    // full-state path. Simulated by writing a chain with a store
+    // whose snapshot tables stay empty.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    {
+        let mut store = RedbStore::open(&path).unwrap();
+        let mut chain = scone_blockchain::Blockchain::new();
+        let sk = scone_crypto::SigningKey::from_bytes([0x77; 32]);
+        // Fewer than SNAPSHOT_INTERVAL blocks: no snapshot is ever
+        // written — exactly a pre-M6b store's layout.
+        for i in 1..=3 {
+            extend_with_block(&mut store, &mut chain, &sk, &format!("old{i}.uip"));
+        }
+    }
+    let store = RedbStore::open(&path).unwrap();
+    assert_eq!(store.snapshot_meta().unwrap(), None);
+    let chain = load_chain(&store, scone_core::TESTNET).unwrap();
+    assert_eq!(chain.height(), 3);
+    assert_eq!(chain.state().len(), 3);
+    assert_eq!(store.domain_count().unwrap(), 3);
+}
+
+#[test]
+fn snapshot_is_replaced_not_accumulated() {
+    // Single-slot design: crossing the next interval replaces the
+    // snapshot (no growth, no pruning needed).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    let mut store = RedbStore::open(&path).unwrap();
+    let mut chain = scone_blockchain::Blockchain::new();
+    let sk = scone_crypto::SigningKey::from_bytes([0x5a; 32]);
+    for i in 1..=(2 * SNAPSHOT_INTERVAL + 1) {
+        extend_with_block(&mut store, &mut chain, &sk, &format!("r{i}.uip"));
+    }
+    let meta = store.snapshot_meta().unwrap().unwrap();
+    assert_eq!(
+        meta.height,
+        2 * SNAPSHOT_INTERVAL,
+        "the snapshot moved to the second interval boundary"
+    );
+    assert!(meta.height < store.tip().unwrap().0);
+    // Frozen state = domains of blocks 1..=128, not more.
+    let (first_page, _) = store.snapshot_domains(None, MAX_DOMAIN_PAGE_USIZE).unwrap();
+    assert_eq!(first_page.len() as u64, 2 * SNAPSHOT_INTERVAL);
+    // Boot from it: replay of exactly one block.
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    let replay = load_chain_replay(&store).unwrap();
+    assert_eq!(fast.tip_hash(), replay.tip_hash());
+    assert_eq!(fast.state().state_root(), replay.state().state_root());
+}
+
+const MAX_DOMAIN_PAGE_USIZE: usize = 10_000;
+
+#[test]
+fn snapshot_meta_bad_length_is_corrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    chain_with_snapshot(&path, 0);
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        {
+            type SnapMeta = redb::TableDefinition<'static, u64, &'static [u8]>;
+            let mut meta = wtxn.open_table(SnapMeta::new("snapshot_v3_meta")).unwrap();
+            meta.insert(0, &[0u8; 7][..]).unwrap(); // wrong length
+        }
+        wtxn.commit().unwrap();
+    }
+    let store = RedbStore::open(&path).unwrap();
+    let err = store.snapshot_meta().unwrap_err();
+    assert!(matches!(err, StorageError::Corrupted(_)), "{err:?}");
+    // Boot degrades to the full load — snapshot_meta errors are
+    // treated as "unusable snapshot" by load_chain.
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
+    assert_eq!(fast.height(), SNAPSHOT_INTERVAL + 1);
+}
+
+#[test]
+fn snapshot_meta_type_exposes_height_and_hash() {
+    // Public API surface sanity for SnapshotMeta.
+    let meta = SnapshotMeta {
+        height: 7,
+        tip_hash: [9; 32],
+    };
+    assert_eq!(meta.height, 7);
+    assert_eq!(meta.tip_hash, [9; 32]);
+}

@@ -1,4 +1,18 @@
 //! Canonical chain state and transaction application rules (M8b).
+//!
+//! # SMT engagement (M6a)
+//!
+//! Besides the canonical direct-fold [`ChainState::state_root`]
+//! (`SCONE-STATE-V2` — format frozen), the state carries an
+//! **incremental sparse Merkle engagement** ([`crate::smt::Smt`]) of
+//! its domain and TLD maps, maintained O(40 hashes) per journaled
+//! mutation (apply / deterministic GC / rollback — see
+//! [`ChainState::state_root_smt`]). Rollback replays the undo
+//! entries in reverse order and re-inserts the exact prior leaf, so
+//! the restored tree is **bit-identical** (physical shape and root),
+//! never merely equivalent — a reorg that rewinds to the common
+//! ancestor and replays a different branch converges to the exact
+//! bytes every node computes for that branch.
 
 use std::collections::HashMap;
 
@@ -7,6 +21,7 @@ use scone_core::pow;
 use scone_core::{DomainId, NetworkParams, OwnerId, RecordHash, TESTNET, TldId, Transaction};
 
 use crate::error::{BlockchainError, Result};
+use crate::smt::{Smt, smt_key};
 
 /// Registration term of a domain: 1 year (M8b).
 pub const DOMAIN_TERM_SECS: u64 = 365 * 24 * 3600;
@@ -98,6 +113,19 @@ pub struct ChainState {
     /// refused until grace elapses (keyed by the deterministic
     /// expiry instant, so replay/rollback stay exact).
     grace: HashMap<DomainId, (u64, OwnerId)>,
+    /// Incremental SMT engagement of the domain and TLD maps (M6a):
+    /// one tree, keyed by `smt_key(id)` (top 40 bits of the 32-byte
+    /// id), leaf = the very same `SCONE-LEAF-DOM-V2` /
+    /// `SCONE-LEAF-TLD-V2` encoding the canonical
+    /// [`ChainState::state_root`] folds — the two commitments track
+    /// the same logical state by construction. Maintained by every
+    /// journaled mutation (apply/GC) and by `rollback` (bit-exact:
+    /// the undo entries carry the prior leaf bytes), so a reorg
+    /// replays without ever rebuilding the tree. DomainId and TldId
+    /// are hashes with distinct derivation prefixes, hence uniformly
+    /// distributed and disjoint in the 40-bit key space (collisions
+    /// fall into the SMT's sorted buckets and remain deterministic).
+    smt: Smt,
 }
 
 impl Default for ChainState {
@@ -179,6 +207,7 @@ impl ChainState {
             tlds: HashMap::new(),
             owner_keys: HashMap::new(),
             grace: HashMap::new(),
+            smt: Smt::new(),
         }
     }
 
@@ -225,6 +254,94 @@ impl ChainState {
         self.tlds.is_empty()
     }
 
+    // ——— SMT engagement (M6a) ———
+
+    /// SMT leaf of a registered domain — the exact
+    /// `SCONE-LEAF-DOM-V2` bytes the canonical `state_root` folds
+    /// (see [`crate::finality::domain_leaf_v2`]).
+    fn smt_domain_leaf(id: &DomainId, st: &crate::state::DomainState) -> [u8; 32] {
+        crate::finality::domain_leaf_v2(id, st)
+    }
+
+    /// SMT leaf of a registered TLD (see
+    /// [`crate::finality::tld_leaf_v2`]).
+    fn smt_tld_leaf(id: &TldId, st: &crate::state::TldState) -> [u8; 32] {
+        crate::finality::tld_leaf_v2(id, st)
+    }
+
+    /// Writes a domain leaf into the SMT (replacement = remove of
+    /// the exact old leaf + insert of the new one, both O(40)
+    /// hashes). `old` avoids a redundant remove for fresh inserts.
+    fn smt_put_domain(
+        &mut self,
+        id: &DomainId,
+        old: Option<&crate::state::DomainState>,
+        new: &crate::state::DomainState,
+    ) {
+        let key = smt_key(id.as_bytes());
+        if let Some(prior) = old {
+            self.smt.remove(key, &Self::smt_domain_leaf(id, prior));
+        }
+        self.smt.insert(key, Self::smt_domain_leaf(id, new));
+    }
+
+    /// Removes a domain leaf from the SMT.
+    fn smt_remove_domain(&mut self, id: &DomainId, st: &crate::state::DomainState) {
+        self.smt
+            .remove(smt_key(id.as_bytes()), &Self::smt_domain_leaf(id, st));
+    }
+
+    /// Writes a TLD leaf into the SMT (replacement path).
+    fn smt_put_tld(
+        &mut self,
+        id: &TldId,
+        old: &crate::state::TldState,
+        new: &crate::state::TldState,
+    ) {
+        let key = smt_key(id.as_bytes());
+        self.smt.remove(key, &Self::smt_tld_leaf(id, old));
+        self.smt.insert(key, Self::smt_tld_leaf(id, new));
+    }
+
+    /// Inserts a TLD leaf into the SMT (fresh claim).
+    fn smt_insert_tld(&mut self, id: &TldId, st: &crate::state::TldState) {
+        self.smt
+            .insert(smt_key(id.as_bytes()), Self::smt_tld_leaf(id, st));
+    }
+
+    /// Removes a TLD leaf from the SMT.
+    fn smt_remove_tld(&mut self, id: &TldId, st: &crate::state::TldState) {
+        self.smt
+            .remove(smt_key(id.as_bytes()), &Self::smt_tld_leaf(id, st));
+    }
+
+    /// Incremental SMT state root (M6a): `blake3("SCONE-STATE-SMT-V1"
+    /// || smt_root)` over the domain+TLD tree maintained by every
+    /// journaled mutation. O(1) — the tree root is cached.
+    ///
+    /// Choice (documented, per M6a): this is an **incremental
+    /// engagement**, not the canonical one. The canonical commitment
+    /// of the current protocol version remains the direct-fold
+    /// [`ChainState::state_root`] (`SCONE-STATE-V2`, format frozen) —
+    /// `state_root_smt` never feeds consensus artifacts. The two
+    /// commit the same leaves, so equality of logical states implies
+    /// equality of BOTH roots; the SMT additionally provides
+    /// O(40)-per-tx maintenance and non-membership-capable proofs at
+    /// O(log N), which the flat V2 fold cannot.
+    #[must_use]
+    pub fn state_root_smt(&self) -> [u8; 32] {
+        let mut top = Vec::with_capacity(18 + 32);
+        top.extend_from_slice(b"SCONE-STATE-SMT-V1");
+        top.extend_from_slice(&self.smt.root());
+        scone_crypto::hash256(&[&top])
+    }
+
+    /// The incremental SMT itself (diagnostics/tests).
+    #[must_use]
+    pub fn smt(&self) -> &Smt {
+        &self.smt
+    }
+
     /// Restores the persisted state of one domain (storage
     /// integration, see `scone-storage`). No rule is applied: the
     /// bytes were validated when the block was accepted; the decoded
@@ -242,6 +359,7 @@ impl ChainState {
         if self.domains.contains_key(&domain) {
             return Err(BlockchainError::DomainAlreadyRegistered);
         }
+        self.smt_put_domain(&domain, None, &state);
         self.domains.insert(domain, state);
         Ok(())
     }
@@ -257,6 +375,7 @@ impl ChainState {
         if self.tlds.contains_key(&tld) {
             return Err(BlockchainError::TldAlreadyRegistered);
         }
+        self.smt_insert_tld(&tld, &state);
         self.tlds.insert(tld, state);
         Ok(())
     }
@@ -378,6 +497,7 @@ impl ChainState {
                     registered_at: now,
                     valid_until,
                 };
+                self.smt_put_domain(&register.domain_id, None, &new_state);
                 self.domains.insert(register.domain_id, new_state);
                 journal.entries.push(UndoEntry::RegisterDomain {
                     domain: register.domain_id,
@@ -415,12 +535,19 @@ impl ChainState {
                         got: update.sequence,
                     });
                 }
+                // Copy the prior state out so the `get_mut` borrow of
+                // `self.domains` ends before the SMT update takes
+                // `&mut self`.
+                let (id, prior_state) = (update.domain_id, *state);
+                let mut next = prior_state;
+                next.sequence = expected;
+                next.record_hash = Some(update.record_hash);
                 journal.entries.push(UndoEntry::UpdateDomain {
-                    domain: update.domain_id,
-                    prior: *state,
+                    domain: id,
+                    prior: prior_state,
                 });
-                state.sequence = expected;
-                state.record_hash = Some(update.record_hash);
+                self.smt_put_domain(&id, Some(&prior_state), &next);
+                self.domains.insert(id, next);
             }
             Transaction::RegisterTld(register_tld) => {
                 if self.tlds.contains_key(&register_tld.tld_id) {
@@ -449,13 +576,12 @@ impl ChainState {
                         .entries
                         .push(UndoEntry::LearnOwnerKey(register_tld.owner));
                 }
-                self.tlds.insert(
-                    register_tld.tld_id,
-                    TldState {
-                        owner: register_tld.owner,
-                        open: false,
-                    },
-                );
+                let new_tld = TldState {
+                    owner: register_tld.owner,
+                    open: false,
+                };
+                self.smt_insert_tld(&register_tld.tld_id, &new_tld);
+                self.tlds.insert(register_tld.tld_id, new_tld);
                 journal
                     .entries
                     .push(UndoEntry::RegisterTld(register_tld.tld_id));
@@ -468,11 +594,14 @@ impl ChainState {
                 if state.owner != transfer.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
-                journal.entries.push(UndoEntry::MutateTld {
-                    tld: transfer.tld_id,
-                    prior: *state,
-                });
-                state.owner = transfer.new_owner;
+                // Copy out so the `get_mut` borrow ends before the
+                // SMT update takes `&mut self`.
+                let (tld, prior) = (transfer.tld_id, *state);
+                let mut next = prior;
+                next.owner = transfer.new_owner;
+                journal.entries.push(UndoEntry::MutateTld { tld, prior });
+                self.smt_put_tld(&tld, &prior, &next);
+                self.tlds.insert(tld, next);
             }
             Transaction::RevokeTld(revoke) => {
                 let state = self
@@ -482,11 +611,13 @@ impl ChainState {
                 if state.owner != revoke.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
+                let prior = *state;
+                self.smt_remove_tld(&revoke.tld_id, &prior);
+                self.tlds.remove(&revoke.tld_id);
                 journal.entries.push(UndoEntry::RevokeTld {
                     tld: revoke.tld_id,
-                    prior: *state,
+                    prior,
                 });
-                self.tlds.remove(&revoke.tld_id);
             }
             Transaction::SetTldOpen(set_open) => {
                 let state = self
@@ -496,11 +627,12 @@ impl ChainState {
                 if state.owner != set_open.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
-                journal.entries.push(UndoEntry::MutateTld {
-                    tld: set_open.tld_id,
-                    prior: *state,
-                });
-                state.open = set_open.open;
+                let (tld, prior) = (set_open.tld_id, *state);
+                let mut next = prior;
+                next.open = set_open.open;
+                journal.entries.push(UndoEntry::MutateTld { tld, prior });
+                self.smt_put_tld(&tld, &prior, &next);
+                self.tlds.insert(tld, next);
             }
             Transaction::AssignDomain(assign) => {
                 let tld_id = TldId::from_tld(&assign.name.tld());
@@ -521,6 +653,7 @@ impl ChainState {
                     registered_at: now,
                     valid_until: now + DOMAIN_TERM_SECS,
                 };
+                self.smt_put_domain(&assign.domain_id, None, &new_state);
                 self.domains.insert(assign.domain_id, new_state);
                 journal.entries.push(UndoEntry::RegisterDomain {
                     domain: assign.domain_id,
@@ -548,11 +681,14 @@ impl ChainState {
                         proposed: renew.valid_until,
                     });
                 }
-                journal.entries.push(UndoEntry::RenewDomain {
-                    domain: renew.domain_id,
-                    prior: *state,
-                });
-                state.valid_until = renew.valid_until;
+                let (domain, prior) = (renew.domain_id, *state);
+                let mut next = prior;
+                next.valid_until = renew.valid_until;
+                journal
+                    .entries
+                    .push(UndoEntry::RenewDomain { domain, prior });
+                self.smt_put_domain(&domain, Some(&prior), &next);
+                self.domains.insert(domain, next);
             }
         }
         Ok(())
@@ -598,6 +734,7 @@ impl ChainState {
             .collect();
         for id in expired.clone() {
             let prior = self.domains.remove(&id).expect("checked present");
+            self.smt_remove_domain(&id, &prior);
             self.grace.insert(id, (prior.valid_until, prior.owner));
             journal
                 .entries
@@ -607,7 +744,12 @@ impl ChainState {
     }
 
     /// Undoes every journaled change, most recent first, restoring
-    /// the exact state captured before the journal started.
+    /// the exact state captured before the journal started —
+    /// **including the SMT engagement** (M6a): each entry replays
+    /// the exact inverse leaf operation (re-insert the prior leaf /
+    /// remove the inserted leaf), so the restored tree is
+    /// bit-identical (physical shape and root) to the pre-journal
+    /// tree, not merely an equivalent commitment.
     pub(crate) fn rollback(&mut self, journal: UndoLog) {
         for entry in journal.entries.into_iter().rev() {
             match entry {
@@ -615,28 +757,40 @@ impl ChainState {
                     domain,
                     consumed_grace,
                 } => {
-                    self.domains.remove(&domain);
+                    if let Some(state) = self.domains.remove(&domain) {
+                        self.smt_remove_domain(&domain, &state);
+                    }
                     if let Some(entry) = consumed_grace {
                         self.grace.insert(domain, entry);
                     }
                 }
                 UndoEntry::UpdateDomain { domain, prior } => {
-                    self.domains.insert(domain, prior);
+                    if let Some(current) = self.domains.insert(domain, prior) {
+                        self.smt_put_domain(&domain, Some(&current), &prior);
+                    }
                 }
                 UndoEntry::RegisterTld(tld) => {
-                    self.tlds.remove(&tld);
+                    if let Some(state) = self.tlds.remove(&tld) {
+                        self.smt_remove_tld(&tld, &state);
+                    }
                 }
                 UndoEntry::MutateTld { tld, prior } => {
-                    self.tlds.insert(tld, prior);
+                    if let Some(current) = self.tlds.insert(tld, prior) {
+                        self.smt_put_tld(&tld, &current, &prior);
+                    }
                 }
                 UndoEntry::RevokeTld { tld, prior } => {
+                    self.smt_insert_tld(&tld, &prior);
                     self.tlds.insert(tld, prior);
                 }
                 UndoEntry::RenewDomain { domain, prior } => {
-                    self.domains.insert(domain, prior);
+                    if let Some(current) = self.domains.insert(domain, prior) {
+                        self.smt_put_domain(&domain, Some(&current), &prior);
+                    }
                 }
                 UndoEntry::ExpireDomain { domain, prior } => {
                     self.grace.remove(&domain);
+                    self.smt_put_domain(&domain, None, &prior);
                     self.domains.insert(domain, prior);
                 }
                 UndoEntry::LearnOwnerKey(owner) => {
@@ -1386,5 +1540,198 @@ mod tests {
             Signature::from_bytes([0; 64]),
         ));
         assert!(matches!(mainnet.apply(&tx), Err(BlockchainError::Core(_))));
+    }
+
+    // --- SMT engagement (M6a) ---
+
+    use crate::finality::{domain_leaf_v2, tld_leaf_v2};
+    use crate::smt::{Smt, smt_key};
+
+    /// Invariant: the incrementally maintained SMT is EXACTLY the
+    /// commitment of the current domain+TLD maps (naive rebuild from
+    /// the maps → same root, same size). Catches any apply/GC path
+    /// that forgets to sync a leaf.
+    fn assert_smt_invariant(state: &ChainState) {
+        let mut expect = Smt::new();
+        for (id, st) in &state.domains {
+            expect.insert(smt_key(id.as_bytes()), domain_leaf_v2(id, st));
+        }
+        for (id, st) in &state.tlds {
+            expect.insert(smt_key(id.as_bytes()), tld_leaf_v2(id, st));
+        }
+        assert_eq!(
+            state.smt().root(),
+            expect.root(),
+            "maintained SMT == naive rebuild of the maps"
+        );
+        assert_eq!(state.smt().len(), state.domains.len() + state.tlds.len());
+    }
+
+    #[test]
+    fn smt_empty_state_root_is_pinned() {
+        let state = ChainState::new();
+        let mut top = Vec::new();
+        top.extend_from_slice(b"SCONE-STATE-SMT-V1");
+        top.extend_from_slice(&state.smt().root());
+        assert_eq!(state.state_root_smt(), scone_crypto::hash256(&[&top]));
+        assert!(state.smt().is_empty());
+    }
+
+    #[test]
+    fn smt_matches_naive_rebuild_through_every_tx_kind() {
+        let mut state = ChainState::new();
+        assert_smt_invariant(&state);
+        state.apply(&register_tld("uip", 1)).unwrap();
+        assert_smt_invariant(&state);
+        state.apply(&set_open("uip", 1, true)).unwrap();
+        assert_smt_invariant(&state);
+        state.apply(&register("a.uip", 2)).unwrap();
+        assert_smt_invariant(&state);
+        state.apply(&register("b.uip", 3)).unwrap();
+        assert_smt_invariant(&state);
+        state.apply(&update("a.uip", 2, 1)).unwrap();
+        assert_smt_invariant(&state);
+        state
+            .apply(&renew("a.uip", 2, DOMAIN_TERM_SECS + 500))
+            .unwrap();
+        assert_smt_invariant(&state);
+        // TLD transfer + revoke on another namespace.
+        state.apply(&register_tld("com", 4)).unwrap();
+        assert_smt_invariant(&state);
+        let transfer = Transaction::TransferTld(scone_core::TransferTld::transfer_tld_signed(
+            tld_id("com"),
+            owner(5),
+            key(4).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&transfer).unwrap();
+        assert_smt_invariant(&state);
+        let assign = Transaction::AssignDomain(scone_core::AssignDomain::assign_domain_signed(
+            DomainName::new("vip.com").unwrap(),
+            owner(5),
+            key(5).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&assign).unwrap();
+        assert_smt_invariant(&state);
+        let revoke = Transaction::RevokeTld(scone_core::RevokeTld::revoke_tld_signed(
+            tld_id("com"),
+            key(5).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&revoke).unwrap();
+        assert_smt_invariant(&state);
+        // Deterministic GC (journaled): expire a.uip — the SMT must
+        // drop its leaf.
+        let a_until = state.domain(&domain_id("a.uip")).unwrap().valid_until;
+        let mut j = UndoLog::default();
+        state.gc_expired_journaled(a_until, &mut j);
+        assert_smt_invariant(&state);
+        state.rollback(j);
+        assert_smt_invariant(&state);
+    }
+
+    #[test]
+    fn smt_rollback_restores_the_tree_bit_exact() {
+        let mut state = ChainState::new();
+        seed_open_uip(&mut state);
+        let snapshot = state.clone();
+        let root_before = state.state_root_smt();
+
+        let mut journal = UndoLog::default();
+        state
+            .apply_journaled_at(&register("a.uip", 1), 1000, &mut journal)
+            .unwrap();
+        // Intermediate divergence: the engaged state (a.uip live)
+        // differs from the snapshot → different SMT root.
+        assert_ne!(state.state_root_smt(), root_before);
+        state
+            .apply_journaled_at(&update("a.uip", 1, 1), 1000, &mut journal)
+            .unwrap();
+        state
+            .apply_journaled_at(&register("b.uip", 2), 1000, &mut journal)
+            .unwrap();
+        let a_until = state.domain(&domain_id("a.uip")).unwrap().valid_until;
+        // GC both: a expires at its term, b (same term) too. The
+        // engaged set falls back to the snapshot's (uip only — grace
+        // entries are deliberately NOT engaged), but the full state
+        // (grace map) still differs.
+        state.gc_expired_journaled(a_until, &mut journal);
+        assert_ne!(state, snapshot);
+
+        // Rollback: the restored tree must be BIT-IDENTICAL to the
+        // pre-journal tree — `ChainState: PartialEq` compares the
+        // Smt field structurally (leaves, buckets, branch nodes,
+        // root cache), so this is a physical, not merely logical,
+        // equality check.
+        state.rollback(journal);
+        assert_eq!(state, snapshot);
+        assert_eq!(state.state_root_smt(), root_before);
+    }
+
+    #[test]
+    fn smt_root_is_order_independent() {
+        // Two independent states reach the same logical state via
+        // different (both valid) application orders → same SMT root.
+        let mut left = ChainState::new();
+        let mut right = ChainState::new();
+        for state in [&mut left, &mut right] {
+            state.apply(&register_tld("uip", 1)).unwrap();
+            state.apply(&register_tld("com", 4)).unwrap();
+            state.apply(&set_open("uip", 1, true)).unwrap();
+            state.apply(&set_open("com", 4, true)).unwrap();
+        }
+        // left: a, b, upd a, upd b — right: b, a, upd b, upd a.
+        left.apply(&register("a.uip", 2)).unwrap();
+        left.apply(&register("b.uip", 3)).unwrap();
+        right.apply(&register("b.uip", 3)).unwrap();
+        right.apply(&register("a.uip", 2)).unwrap();
+        left.apply(&update("a.uip", 2, 1)).unwrap();
+        left.apply(&update("b.uip", 3, 1)).unwrap();
+        right.apply(&update("b.uip", 3, 1)).unwrap();
+        right.apply(&update("a.uip", 2, 1)).unwrap();
+
+        assert_eq!(left, right);
+        assert_eq!(left.state_root_smt(), right.state_root_smt());
+        assert_smt_invariant(&left);
+        assert_smt_invariant(&right);
+    }
+
+    #[test]
+    fn smt_distinguishes_distinct_logical_states() {
+        let base = |state: &mut ChainState| {
+            state.apply(&register_tld("uip", 1)).unwrap();
+            state.apply(&set_open("uip", 1, true)).unwrap();
+            state.apply(&register("a.uip", 2)).unwrap();
+        };
+        let mut a = ChainState::new();
+        let mut b = ChainState::new();
+        let mut c = ChainState::new();
+        base(&mut a);
+        base(&mut b);
+        base(&mut c);
+        // a: untouched; b: one more update; c: renewal instead.
+        b.apply(&update("a.uip", 2, 1)).unwrap();
+        c.apply(&renew("a.uip", 2, DOMAIN_TERM_SECS + 1)).unwrap();
+        assert_ne!(a.state_root_smt(), b.state_root_smt());
+        assert_ne!(a.state_root_smt(), c.state_root_smt());
+        assert_ne!(b.state_root_smt(), c.state_root_smt());
+        // The canonical V2 root distinguishes them too (same leaves).
+        assert_ne!(a.state_root(), b.state_root());
+        assert_ne!(a.state_root(), c.state_root());
+    }
+
+    #[test]
+    fn failed_apply_leaves_smt_unchanged() {
+        let mut state = ChainState::new();
+        seed_open_uip(&mut state);
+        state.apply(&register("example.uip", 1)).unwrap();
+        let snapshot = state.clone();
+        let root = state.state_root_smt();
+        let _ = state.apply(&register("example.uip", 9));
+        let _ = state.apply(&update("example.uip", 9, 1));
+        let _ = state.apply(&update("example.uip", 1, 7));
+        assert_eq!(state, snapshot);
+        assert_eq!(state.state_root_smt(), root);
     }
 }

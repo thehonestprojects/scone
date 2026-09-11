@@ -714,6 +714,35 @@ pub fn smt_key(id: &[u8; 32]) -> u64 {
     u64::from_be_bytes(id[0..8].try_into().expect("8 bytes")) >> (64 - MAX_DEPTH)
 }
 
+/// Content equality: the physical shape is a pure function of the
+/// (key → leaf) set (see `# Guarantees`), so comparing the leaf/bucket
+/// maps, the branch nodes and the root state is exact. The
+/// dirty-tracking vectors (persistence markers, drained by
+/// `take_dirty`) are deliberately excluded — they are write-side
+/// bookkeeping, not committed state.
+impl PartialEq for Smt {
+    fn eq(&self, other: &Self) -> bool {
+        self.root_child == other.root_child
+            && self.root_hash == other.root_hash
+            && self.leaves == other.leaves
+            && self.buckets == other.buckets
+            && self.nodes == other.nodes
+    }
+}
+
+impl Eq for Smt {}
+
+/// Compact diagnostic view (root/size only — never dumps the maps).
+impl std::fmt::Debug for Smt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Smt")
+            .field("root", &self.root())
+            .field("len", &self.len())
+            .field("nodes", &self.node_count())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

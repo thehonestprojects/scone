@@ -10,6 +10,9 @@
 //! | `tlds` | `TldId` (`32`, ordered) | [`TldStateBytes`] (M7d) |
 //! | `dht_cache` | `DomainId` (`32`) | encoded `SignedDnsRecord` |
 //! | `meta` | `&[u8]` | `&[u8]` (tip, tip height, format version, domain counter, TLD counter) |
+//! | `snapshot_v3_meta` | `0` (single slot) | `height(8 BE) + tip_hash(32)` (M6b boot snapshot) |
+//! | `snapshot_v3_domains` | `DomainId` (`32`, ordered) | [`DomainStateBytes`] (frozen, M6b) |
+//! | `snapshot_v3_tlds` | `TldId` (`32`, ordered) | [`TldStateBytes`] (frozen, M6b) |
 //!
 //! ## Guarantees
 //!
@@ -57,6 +60,13 @@ type Tlds = TableDefinition<'static, &'static [u8], &'static [u8]>;
 type DhtCache = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `meta key -> meta value`.
 type Meta = TableDefinition<'static, &'static [u8], &'static [u8]>;
+/// `snapshot key -> height(8 BE) || tip_hash(32)` (M6b, separate v3
+/// tables so a pre-M6b store keeps loading with no snapshot).
+type SnapshotMetaTable = TableDefinition<'static, u64, &'static [u8]>;
+/// `DomainId(32) -> DomainStateBytes` — frozen snapshot state (M6b).
+type SnapshotDomains = TableDefinition<'static, &'static [u8], &'static [u8]>;
+/// `TldId(32) -> TldStateBytes` — frozen snapshot TLD registry (M6b).
+type SnapshotTlds = TableDefinition<'static, &'static [u8], &'static [u8]>;
 
 /// `meta` key of the cached tip height (keeps `tip()` O(1)).
 const META_TIP_HEIGHT: &[u8] = b"tip_height";
@@ -76,6 +86,19 @@ pub const MAX_DOMAIN_PAGE: usize = 10_000;
 
 /// Same DoS guard as [`MAX_DOMAIN_PAGE`], for `iterate_tlds` (M7d).
 pub const MAX_TLD_PAGE: usize = 10_000;
+
+/// State-snapshot cadence (M6b): every `SNAPSHOT_INTERVAL`-th append
+/// (i.e. when the NEW tip height is a multiple of the interval) the
+/// full canonical state is frozen into the `snapshot_v3_*` tables, in
+/// the SAME transaction as the block. The snapshot therefore sits at
+/// `tip - 1` at the oldest and can never equal the tip — at boot only
+/// the blocks ABOVE the snapshot height are replayed, so the boot
+/// cost is O(tip − H) with H within one interval of the tip.
+///
+/// 64 keeps the snapshot write amortized (one full-state freeze per
+/// 64 blocks) while bounding the suffix replay to at most 63 blocks
+/// plus the snapshot block itself.
+pub const SNAPSHOT_INTERVAL: u64 = 64;
 
 /// Rejects `meta` keys reserved for the store's internal
 /// bookkeeping — clobbering them would silently corrupt the store.
@@ -102,6 +125,18 @@ const DOMAINS: Domains = TableDefinition::new("domains");
 const TLDS: Tlds = TableDefinition::new("tlds");
 const DHT_CACHE: DhtCache = TableDefinition::new("dht_cache");
 const META: Meta = TableDefinition::new("meta");
+// M6b snapshot tables: NEW names (v3 prefix), never written by a
+// pre-M6b build — an old store simply has no snapshot and boots on
+// the plain state load. The live `domains`/`tlds` tables are NOT
+// touched by snapshotting: a stale snapshot can never corrupt the
+// fast-load state.
+const SNAPSHOT_META: SnapshotMetaTable = TableDefinition::new("snapshot_v3_meta");
+const SNAPSHOT_DOMAINS: SnapshotDomains = TableDefinition::new("snapshot_v3_domains");
+const SNAPSHOT_TLDS: SnapshotTlds = TableDefinition::new("snapshot_v3_tlds");
+
+/// Value layout of `snapshot_v3_meta`: `height(8 BE) || tip_hash(32)`
+/// (40 bytes exactly, strict decode).
+const SNAPSHOT_META_LEN: usize = 8 + 32;
 
 /// `redb`-backed [`NodeStore`].
 ///
@@ -183,6 +218,9 @@ impl RedbStore {
             let _ = wtxn.open_table(DOMAINS)?;
             let _ = wtxn.open_table(TLDS)?;
             let _ = wtxn.open_table(DHT_CACHE)?;
+            let _ = wtxn.open_table(SNAPSHOT_META)?;
+            let _ = wtxn.open_table(SNAPSHOT_DOMAINS)?;
+            let _ = wtxn.open_table(SNAPSHOT_TLDS)?;
             let mut meta_t = wtxn.open_table(META)?;
             if meta_t.get(META_FORMAT_VERSION)?.is_none() {
                 meta_t.insert(
@@ -254,10 +292,6 @@ fn append_core(
     block_bytes: &[u8],
     deltas: &crate::StateDelta,
 ) -> Result<()> {
-    let state_deltas = &deltas.domains;
-    let tld_deltas = &deltas.tlds;
-    let removed_domains = &deltas.removed_domains;
-    let removed_tlds = &deltas.removed_tlds;
     // Pre-encoded value for blocks_by_height: hash || height || bytes.
     let mut indexed = Vec::with_capacity(BLOCK_INDEX_HEADER + block_bytes.len());
     indexed.extend_from_slice(hash);
@@ -271,9 +305,101 @@ fn append_core(
         let mut tlds_t = wtxn.open_table(TLDS)?;
         let mut meta_t = wtxn.open_table(META)?;
 
+        // M6b state snapshot, BEFORE any delta of this block lands:
+        // when the parent height (the just-completed tip) crosses a
+        // multiple of the interval, freeze the parent state (the live
+        // tables at this point still hold it) into the snapshot
+        // tables, atomically with the block. The snapshot sits at
+        // `height - 1` — strictly below the new tip, so a boot
+        // restores it and replays at most `SNAPSHOT_INTERVAL` blocks.
+        // Parent 0 (genesis) is excluded: genesis is never stored as
+        // bytes and its state is empty by definition.
+        if height > 1 && (height - 1).is_multiple_of(SNAPSHOT_INTERVAL) {
+            let parent_height = height - 1;
+            // The parent hash is read from the block index header
+            // (`blocks_by_height` values are self-certifying: the
+            // hash was recomputed by the caller when the parent was
+            // accepted).
+            let parent_hash: [u8; 32] = by_height
+                .get(parent_height)?
+                .map(|g| {
+                    let v = g.value();
+                    v.get(..32).and_then(|s| s.try_into().ok()).ok_or_else(|| {
+                        StorageError::Corrupted(format!(
+                            "blocks_by_height[{parent_height}]: short index header"
+                        ))
+                    })
+                })
+                .transpose()?
+                .ok_or_else(|| {
+                    StorageError::Corrupted(format!(
+                        "blocks_by_height[{parent_height}]: missing below tip"
+                    ))
+                })?;
+            drop(meta_t);
+            drop(tlds_t);
+            drop(domains_t);
+            drop(by_hash);
+            drop(by_height);
+            snapshot_core(wtxn, parent_height, &parent_hash)?;
+            let mut by_height = wtxn.open_table(BLOCKS_BY_HEIGHT)?;
+            let mut by_hash = wtxn.open_table(BLOCKS_BY_HASH)?;
+            let mut domains_t = wtxn.open_table(DOMAINS)?;
+            let mut tlds_t = wtxn.open_table(TLDS)?;
+            let mut meta_t = wtxn.open_table(META)?;
+            append_deltas(
+                &mut by_height,
+                &mut by_hash,
+                &mut domains_t,
+                &mut tlds_t,
+                &mut meta_t,
+                height,
+                hash,
+                block_bytes,
+                &indexed,
+                deltas,
+            )?;
+            return Ok(());
+        }
+
+        append_deltas(
+            &mut by_height,
+            &mut by_hash,
+            &mut domains_t,
+            &mut tlds_t,
+            &mut meta_t,
+            height,
+            hash,
+            block_bytes,
+            &indexed,
+            deltas,
+        )
+    }
+}
+
+/// Writes the block, its state deltas and the tip into tables opened
+/// by the caller ([`append_core`] core — all inside one transaction).
+#[allow(clippy::too_many_arguments)]
+fn append_deltas(
+    by_height: &mut redb::Table<'_, u64, &'static [u8]>,
+    by_hash: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    domains_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    tlds_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    meta_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    height: u64,
+    hash: &[u8; 32],
+    block_bytes: &[u8],
+    indexed: &[u8],
+    deltas: &crate::StateDelta,
+) -> Result<()> {
+    let state_deltas = &deltas.domains;
+    let tld_deltas = &deltas.tlds;
+    let removed_domains = &deltas.removed_domains;
+    let removed_tlds = &deltas.removed_tlds;
+    {
         if let Some(previous) = by_height.get(height)? {
             let previous = previous.value();
-            if previous == indexed.as_slice() {
+            if previous == indexed {
                 // Exact re-append of the same block: idempotent no-op.
                 return Ok(());
             }
@@ -282,7 +408,7 @@ fn append_core(
                 id: format!("{height}"),
             });
         }
-        by_height.insert(height, &indexed[..])?;
+        by_height.insert(height, indexed)?;
         by_hash.insert(&hash[..], block_bytes)?;
 
         let mut new_domains: u64 = 0;
@@ -293,7 +419,7 @@ fn append_core(
             }
         }
         if new_domains > 0 {
-            let current = meta_u64(&meta_t, META_DOMAIN_COUNT, "domain_count")?;
+            let current = meta_u64(meta_t, META_DOMAIN_COUNT, "domain_count")?;
             meta_t.insert(
                 META_DOMAIN_COUNT,
                 &(current + new_domains).to_be_bytes()[..],
@@ -310,7 +436,7 @@ fn append_core(
             }
         }
         if new_tlds > 0 {
-            let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+            let current = meta_u64(meta_t, META_TLD_COUNT, "tld_count")?;
             meta_t.insert(META_TLD_COUNT, &(current + new_tlds).to_be_bytes()[..])?;
         }
 
@@ -324,7 +450,7 @@ fn append_core(
             }
         }
         if removed_domain_count > 0 {
-            let current = meta_u64(&meta_t, META_DOMAIN_COUNT, "domain_count")?;
+            let current = meta_u64(meta_t, META_DOMAIN_COUNT, "domain_count")?;
             let current = current
                 .checked_sub(removed_domain_count)
                 .ok_or_else(|| StorageError::Corrupted("domain_count underflow".into()))?;
@@ -337,14 +463,58 @@ fn append_core(
             }
         }
         if removed_tld_count > 0 {
-            let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+            let current = meta_u64(meta_t, META_TLD_COUNT, "tld_count")?;
             let current = current
                 .checked_sub(removed_tld_count)
                 .ok_or_else(|| StorageError::Corrupted("tld_count underflow".into()))?;
             meta_t.insert(META_TLD_COUNT, &current.to_be_bytes()[..])?;
         }
 
-        write_tip(&mut meta_t, height, hash)?;
+        write_tip(meta_t, height, hash)?;
+    }
+    Ok(())
+}
+
+/// Freezes the full canonical state into the `snapshot_v3_*` tables,
+/// inside the caller's block transaction (M6b). Reads the LIVE
+/// `domains`/`tlds` tables as they stand in this transaction (the
+/// caller invokes it BEFORE writing the new block's deltas, so the
+/// frozen state is exactly the state after block `height`).
+///
+/// A snapshot overwrites any previous one (single-slot design: one
+/// meta row, two state tables, no accumulation — "pruning" of expired
+/// snapshots is implicit).
+fn snapshot_core(
+    wtxn: &mut redb::WriteTransaction,
+    height: u64,
+    tip_hash: &[u8; 32],
+) -> Result<()> {
+    let mut meta_value = Vec::with_capacity(SNAPSHOT_META_LEN);
+    meta_value.extend_from_slice(&height.to_be_bytes());
+    meta_value.extend_from_slice(tip_hash);
+    {
+        let mut snap_meta = wtxn.open_table(SNAPSHOT_META)?;
+        let mut snap_domains = wtxn.open_table(SNAPSHOT_DOMAINS)?;
+        let mut snap_tlds = wtxn.open_table(SNAPSHOT_TLDS)?;
+        let domains_ro = wtxn.open_table(DOMAINS)?;
+        let tlds_ro = wtxn.open_table(TLDS)?;
+        // Replace-in-place: clear then copy within the same ACID
+        // transaction. redb write transactions see their own writes,
+        // so `domains_ro` (opened before the snapshot tables are
+        // touched) is not affected by the copy below — the live
+        // tables are never modified here.
+        snap_meta.retain(|_, _| false)?;
+        snap_meta.insert(0u64, &meta_value[..])?;
+        snap_domains.retain(|_, _| false)?;
+        for entry in domains_ro.iter()? {
+            let (key, value) = entry?;
+            snap_domains.insert(key.value(), value.value())?;
+        }
+        snap_tlds.retain(|_, _| false)?;
+        for entry in tlds_ro.iter()? {
+            let (key, value) = entry?;
+            snap_tlds.insert(key.value(), value.value())?;
+        }
     }
     Ok(())
 }
@@ -588,5 +758,119 @@ impl NodeStore for RedbStore {
         }
         wtxn.commit()?;
         Ok(())
+    }
+
+    fn snapshot_meta(&self) -> Result<Option<crate::SnapshotMeta>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(SNAPSHOT_META)?;
+        let Some(guard) = table.get(0u64)? else {
+            return Ok(None);
+        };
+        let bytes = guard.value();
+        if bytes.len() != SNAPSHOT_META_LEN {
+            return Err(StorageError::Corrupted(format!(
+                "snapshot_v3_meta: not {SNAPSHOT_META_LEN} bytes"
+            )));
+        }
+        let height = u64::from_be_bytes(bytes[..8].try_into().expect("len checked"));
+        let tip_hash: [u8; 32] = bytes[8..].try_into().expect("len checked");
+        Ok(Some(crate::SnapshotMeta { height, tip_hash }))
+    }
+
+    fn snapshot_domains(&self, after: Option<DomainId>, max: usize) -> Result<crate::DomainPage> {
+        self.snapshot_domains_inner(after, max)
+    }
+
+    fn snapshot_tlds(&self, after: Option<TldId>, max: usize) -> Result<crate::TldPage> {
+        self.snapshot_tlds_inner(after, max)
+    }
+}
+
+impl RedbStore {
+    /// Reads up to `max` snapshot domain states with id strictly
+    /// greater than `after` (same cursor contract as
+    /// [`NodeStore::iterate_domains`], over the frozen snapshot
+    /// tables) (M6b).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if an entry fails strict decoding.
+    fn snapshot_domains_inner(
+        &self,
+        after: Option<DomainId>,
+        max: usize,
+    ) -> Result<crate::DomainPage> {
+        let max = max.min(MAX_DOMAIN_PAGE);
+        if max == 0 {
+            return Ok((Vec::new(), after));
+        }
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(SNAPSHOT_DOMAINS)?;
+        let range = match after {
+            None => table.range::<&[u8]>(..)?,
+            Some(id) => {
+                let start: &[u8] = id.as_bytes();
+                table.range(start..)?
+            }
+        };
+        let mut out = Vec::new();
+        let mut cursor = after;
+        for entry in range {
+            let (key, value) = entry?;
+            let key = key.value();
+            if let Some(previous) = after
+                && key == previous.as_bytes()
+            {
+                continue;
+            }
+            let (domain, state) = decode_domain_entry(key, value.value())?;
+            out.push((domain, state));
+            cursor = Some(domain);
+            if out.len() == max {
+                break;
+            }
+        }
+        Ok((out, cursor))
+    }
+
+    /// Reads up to `max` snapshot TLD states with id strictly greater
+    /// than `after` (same cursor contract over the frozen snapshot
+    /// TLD registry) (M6b).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if an entry fails strict decoding.
+    fn snapshot_tlds_inner(&self, after: Option<TldId>, max: usize) -> Result<crate::TldPage> {
+        let max = max.min(MAX_TLD_PAGE);
+        if max == 0 {
+            return Ok((Vec::new(), after));
+        }
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(SNAPSHOT_TLDS)?;
+        let range = match after {
+            None => table.range::<&[u8]>(..)?,
+            Some(id) => {
+                let start: &[u8] = id.as_bytes();
+                table.range(start..)?
+            }
+        };
+        let mut out = Vec::new();
+        let mut cursor = after;
+        for entry in range {
+            let (key, value) = entry?;
+            let key = key.value();
+            if let Some(previous) = after
+                && key == previous.as_bytes()
+            {
+                continue;
+            }
+            let (tld, state) = decode_tld_entry(key, value.value())?;
+            out.push((tld, state));
+            cursor = Some(tld);
+            if out.len() == max {
+                break;
+            }
+        }
+        Ok((out, cursor))
     }
 }

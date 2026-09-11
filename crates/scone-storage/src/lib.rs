@@ -32,7 +32,7 @@ pub mod redb;
 pub mod state_bytes;
 
 pub use error::{Result, StorageError};
-pub use redb::{MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, MAX_TLD_PAGE, RedbStore};
+pub use redb::{MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, MAX_TLD_PAGE, RedbStore, SNAPSHOT_INTERVAL};
 pub use state_bytes::{DomainStateBytes, TldStateBytes};
 
 use scone_core::{DomainId, TldId};
@@ -49,6 +49,27 @@ pub const META_TIP: &[u8] = b"tip";
 
 /// Key of the storage format version in the `meta` table.
 pub const META_FORMAT_VERSION: &[u8] = b"format_version";
+
+/// Metadata of the persisted canonical-state snapshot (M6b).
+///
+/// The snapshot freezes the FULL canonical state (domains + TLDs) as
+/// of a block boundary strictly BELOW the tip (the writer only
+/// snapshots when appending a new block, so the snapshot can never
+/// sit at the tip). At boot, [`NodeStore::snapshot_meta`] plus the
+/// snapshot tables let the chain restore this state and replay only
+/// the blocks above it — O(tip − H) instead of a full replay.
+///
+/// `tip_hash` is the hash of the canonical block at `height`; the
+/// boot path RECOMPUTES it from the stored block header and ignores
+/// the snapshot on mismatch (fail-safe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// Height of the snapshot state (its block's height).
+    pub height: u64,
+    /// Hash of the canonical block at `height` (recomputed at boot,
+    /// never trusted).
+    pub tip_hash: [u8; 32],
+}
 
 /// One page of domain states returned by [`NodeStore::iterate_domains`]:
 /// up to `max` entries in ascending `DomainId` order, plus the cursor
@@ -262,4 +283,45 @@ pub trait NodeStore {
     ///
     /// [`StorageError::ReservedKey`] on a reserved key; on I/O errors.
     fn meta_set(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+
+    /// Metadata of the persisted state snapshot, if any (M6b).
+    ///
+    /// Default: no snapshot (backends without snapshot support fall
+    /// back to the plain state load — same guarantee as a pre-M6b
+    /// store).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if the stored snapshot metadata
+    /// does not decode; on I/O errors.
+    fn snapshot_meta(&self) -> Result<Option<SnapshotMeta>> {
+        Ok(None)
+    }
+
+    /// Reads up to `max` snapshot domain states with id strictly
+    /// greater than `after`, in ascending `DomainId` order — same
+    /// cursor contract as [`NodeStore::iterate_domains`], over the
+    /// frozen snapshot tables (M6b).
+    ///
+    /// Default: empty (backend without snapshot support).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if any entry fails strict decoding.
+    fn snapshot_domains(&self, after: Option<DomainId>, max: usize) -> Result<DomainPage> {
+        let _ = (after, max);
+        Ok((Vec::new(), None))
+    }
+
+    /// Reads up to `max` snapshot TLD states with id strictly greater
+    /// than `after` — same cursor contract, over the frozen snapshot
+    /// TLD registry (M6b). Default: empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if any entry fails strict decoding.
+    fn snapshot_tlds(&self, after: Option<TldId>, max: usize) -> Result<TldPage> {
+        let _ = (after, max);
+        Ok((Vec::new(), None))
+    }
 }

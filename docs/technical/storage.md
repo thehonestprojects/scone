@@ -36,7 +36,10 @@ reste du code (blockchain, futur relay M4) :
   mêmes contrats pour le registre TLD (`tld_count` maintenu,
   curseur borné) (M7d) ;
 - `put_dht_cache` / `dht_cache` — octets `SignedDnsRecord` opaques ;
-- `meta_get` / `meta_set`.
+- `meta_get` / `meta_set` ;
+- `snapshot_meta` / `snapshot_domains` / `snapshot_tlds` — lecture du
+  snapshot d'état de boot (M6b ; défauts vides = backend sans
+  snapshot, `load_chain` retombe alors sur le chargement complet).
 
 Règles :
 
@@ -59,6 +62,9 @@ Règles :
 | `tlds` | `TldId` (32 o, ordre octet) | `TldStateBytes` (ci-dessous, M7d) |
 | `dht_cache` | `DomainId` (32 o) | octets `SignedDnsRecord` (opaques) |
 | `meta` | `&[u8]` | `&[u8]` |
+| `snapshot_v3_meta` (M6b) | `u64` = 0 (slot unique) | `height(8 BE) ‖ tip_hash(32)` = 40 o exactement |
+| `snapshot_v3_domains` (M6b) | `DomainId` (32 o, ordre octet) | `DomainStateBytes` (même format que `domains`) |
+| `snapshot_v3_tlds` (M6b) | `TldId` (32 o, ordre octet) | `TldStateBytes` (même format que `tlds`) |
 
 Clés de `meta` :
 
@@ -216,6 +222,75 @@ complet reste possible et sert de contrôle/repair.
 Le relay (M4) utilisera : `load_chain` au démarrage, puis pour chaque
 bloc accepté `push_block` (RAM) puis `store_block` (disque).
 
+## Snapshot d'état de boot (M6b)
+
+`load_chain` tel que décrit ci-dessus reste O(taille de l'état) :
+aucun bloc n'est rejoué, mais toute la table `domains` est relue.
+C'est le chemin de persistance-état-par-bloc qui rend le rejeu
+inutile. Le snapshot M6b répond à un autre coût : le cas où l'état
+RAM doit être reconstruit **par rejeu** (réparation, contrôle, ou
+backend sans état persisté par bloc). Il offre un boot en
+**O(tip − H)** — rejeu du seul suffixe au-dessus du snapshot.
+
+### Écriture
+
+- **Intervalle** : `SNAPSHOT_INTERVAL = 64` (constante publique de
+  `scone-storage`). Le déclencheur est l'append du bloc
+  `k·SNAPSHOT_INTERVAL + 1` : la transaction gèle alors l'état des
+  tables vivantes **tel qu'il est avant l'application de ce bloc**,
+  c'est-à-dire l'état canonique après le bloc `k·SNAPSHOT_INTERVAL`.
+- **Jamais à la pointe** : le snapshot siège donc à `tip − 1` au
+  plus proche, toujours strictement sous la pointe au moment où il
+  est écrit. Un crash juste après ne peut jamais laisser un snapshot
+  « au-dessus » de la chaîne persistée.
+- **Atomique** : le gel (clear + copie des tables `domains`/`tlds`
+  vers `snapshot_v3_*`, écriture de `snapshot_v3_meta`) se produit
+  dans la MÊME transaction redb que l'append du bloc déclencheur —
+  un crash laisse soit l'ancien snapshot intact, soit le nouveau
+  complet avec son bloc (WAL redb).
+- **Slot unique** : chaque snapshot REMPLACE le précédent (tables
+  vidées puis recopiées) — pas d'accumulation, pas de pruning à
+  gérer, la taille disque est bornée par ~2× l'état.
+- Le format des états gelés est strictement celui de
+  `DomainStateBytes`/`TldStateBytes` (réutilisation, aucun encodage
+  nouveau) ; seule la ligne `snapshot_v3_meta` est un format neuf
+  (`height(8 BE) ‖ tip_hash(32)`, décodage strict : toute autre
+  longueur → `Corrupted`).
+
+### Lecture au boot (`load_chain`)
+
+1. Le tip est validé comme toujours (hash recalculé depuis le header
+   du bloc tip vs `meta["tip"]`).
+2. Si `snapshot_meta()` existe, que sa hauteur `H` vérifie
+   `0 < H < tip_height`, et que le hash RECALCULÉ du bloc stocké à
+   `H` égale le `tip_hash` du snapshot (**ancre** — un snapshot
+   étranger à la chaîne persistée, altéré ou issu d'un autre fichier
+   est détecté ici), l'état gelé est restauré par pages de 100 puis
+   les blocs `H+1..=tip` seuls sont rejoués (validation complète,
+   identique aux blocs vivants).
+3. Le tip rejoint par le rejeu doit égaler le tip stocké.
+4. **Toute défaillance sur ce chemin (absence de snapshot, hauteur
+   inutilisable, ancre invalide, octets indécodables, rejeu en
+   échec) dégrade silencieusement vers le chargement complet
+   pré-M6b** (lecture des tables vivantes, sans rejeu) — un snapshot
+   en mauvais état ne fait jamais échouer le boot. La compatibilité
+   descendante est le cas particulier « aucun snapshot » : un store
+   écrit avant M6b (sans les tables `snapshot_v3_*`) charge à
+   l'identique, `snapshot_meta()` valant `None`.
+
+Le suffixe rejoué est borné par `SNAPSHOT_INTERVAL` (au plus 64
+blocs au moment du déclenchement + les blocs minés depuis) : le boot
+est O(tip − H) avec H garanti récent.
+
+### Ce que le snapshot n'engage PAS
+
+L'état RAM `ChainState` porte des structures internes non engagées
+par la consensus (clés d'owners, fenêtres de grâce). Elles ne sont
+PAS gelées : le rejeu du suffixe les reconstruit par application des
+transactions (déterministe, même contenu que le rejeu complet pour
+la fenêtre concernée). L'égalité bit à bit avec `load_chain_replay`
+est vérifiée par test sur l'état canonique (state_root V2 + SMT).
+
 ## Politique mémoire
 
 - **Curseurs partout** : `iterate_domains` borne la page à `max`
@@ -263,7 +338,11 @@ Deux chemins de chargement, deux niveaux de garantie :
   historiques ne sont **pas rejoués** : les états persistés sont
   crus tels quels. C'est le démarrage rapide d'un nœud qui fait
   confiance à son propre disque (écrit uniquement par ce même nœud,
-  de façon atomique).
+  de façon atomique). Depuis M6b, ce chemin utilise d'abord le
+  **snapshot d'état** quand il est utilisable (voir ci-dessous) :
+  l'ancre du snapshot est recalculée et le suffixe au-dessus de H
+  est revalidé comme des blocs vivants — la portion rejouée est
+  donc de confiance zéro, le socle gelé de confiance disque.
 - **`load_chain_replay` — confiance zéro** : tous les blocs sont
   relus et revalidés un par un (validation complète, identique aux
   blocs vivants) ; le tip obtenu doit égaler le tip stocké. C'est
@@ -301,6 +380,14 @@ Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
 - cache DHT roundtrip + écrasement ;
 - concurrence : lectures depuis deux threads sur des handles clonés ;
 - base corrompue : fichier tronqué / garbage → erreur typée, aucune
-  panic (`catch_unwind`).
+  panic (`catch_unwind`) ;
+- M6b : snapshot écrit à l'intervalle, strictement sous la pointe ;
+  boot depuis snapshot = rejeu complet bit-exact (state_root V2 +
+  SMT, état logique complet, tip) ; snapshot altéré (tip_hash
+  corrompu, état indécodable, hauteur > pointe, méta de mauvaise
+  longueur) → repli silencieux sur le chargement complet, même
+  chaîne finale ; suffixe rejoué < intervalle ; remplacement (pas
+  accumulation) du snapshot au franchissement de l'intervalle ;
+  store pré-M6b sans tables snapshot charge à l'identique.
 
 [`ChainState`]: ../../../crates/scone-blockchain/src/state.rs

@@ -454,7 +454,7 @@ impl<C: Consensus> Blockchain<C> {
 #[cfg(test)]
 pub(crate) mod tests_support {
     pub(crate) use super::tests::{
-        child, claim_open_uip, producer_key, register_domain_tx, resign,
+        child, claim_open_uip, producer_key, register_domain_tx, resign, update_domain_tx,
     };
 }
 
@@ -541,7 +541,7 @@ mod tests {
         ))
     }
 
-    fn update_domain_tx(name: &str, seed: u8, sequence: u64) -> Transaction {
+    pub(crate) fn update_domain_tx(name: &str, seed: u8, sequence: u64) -> Transaction {
         sign(
             unsigned_update(name, seed, sequence),
             &SigningKey::from_bytes([seed; 32]),

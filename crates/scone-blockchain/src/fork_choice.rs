@@ -380,4 +380,125 @@ mod tests {
         assert_eq!(left.tip_hash(), right.tip_hash());
         assert_eq!(left.state, right.state);
     }
+
+    #[test]
+    fn reorg_smt_root_is_bit_exact_regardless_of_arrival_order() {
+        // M6a: two independent chains apply the same blocks in
+        // different ORDERS (one goes through the full reorg path
+        // `adopt_branch`, the other pushes sequentially) → identical
+        // SMT commitment, bit-exact state (the PartialEq on
+        // ChainState compares the Smt physically: leaves, buckets,
+        // branch nodes, root cache).
+        use crate::chain::tests_support::update_domain_tx;
+        let build_prefix = |chain: &mut Blockchain| {
+            claim_open_uip(chain, 1);
+            chain
+                .push_block(&child(
+                    chain,
+                    vec![
+                        register_domain_tx("a.uip", 2),
+                        register_domain_tx("b.uip", 3),
+                    ],
+                ))
+                .unwrap();
+        };
+        let mut left = Blockchain::new();
+        let mut right = Blockchain::new();
+        build_prefix(&mut left);
+        build_prefix(&mut right);
+        assert_eq!(
+            left.state().state_root_smt(),
+            right.state().state_root_smt()
+        );
+
+        // Two genuinely different branches at the same fork point:
+        // F1 updates a.uip, F2 registers c.uip.
+        let fork_point = left.height();
+        let mut f1 = child(&left, vec![update_domain_tx("a.uip", 2, 1)]);
+        f1.header.timestamp = fork_point + 1;
+        f1.header.tx_root = crate::merkle::tx_root(&f1.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut f1);
+        let f1_hash = crate::block_hash::block_hash(&f1.header).unwrap();
+        let f1b = crate::BlockBuilder::after(f1.header.height, f1_hash)
+            .with_timestamp(fork_point + 2)
+            .with_producer(&crate::chain::tests_support::producer_key())
+            .build_with(vec![update_domain_tx("a.uip", 2, 2)])
+            .expect("test block is well-formed");
+        let mut f2 = child(&left, vec![register_domain_tx("c.uip", 3)]);
+        f2.header.timestamp = fork_point + 1;
+        f2.header.tx_root = crate::merkle::tx_root(&f2.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut f2);
+
+        // right: push [f1, f1b] sequentially (no reorg ever).
+        right.push_block(&f1).unwrap();
+        right.push_block(&f1b).unwrap();
+
+        // left: f2 lands at the tip first, then [f1, f1b] — longer —
+        // reorgs it away through the full rewind+replay path.
+        left.push_block(&f2).unwrap();
+        assert_ne!(
+            left.state().state_root_smt(),
+            right.state().state_root_smt()
+        );
+        assert!(left.adopt_branch(&[f1, f1b]).unwrap());
+
+        // Same branch applied via different orders → same SMT root,
+        // bit-exact full state, and same canonical V2 root.
+        assert_eq!(left.tip_hash(), right.tip_hash());
+        assert_eq!(
+            left.state().state_root_smt(),
+            right.state().state_root_smt()
+        );
+        assert_eq!(left.state().state_root(), right.state().state_root());
+        assert_eq!(left.state, right.state);
+    }
+
+    #[test]
+    fn losing_branch_leaves_smt_untouched() {
+        // M6a: a branch that LOSES the fork choice (same height,
+        // higher tip hash) changes nothing — state, SMT engagement
+        // and root byte-identical to a node that never saw it.
+        let mut left = chain_with("example.uip");
+        let mut right = chain_with("example.uip");
+        let prefork_tip = left.tip_hash();
+        let fork_point = left.height();
+
+        let winner = child(&left, vec![register_domain_tx("winner.uip", 2)]);
+        let winner_hash = crate::block_hash::block_hash(&winner.header).unwrap();
+        left.push_block(&winner).unwrap();
+        right.push_block(&winner).unwrap();
+        assert_eq!(
+            left.state().state_root_smt(),
+            right.state().state_root_smt()
+        );
+
+        // Build a sister of the winner with a provably HIGHER hash
+        // (timestamps vary the hash; 64 draws make an all-lower run
+        // astronomically unlikely — and the assert catches it).
+        let mut loser: Option<Block> = None;
+        for ts in 0..64u64 {
+            let cand = crate::BlockBuilder::after(fork_point, prefork_tip)
+                .with_timestamp(ts)
+                .with_producer(&crate::chain::tests_support::producer_key())
+                .build_with(vec![register_domain_tx("loser.uip", 2)])
+                .expect("test block is well-formed");
+            if crate::block_hash::block_hash(&cand.header)
+                .unwrap()
+                .as_bytes()
+                > winner_hash.as_bytes()
+            {
+                loser = Some(cand);
+                break;
+            }
+        }
+        let loser = loser.expect("a higher-hash sister block exists within 64 timestamp draws");
+
+        let adopted = left.adopt_branch(&[loser]).unwrap();
+        assert!(!adopted, "a same-height higher-hash branch never wins");
+        assert_eq!(
+            left.state().state_root_smt(),
+            right.state().state_root_smt()
+        );
+        assert_eq!(left.state, right.state);
+    }
 }

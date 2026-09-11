@@ -318,6 +318,42 @@ impl<C: crate::consensus::Consensus> Blockchain<C> {
     }
 }
 
+/// Leaf encoding of one domain state (`SCONE-LEAF-DOM-V2`).
+///
+/// Shared (pub(crate)) between the canonical direct-fold `state_root`
+/// below and the incremental SMT commitment (`ChainState::smt`,
+/// `state_root_smt`): both commit **exactly the same leaves**, so the
+/// two commitments track the same logical state by construction.
+pub(crate) fn domain_leaf_v2(
+    id: &scone_core::DomainId,
+    st: &crate::state::DomainState,
+) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(15 + 32 + 32 + 8 + 8 + 32);
+    buf.extend_from_slice(b"SCONE-LEAF-DOM-V2");
+    buf.extend_from_slice(id.as_bytes());
+    buf.extend_from_slice(st.owner.as_bytes());
+    buf.extend_from_slice(&st.sequence.to_be_bytes());
+    buf.extend_from_slice(&st.registered_at.to_be_bytes());
+    buf.extend_from_slice(&st.valid_until.to_be_bytes());
+    if let Some(rh) = st.record_hash {
+        buf.extend_from_slice(rh.as_bytes());
+    } else {
+        buf.extend_from_slice(&[0u8; 32]);
+    }
+    scone_crypto::hash256(&[&buf])
+}
+
+/// Leaf encoding of one TLD state (`SCONE-LEAF-TLD-V2`) — same
+/// sharing contract as [`domain_leaf_v2`].
+pub(crate) fn tld_leaf_v2(id: &scone_core::TldId, st: &crate::state::TldState) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(15 + 32 + 32 + 1);
+    buf.extend_from_slice(b"SCONE-LEAF-TLD-V2");
+    buf.extend_from_slice(id.as_bytes());
+    buf.extend_from_slice(st.owner.as_bytes());
+    buf.push(u8::from(st.open));
+    scone_crypto::hash256(&[&buf])
+}
+
 impl ChainState {
     /// PoS eligibility pool: public keys of owners of LIVE domains
     /// (`valid_until > now`) and owners of LIVE TLDs (a claim cost a
@@ -354,10 +390,12 @@ impl ChainState {
     /// `SCONE-STATE-V2`). Deterministic: two nodes with the same
     /// logical state compute the same root.
     ///
-    /// NOTE (M3 of the .bak port): the root is currently computed
-    /// over a merkle of the domain map (not yet the incremental SMT —
-    /// the SMT swap is the next port step and keeps this hash stable
-    /// by construction of the leaves).
+    /// This V2 direct fold is the **canonical commitment of the
+    /// current protocol version** — its format is frozen. The
+    /// incremental SMT engagement lives beside it
+    /// ([`ChainState::state_root_smt`]) and commits the exact same
+    /// leaves (see [`domain_leaf_v2`]/[`tld_leaf_v2`]), so the two
+    /// can never diverge on the logical state.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
         use std::collections::BTreeMap;
@@ -368,27 +406,10 @@ impl ChainState {
             self.tlds.iter().collect();
         let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(domains.len() + tlds.len());
         for (id, st) in &domains {
-            let mut buf = Vec::with_capacity(15 + 32 + 32 + 8 + 8 + 32);
-            buf.extend_from_slice(b"SCONE-LEAF-DOM-V2");
-            buf.extend_from_slice(id.as_bytes());
-            buf.extend_from_slice(st.owner.as_bytes());
-            buf.extend_from_slice(&st.sequence.to_be_bytes());
-            buf.extend_from_slice(&st.registered_at.to_be_bytes());
-            buf.extend_from_slice(&st.valid_until.to_be_bytes());
-            if let Some(rh) = st.record_hash {
-                buf.extend_from_slice(rh.as_bytes());
-            } else {
-                buf.extend_from_slice(&[0u8; 32]);
-            }
-            leaves.push(scone_crypto::hash256(&[&buf]));
+            leaves.push(domain_leaf_v2(id, st));
         }
         for (id, st) in &tlds {
-            let mut buf = Vec::with_capacity(15 + 32 + 32 + 1);
-            buf.extend_from_slice(b"SCONE-LEAF-TLD-V2");
-            buf.extend_from_slice(id.as_bytes());
-            buf.extend_from_slice(st.owner.as_bytes());
-            buf.push(u8::from(st.open));
-            leaves.push(scone_crypto::hash256(&[&buf]));
+            leaves.push(tld_leaf_v2(id, st));
         }
         let mut top = Vec::with_capacity(15 + 32 + 32);
         top.extend_from_slice(b"SCONE-STATE-V2");
