@@ -6,6 +6,7 @@
 //! purpose: `GetTransaction`/`TxId` (depend on blockchain-layer
 //! decisions).
 
+use scone_core::checkpoint::Checkpoint as CoreCheckpoint;
 use scone_core::{DomainId, SignedDnsRecord, Transaction};
 
 use crate::PROTOCOL_VERSION;
@@ -35,6 +36,12 @@ pub mod msg_type {
     pub const GET_RECORD: u8 = 0x08;
     /// DHT put/response: carries a signed record set.
     pub const RECORD: u8 = 0x09;
+    /// Broadcasts a checkpoint (aggregate in progress or finalized):
+    /// carries data + the signatures known to the sender.
+    pub const CHECKPOINT: u8 = 0x0a;
+    /// Requests the finalized-checkpoint window. Expected response:
+    /// up to `CHECKPOINT_KEEP` `Checkpoint` messages (oldest first).
+    pub const GET_CHECKPOINTS: u8 = 0x0b;
 }
 
 /// A P2P message.
@@ -67,6 +74,16 @@ pub enum Message {
     GetRecord { domain_id: DomainId },
     /// DHT put/response: carries a signed DNS record set.
     Record(SignedDnsRecord),
+    /// Broadcasts a checkpoint (aggregate in progress or
+    /// finalized). Direction: both ways. The receiver merges the
+    /// carried signatures into its local aggregate for the same
+    /// `CheckpointData`; relayed only while new to the receiver.
+    Checkpoint(Box<CoreCheckpoint>),
+    /// Requests the finalized-checkpoint window. Direction: both
+    /// ways. Empty payload. Expected response: one `Checkpoint`
+    /// message per finalized checkpoint (oldest first, bounded by
+    /// the receiver's keep-window).
+    GetCheckpoints,
 }
 
 impl Encode for Message {
@@ -120,6 +137,14 @@ impl Encode for Message {
                 out.push(msg_type::RECORD);
                 record.encode(out)
             }
+            Self::Checkpoint(cp) => {
+                out.push(msg_type::CHECKPOINT);
+                cp.encode(out)
+            }
+            Self::GetCheckpoints => {
+                out.push(msg_type::GET_CHECKPOINTS);
+                Ok(())
+            }
         }
     }
 }
@@ -158,6 +183,8 @@ impl Decode for Message {
                 domain_id: DomainId::decode(input)?,
             },
             msg_type::RECORD => Self::Record(SignedDnsRecord::decode(input)?),
+            msg_type::CHECKPOINT => Self::Checkpoint(Box::new(CoreCheckpoint::decode(input)?)),
+            msg_type::GET_CHECKPOINTS => Self::GetCheckpoints,
             value => {
                 return Err(ProtocolError::UnknownDiscriminant {
                     kind: "message",
@@ -214,6 +241,23 @@ mod tests {
         })
     }
 
+    fn checkpoint_message() -> Message {
+        let sk = signer();
+        let data = scone_core::checkpoint::CheckpointData {
+            epoch: 1,
+            height: 42,
+            block_hash: [4; 32],
+            prev_checkpoint_hash: [0; 32],
+            state_root: [5; 32],
+            recovery: 0,
+        };
+        let msg = data.signing_hash();
+        Message::Checkpoint(Box::new(scone_core::checkpoint::Checkpoint {
+            data,
+            signatures: vec![(sk.public_key(), sk.sign(&msg))],
+        }))
+    }
+
     fn all_messages() -> Vec<Message> {
         vec![
             Message::Hello {
@@ -242,6 +286,8 @@ mod tests {
                 domain_id: DomainId::from_name(&DomainName::new("example.uip").unwrap()),
             },
             record_message(),
+            checkpoint_message(),
+            Message::GetCheckpoints,
         ]
     }
 
@@ -355,7 +401,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminant_rejected() {
-        for disc in [0x00u8, 0x0a, 0xff] {
+        for disc in [0x00u8, 0x0c, 0xff] {
             assert!(matches!(
                 decode_complete::<Message>(&[disc]),
                 Err(ProtocolError::UnknownDiscriminant {

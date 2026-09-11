@@ -190,24 +190,38 @@ async fn free_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-/// One relay under test, with its RPC client, peer id and listen
-/// address (so later nodes can bootstrap on it).
+/// One relay under test, with its RPC client, peer id, listen
+/// address (so later nodes can bootstrap on it) and its ADOPTED
+/// anchor key (M5: the relay produces blocks with it — an allowed
+/// producer — and the fixture txs are signed by the SAME key).
 struct Node {
     client: RpcClient,
     peer_id: libp2p::PeerId,
     listen_addr: libp2p::Multiaddr,
+    anchor: SigningKey,
 }
 
 /// Starts a relay and waits for its RPC surface. When `bootstrap` is
 /// non-empty the relay dials those peers, forming the gossip topology.
+/// The anchor keyfile is generated first and returned in the node:
+/// `--anchor-key`-style config (M5 producer authority + checkpoint
+/// signing).
 async fn start_node(
     dir: &std::path::Path,
     bootstrap: &[(libp2p::Multiaddr, libp2p::PeerId)],
+    anchor_env: &str,
 ) -> Node {
     let rpc_port = free_port().await;
+    // SAFETY: env vars are written before any relay task reads them.
+    unsafe { std::env::set_var(anchor_env, "three-nodes-pass") };
+    let keyfile = dir.join("anchor.sconekey");
+    let anchor =
+        scone_keystore::create_overwriting(&keyfile, "three-nodes-pass").expect("anchor keyfile");
     let mut config = Config::new(dir.to_path_buf());
     config.produce_interval = Duration::from_secs(1);
     config.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port));
+    config.anchor_key = Some(keyfile);
+    config.anchor_passphrase_env = anchor_env.to_string();
     if !bootstrap.is_empty() {
         config.bootstrap = bootstrap
             .iter()
@@ -228,6 +242,7 @@ async fn start_node(
         client,
         peer_id,
         listen_addr,
+        anchor: anchor.signing_key,
     }
 }
 
@@ -320,25 +335,32 @@ async fn three_nodes_cycle_security_regression() {
     // Node A first (no bootstrap), then B on A, then C on BOTH A and
     // B: the three relays form a real gossip cycle A↔B↔C. (Relying on
     // identify to relay B's address to C proved flaky.)
-    let node_a = start_node(dir_a.path(), &[]).await;
+    let node_a = start_node(dir_a.path(), &[], "SCONE_TEST_3N_PASS_A").await;
     let (addr_a, peer_a) = (node_a.listen_addr.clone(), node_a.peer_id);
-    let node_b = start_node(dir_b.path(), &[(addr_a.clone(), peer_a)]).await;
+    let node_b = start_node(
+        dir_b.path(),
+        &[(addr_a.clone(), peer_a)],
+        "SCONE_TEST_3N_PASS_B",
+    )
+    .await;
     let node_c = start_node(
         dir_c.path(),
         &[
             (addr_a, peer_a),
             (node_b.listen_addr.clone(), node_b.peer_id),
         ],
+        "SCONE_TEST_3N_PASS_C",
     )
     .await;
 
     let nodes = [node_a, node_b, node_c];
-
     // Full mesh: every node sees the two others.
     wait_mesh_connected(&nodes, 2, deadline).await;
 
     // ---- C1: forged transaction must not kill the relay ----------
-    let sk = SigningKey::from_bytes([11u8; 32]);
+    // (M5: node A produces with its anchor key; every fixture tx is
+    // signed by the SAME key so the producer stays allowed.)
+    let sk = nodes[0].anchor.clone();
     let forged = forged_register_tx(&sk, "forged.uip");
     let forged_hex = hex(&encode_to_vec(&forged).expect("encode forged"));
     let response = nodes[0]

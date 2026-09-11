@@ -85,6 +85,24 @@ fn dns_cli_end_to_end() {
     let rpc = SocketAddr::from((Ipv4Addr::LOCALHOST, free_tcp_port()));
     let dns = SocketAddr::from((Ipv4Addr::LOCALHOST, free_udp_port()));
 
+    // ---- identity (generated BEFORE the relay: the anchor key is
+    // the owner's keyfile — this relay produces blocks as the owner,
+    // M5) ---------------------------------------------------------------
+    let keys = work.path().join("keys");
+    let pass_var = "SCONE_TEST_PASS_M6";
+    // SAFETY: single-threaded test.
+    unsafe { std::env::set_var(pass_var, "m6-passphrase") };
+    scone_ok(&[
+        "identity",
+        "generate",
+        "--name",
+        "owner",
+        "--dir",
+        keys.to_str().expect("keys"),
+        "--passphrase-env",
+        pass_var,
+    ]);
+
     // ---- relay with the DNS surface --------------------------------
     let log_path = work.path().with_extension("relay.log");
     let log = std::fs::File::create(&log_path).expect("log");
@@ -98,6 +116,10 @@ fn dns_cli_end_to_end() {
             &rpc.to_string(),
             "--dns",
             &dns.to_string(),
+            "--anchor-key",
+            keys.join("owner.sconekey").to_str().expect("anchor key"),
+            "--anchor-passphrase-env",
+            pass_var,
         ])
         .stdout(Stdio::from(log.try_clone().expect("clone")))
         .stderr(Stdio::from(log));
@@ -118,21 +140,8 @@ fn dns_cli_end_to_end() {
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    // ---- identity + TLD claim + register + update ------------------
-    let keys = work.path().join("keys");
-    let pass_var = "SCONE_TEST_PASS_M6";
-    // SAFETY: single-threaded test.
-    unsafe { std::env::set_var(pass_var, "m6-passphrase") };
-    scone_ok(&[
-        "identity",
-        "generate",
-        "--name",
-        "owner",
-        "--dir",
-        keys.to_str().expect("keys"),
-        "--passphrase-env",
-        pass_var,
-    ]);
+    // ---- TLD claim + register + update ------------------------------
+    // (identity generated before the relay — see above.)
     let id_args = [
         "--identity".to_string(),
         "owner".to_string(),
@@ -223,7 +232,11 @@ fn dns_cli_end_to_end() {
         if lines.iter().any(|l| l.starts_with("height: 2")) {
             break;
         }
-        assert!(Instant::now() < open_deadline, "tld open never mined");
+        if Instant::now() >= open_deadline {
+            // Dump the relay log for diagnosis before failing.
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            panic!("tld open never mined; relay log:\n{log}");
+        }
         std::thread::sleep(Duration::from_millis(300));
     }
 

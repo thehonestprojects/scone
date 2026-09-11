@@ -38,6 +38,7 @@
 //!   [`ProtocolError`], and decoding never panics on network data.
 
 pub mod block;
+pub mod checkpoint;
 pub mod codec;
 pub mod error;
 pub mod hash;
@@ -49,10 +50,12 @@ pub mod transaction;
 pub mod varint;
 
 pub use block::{Block, BlockHash, BlockHeader, MerkleRoot};
+pub use checkpoint::{CHECKPOINT_WIRE_TAG, MAX_CHECKPOINT_SIGNERS};
 pub use codec::{Decode, Encode, decode_complete, encode_to_vec};
 pub use error::{ProtocolError, Result};
 pub use hash::record_hash;
 pub use message::Message;
+pub use scone_core::checkpoint::{Checkpoint, CheckpointData};
 pub use transaction::{TX_FORMAT_VERSION, TX_SIG_PREFIX, UnsignedTransaction, signing_payload};
 
 /// Protocol version. Bumped on any breaking wire-format change.

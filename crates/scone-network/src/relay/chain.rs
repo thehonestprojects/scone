@@ -75,6 +75,9 @@ impl Relay {
                 .reqres
                 .send_request(peer, message.clone());
         }
+        // Anchor loop: propose/sign/aggregate/finalize after every
+        // accepted block (no-op for relays without committee state).
+        self.anchor_after_block();
         Ok(hash)
     }
 
@@ -311,12 +314,24 @@ impl Relay {
                 continue;
             }
             // 3. Greedy assembly: full list first, shrink from the
-            //    end on rejection. Bounded by the candidate count.
+            // end on rejection. Bounded by the candidate count.
             while !candidates.is_empty() {
+                // M5: the block must be SIGNED by an allowed producer.
+                // The anchor key (a committee member is an allowed
+                // producer) when armed, otherwise an ephemeral devnet
+                // key — bootstrap production is open (allowed set
+                // empty / contains live-domain owners).
+                let devnet_key = scone_crypto::SigningKey::from_bytes([
+                    0xd0, 0x1d, 0xca, 0x5e, 0xba, 0xdc, 0x0f, 0xfe, 0x7e, 0x11, 0x0b, 0xad, 0x5c,
+                    0x0c, 0x0f, 0xfe, 0xe3, 0x0c, 0x0d, 0xe5, 0xca, 0x0f, 0xfe, 0xe0, 0x0b, 0x0a,
+                    0xd0, 0xca, 0x5e, 0x0e, 0x0d, 0xe5,
+                ]);
+                let producer = self.anchor.signing_key().unwrap_or(devnet_key);
                 let block = {
                     let mut builder =
                         BlockBuilder::after(self.chain.height(), self.chain.tip_hash())
-                            .with_timestamp(unix_now());
+                            .with_timestamp(unix_now())
+                            .with_producer(&producer);
                     for tx in &candidates {
                         builder.push_tx(tx.clone())?;
                     }
@@ -348,6 +363,9 @@ impl Relay {
                                 .reqres
                                 .send_request(peer, message.clone());
                         }
+                        // Anchor loop: a produced block advances the
+                        // chain too — propose/sign/finalize.
+                        self.anchor_after_block();
                         return Ok(());
                     }
                     Err(e) => {

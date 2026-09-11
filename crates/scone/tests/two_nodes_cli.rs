@@ -91,19 +91,34 @@ fn read_all(path: &Path) -> String {
     text
 }
 
-/// Spawns a relay and waits for its RPC to answer `status`.
-fn start_relay(data_dir: &Path, rpc: SocketAddr, bootstrap: Option<&str>) -> RelayProcess {
+/// Spawns a relay and waits for its RPC to answer `status`. When
+/// `anchor` is set the relay runs with `--anchor-key` (producer
+/// authority + checkpoint signing with that identity).
+fn start_relay(
+    data_dir: &Path,
+    rpc: SocketAddr,
+    bootstrap: Option<&str>,
+    anchor: Option<(&Path, &str)>,
+) -> RelayProcess {
     let log_path = data_dir.with_extension("relay.log");
     let log = std::fs::File::create(&log_path).expect("create relay log");
     let mut command = Command::new(BIN);
+    command.args([
+        "relay",
+        "--data-dir",
+        data_dir.to_str().expect("utf8 data dir"),
+        "--rpc",
+        &rpc.to_string(),
+    ]);
+    if let Some((keyfile, env)) = anchor {
+        command.args([
+            "--anchor-key",
+            keyfile.to_str().expect("utf8 keyfile"),
+            "--anchor-passphrase-env",
+            env,
+        ]);
+    }
     command
-        .args([
-            "relay",
-            "--data-dir",
-            data_dir.to_str().expect("utf8 data dir"),
-            "--rpc",
-            &rpc.to_string(),
-        ])
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log));
     if let Some(addr) = bootstrap {
@@ -217,13 +232,19 @@ fn two_nodes_cli_end_to_end() {
     };
 
     // ---- node A, then node B bootstrapped on A -------------------
-    let relay_a = start_relay(&node_a_dir, rpc_a, None);
+    // A's anchor identity is generated FIRST: `--anchor-key` makes A
+    // produce its blocks with alice's key (an allowed producer once
+    // the PoS pool is non-empty — M5 producer validation) and arms
+    // the checkpoint anchor loop.
+    let id_alice = identity("alice");
+    let alice_keyfile = keys.join("alice.sconekey");
+    let relay_a = start_relay(&node_a_dir, rpc_a, None, Some((&alice_keyfile, pass_var)));
     let bootstrap = bootstrap_of(&work.path().join("node-a.relay.log"), rpc_a);
     assert!(
         bootstrap.ends_with(&format!("/p2p/{}", peer_id_of(&rpc_a))),
         "bootstrap addr carries the peer id: {bootstrap}"
     );
-    let relay_b = start_relay(&node_b_dir, rpc_b, Some(&bootstrap));
+    let relay_b = start_relay(&node_b_dir, rpc_b, Some(&bootstrap), None);
 
     // Wait for the mesh: both nodes see one peer.
     let _mesh_deadline = deadline;
@@ -239,7 +260,8 @@ fn two_nodes_cli_end_to_end() {
     );
 
     // ---- claim the TLD namespace (D1, M7c) ------------------------
-    let id_alice = identity("alice");
+    // (alice's identity was generated before A started — see the
+    // `--anchor-key` note above.)
     // `scone tld register` arrives in M7e; until then the e2e path is
     // the offline tx surface: build → sign → submit (against A).
     let tld_payload = scone_ok(&[

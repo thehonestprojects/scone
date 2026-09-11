@@ -199,6 +199,11 @@ impl Relay {
                     ))
                 }
             }
+            Message::Checkpoint(cp) => {
+                self.accept_checkpoint_message(*cp, Some(peer))?;
+                Ok(Message::Pong)
+            }
+            Message::GetCheckpoints => self.handle_get_checkpoints(peer),
         }
     }
 }

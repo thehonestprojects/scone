@@ -319,6 +319,18 @@ pour argent comptant :
 4. nombre de transactions ≤ `MAX_TXS_PER_BLOCK` (4096) ;
 5. `tx_root` recalculé sur les transactions dans l'ordre du bloc ;
 6. crochets du consensus (`validate_header`, `validate_tx`) ;
+6bis. **producteur signé (M5, port .bak)** : le payload `consensus`
+   doit décoder comme un payload producteur
+   (`SCONE-BLOCK-V2 ‖ pk[32] ‖ sig[64]`, borné) ; la signature porte
+   sur le *hash de signature producteur* = `BlockHash` du header
+   **le champ `consensus` vidé** (le payload vivant dans ce champ,
+   signer le hash complet serait circulaire) ; le producteur doit
+   appartenir à l'ensemble autorisé à l'instant `timestamp` du bloc
+   (comité élu par checkpoint, plus tirages recovery déverrouillés ;
+   bootstrap : owners de domaines vivants — pool vide = production
+   ouverte, sinon le premier enregistrement serait impossible). La
+   genèse (hauteur 0, payload vide) est structurelle et jamais
+   concernée. Erreur typée `InvalidProducer` ;
 7. pour chaque transaction, dans l'ordre : validation
    **cryptographique** (`validate_transaction` : binding
    owner/clé recomputé + `verify_strict` sur le payload signé
@@ -355,24 +367,33 @@ BlockBuilder::after(hauteur_parent, prev_hash)
 - le payload `consensus` (champs PoW futurs) et le `timestamp` sont
   fournis par l'appelant : le consensus concret s'insère via le trait
   [`Consensus`](#abstraction-du-consensus) existant, symétriquement à
-  la validation.
+  la validation ;
+- M5 : `.with_producer(&SigningKey)` signe le bloc comme producteur —
+  le payload `consensus` devient le payload producteur signé (sur le
+  hash de signature producteur défini ci-dessus) et remplace tout
+  `.with_consensus` préalable.
 
 Un bloc assemblé passe `push_block` sans réencodage (testé).
 
-## Forks
+## Forks et fork choice (M3c, port .bak)
 
-Traitement minimal, volontairement sans algorithme de fork choice :
+`push_block` reste l'entrée linéaire (parent == pointe, sinon
+`UnknownParent`/`ParentNotTip`). `try_attach` (M3c) évalue les blocs
+concurrents :
 
-- parent inconnu → `UnknownParent` (le bloc attend, il n'est ni accepté
-  ni canonique) ;
-- parent connu mais non-pointe → `ParentNotTip` (branche concurrente
-  refusée par cette implémentation linéaire) ;
-- hauteur logique = `height` du header, vérifiée == pointe + 1 ;
+- parent inconnu → `UnknownParent` (le bloc attend) ;
+- filiation valide mais en retrait → évaluation de branche : la plus
+  longue chaîne gagne ; égalité parfaite → tie-break déterministe
+  (hash de pointe le plus petit en ordre lexicographique — deux
+  nœuds ayant les mêmes blocs choisissent toujours le même gagnant,
+  testé) ;
+- **plancher de finalité** : une branche dont un ancêtre contredit un
+  checkpoint finalisé (inclus dans `prev_checkpoint_hash` d'un
+  checkpoint accepté) est refusée (`FinalityConflict`) ;
+- adoption = rejeu depuis la genèse des blocs de la branche gagnante
+  (déterminisme bit-exact testé : deux nœuds recevant les mêmes blocs
+  dans des ordres différents aboutissent au même état) ;
 - aucun bloc reçu n'est canonique avant validation complète.
-
-La structure interne (hashes connus, chaîne linéaire + état) permet
-d'ajouter ultérieurement le suivi multi-branches et la sélection de
-branche.
 
 ## Abstraction du consensus
 
@@ -394,9 +415,11 @@ pub trait Consensus {
 
 Volontairement non définis dans cette crate :
 
-- **fork choice** : sélection entre pointes concurrentes, reorg ;
-- **mempool** : admission, remplacement, frais ;
-- **ordering global** : autorité de tri, tie-break final ;
+- **mempool** : l'admission/réordonnancement fin (frais, remplacement)
+  reste au relay (M4 a porté cap par domaine + anti-replay TXID
+  fenêtré — `REPLAY_WINDOW_BLOCKS = 256`) ;
+- **ordering global** : le tri du mempool est un tri déterministe
+  local (relay), pas une autorité globale ;
 - **timestamp authority** au-delà du GC : les expirations (M8b)
   utilisent le timestamp du bloc parent ; d'autres règles de temps
   (anti-replay fin) restent au consensus ;

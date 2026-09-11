@@ -438,6 +438,17 @@ impl ChainState {
                     register_tld.proof.as_bytes(),
                     self.network.tld_pow_difficulty,
                 )?;
+                // M5: learn the TLD owner's key — the TLD owner is a
+                // PoS stakeholder (the claim cost a PoW). Journaled:
+                // a rolled-back block un-learns it.
+                if let std::collections::hash_map::Entry::Vacant(v) =
+                    self.owner_keys.entry(register_tld.owner)
+                {
+                    v.insert(register_tld.public_key);
+                    journal
+                        .entries
+                        .push(UndoEntry::LearnOwnerKey(register_tld.owner));
+                }
                 self.tlds.insert(
                     register_tld.tld_id,
                     TldState {

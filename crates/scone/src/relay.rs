@@ -17,6 +17,8 @@ pub(crate) fn run_relay(
     rpc: Option<String>,
     dns: Option<String>,
     dns_upstream: Vec<String>,
+    anchor_key: Option<PathBuf>,
+    anchor_passphrase_env: String,
 ) -> Result<Vec<String>, CliError> {
     // M8b: named network — testnet is the development default,
     // mainnet must be explicit.
@@ -51,6 +53,10 @@ pub(crate) fn run_relay(
         );
     }
     config.dns_upstreams = dns_upstream;
+    // M5: anchor identity — checkpoint participation + block
+    // production authority.
+    config.anchor_key = anchor_key;
+    config.anchor_passphrase_env = anchor_passphrase_env;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

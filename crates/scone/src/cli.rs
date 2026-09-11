@@ -73,6 +73,17 @@ pub(crate) enum Command {
         /// charset are forwarded there, otherwise REFUSED.
         #[arg(long = "dns-upstream")]
         dns_upstream: Vec<String>,
+        /// Anchor keyfile (`.sconekey`) — when set, this relay
+        /// participates in the checkpoint loop (proposes, signs,
+        /// aggregates) and produces blocks with the anchor identity
+        /// (M5: an allowed producer). Requires the passphrase env
+        /// var (see `--anchor-passphrase-env`).
+        #[arg(long = "anchor-key")]
+        anchor_key: Option<PathBuf>,
+        /// Environment variable holding the anchor keyfile passphrase
+        /// (default `SCONE_ANCHOR_PASS`).
+        #[arg(long = "anchor-passphrase-env", default_value = "SCONE_ANCHOR_PASS")]
+        anchor_passphrase_env: String,
     },
 
     /// Relay status (tip, height, peers, domains).

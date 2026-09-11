@@ -26,6 +26,10 @@ pub const MAX_DHT_WAITERS: usize = 256;
 /// RPC read timeout) instead of spawning freely.
 pub const MAX_RPC_CONNECTIONS: usize = 64;
 
+/// Environment variable holding the anchor keyfile passphrase
+/// (checked only when [`Config::anchor_key`] is set).
+pub const DEFAULT_ANCHOR_PASSPHRASE_ENV: &str = "SCONE_ANCHOR_PASSPHRASE";
+
 // Compile-time sanity: both caps finite and positive.
 const _: () = assert!(MAX_DHT_WAITERS > 0);
 const _: () = assert!(MAX_RPC_CONNECTIONS > 0);
@@ -58,6 +62,15 @@ pub struct Config {
     /// Optional recursive DNS fallback upstreams (`addr:port`).
     /// Empty = Scone-unknown names get REFUSED.
     pub dns_upstreams: Vec<String>,
+    /// Optional anchor keyfile (`.sconekey`, opened via
+    /// `scone-keystore`): when set AND this node is in the current
+    /// committee, the relay signs and gossips checkpoint proposals
+    /// (the anchor loop). `None` = passive observer of finality.
+    pub anchor_key: Option<PathBuf>,
+    /// Environment variable holding the anchor keyfile passphrase
+    /// (default [`DEFAULT_ANCHOR_PASSPHRASE_ENV`]). Only read when
+    /// `anchor_key` is set.
+    pub anchor_passphrase_env: String,
 }
 
 impl Config {
@@ -74,6 +87,8 @@ impl Config {
             rpc_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             dns_addr: None,
             dns_upstreams: Vec::new(),
+            anchor_key: None,
+            anchor_passphrase_env: DEFAULT_ANCHOR_PASSPHRASE_ENV.to_string(),
         }
     }
 }
@@ -90,5 +105,7 @@ mod tests {
         assert_eq!(config.produce_interval, DEFAULT_PRODUCE_INTERVAL);
         assert_eq!(config.rpc_addr.port(), 0);
         assert!(config.bootstrap.is_empty());
+        assert!(config.anchor_key.is_none());
+        assert_eq!(config.anchor_passphrase_env, "SCONE_ANCHOR_PASSPHRASE");
     }
 }

@@ -149,9 +149,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = RedbStore::open(dir.path().join("c.redb")).unwrap();
         let mut chain = scone_blockchain::Blockchain::new();
+        // All fixture txs are owned by seed 1 (the TLD claimer), so
+        // the blocks must be SIGNED by that same key (M5: it becomes
+        // the allowed producer once the pool is non-empty).
+        let producer = scone_crypto::SigningKey::from_bytes([1; 32]);
         for i in 0..5 {
-            let mut builder =
-                BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(i + 1);
+            let mut builder = BlockBuilder::after(chain.height(), chain.tip_hash())
+                .with_timestamp(i + 1)
+                .with_producer(&producer);
             if i == 0 {
                 // D1 (M7c) + M8b: claim the namespace, open it, then
                 // the first domain (self-registration requires an

@@ -498,7 +498,9 @@ mod tests {
         // Block 1 (t=1000): claim + open + register, one block, one
         // atomic store append.
         let block1 = {
-            let mut b = BlockBuilder::after(0, chain.tip_hash()).with_timestamp(1000);
+            let mut b = BlockBuilder::after(0, chain.tip_hash())
+                .with_timestamp(1000)
+                .with_producer(&sk);
             b.push_tx(signed_claim_tld(&sk, "uip")).unwrap();
             b.push_tx(signed_open_tld(&sk, "uip")).unwrap();
             b.push_tx(signed_register(&sk, "ghost.uip")).unwrap();
@@ -518,6 +520,7 @@ mod tests {
         // block still lands (empty).
         let block2 = BlockBuilder::after(1, chain.tip_hash())
             .with_timestamp(1000 + 2 * DOMAIN_TERM_SECS)
+            .with_producer(&sk)
             .build()
             .unwrap();
         let applied2 = chain.push_block_with_gc(&block2).unwrap();
@@ -538,6 +541,7 @@ mod tests {
         // the GC removes ghost.uip and the removal reaches the store.
         let block3 = BlockBuilder::after(2, chain.tip_hash())
             .with_timestamp(1000 + 3 * DOMAIN_TERM_SECS)
+            .with_producer(&sk)
             .build()
             .unwrap();
         let applied3 = chain.push_block_with_gc(&block3).unwrap();

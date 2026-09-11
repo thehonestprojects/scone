@@ -184,9 +184,12 @@ async fn two_nodes_sync_blocks_and_records() {
 
     // ---- node A: fixed rpc port, devnet production every second ----
     let rpc_port_a = free_port().await;
+    let (anchor_file_a, anchor_key_a) = devnet_anchor(dir_a.path(), "SCONE_TEST_2N_PASS_A");
     let mut config_a = Config::new(dir_a.path().to_path_buf());
     config_a.produce_interval = Duration::from_secs(1);
     config_a.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port_a));
+    config_a.anchor_key = Some(anchor_file_a);
+    config_a.anchor_passphrase_env = "SCONE_TEST_2N_PASS_A".to_string();
     let mut relay_a = Relay::new(config_a).expect("relay A init");
     let peer_a = relay_a.peer_id();
     let addr_a = relay_a.wait_listen_addr().await.expect("A listen");
@@ -224,7 +227,9 @@ async fn two_nodes_sync_blocks_and_records() {
     assert_eq!(status["height"], 0, "B starts at genesis: {status}");
 
     // ---- claim the TLD namespace, then the domain (D1, M7c) --------
-    let sk = SigningKey::from_bytes([7u8; 32]);
+    // M5: A produces with its anchor key; the fixture txs are signed
+    // by the same key (the TLD owner is the allowed producer).
+    let sk = anchor_key_a;
     let name = "example.uip";
     let tld_hex = hex(&encode_to_vec(&register_tld_tx(&sk, "uip")).expect("encode tld tx"));
     let response = request(
@@ -347,12 +352,15 @@ async fn concurrent_registers_never_kill_the_producer() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let rpc_port = free_port().await;
+    let (anchor_file, tld_sk) = devnet_anchor(dir.path(), "SCONE_TEST_2N_PASS_RACE");
     let mut config = Config::new(dir.path().to_path_buf());
     // Long interval: both transactions sit in the mempool at the same
     // production tick (precheck accepts both against the genesis
     // state), which is exactly the crash window.
     config.produce_interval = Duration::from_secs(3);
     config.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port));
+    config.anchor_key = Some(anchor_file);
+    config.anchor_passphrase_env = "SCONE_TEST_2N_PASS_RACE".to_string();
     let relay = Relay::new(config).expect("relay init");
     tokio::spawn(async move {
         if let Err(e) = relay.run().await {
@@ -363,8 +371,7 @@ async fn concurrent_registers_never_kill_the_producer() {
     let client = wait_rpc(rpc_port, deadline).await;
 
     // D1 (M7c): the namespace must exist before anyone races for a
-    // name under it.
-    let tld_sk = SigningKey::from_bytes([0x99; 32]);
+    // name under it. tld_sk = the relay's anchor key (M5 producer).
     let tld_hex = hex(&encode_to_vec(&register_tld_tx(&tld_sk, "uip")).expect("encode tld"));
     let response = request(&client, RpcRequest::SubmitTx { tx_hex: tld_hex }, deadline).await;
     assert!(response["txid"].is_string(), "{response}");
@@ -450,6 +457,21 @@ async fn request(
 
 async fn status_of(client: &RpcClient, deadline: tokio::time::Instant) -> serde_json::Value {
     request(client, RpcRequest::Status, deadline).await
+}
+
+/// Devnet anchor setup for one relay (M5): generates the keyfile first
+/// and returns (path, env-name, key) — the relay produces with this
+/// key, so fixture txs signed by it stay applicable.
+fn devnet_anchor(
+    dir: &std::path::Path,
+    env_name: &'static str,
+) -> (std::path::PathBuf, SigningKey) {
+    // SAFETY: test env vars are written before relay tasks spawn.
+    unsafe { std::env::set_var(env_name, "two-nodes-pass") };
+    let keyfile = dir.join("anchor.sconekey");
+    let generated =
+        scone_keystore::create_overwriting(&keyfile, "two-nodes-pass").expect("anchor keyfile");
+    (keyfile, generated.signing_key)
 }
 
 async fn wait_rpc(port: u16, deadline: tokio::time::Instant) -> RpcClient {

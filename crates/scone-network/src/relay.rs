@@ -41,6 +41,7 @@
 //!   production;
 //! - `rpc_dispatch`: control-RPC handlers and DHT waiter lifecycle.
 
+mod anchor;
 mod chain;
 mod hex;
 mod rpc_dispatch;
@@ -85,6 +86,10 @@ pub struct Relay {
     /// Pending DHT `get_record` waiters (one per RPC query), with
     /// their expiry deadline.
     dht_waiters: Vec<DhtWaiter>,
+    /// Anchor loop state (checkpoint signing + aggregation). Always
+    /// present; holds signing material only when an anchor keyfile is
+    /// configured.
+    anchor: self::anchor::AnchorLoop,
 }
 
 impl Relay {
@@ -112,6 +117,12 @@ impl Relay {
         }
         let mempool = Mempool::new(config.mempool_capacity);
         let rpc_addr = config.rpc_addr;
+
+        // The anchor key is read BEFORE `config` is moved into the
+        // relay: a bad keyfile/passphrase is a startup error the
+        // operator must see (the relay then runs unarmed if the
+        // caller chooses to continue without it).
+        let anchor_config = config.clone();
 
         let mut swarm = libp2p::SwarmBuilder::with_new_identity()
             .with_tokio()
@@ -143,6 +154,7 @@ impl Relay {
             rpc_addr,
             sync: HashMap::new(),
             dht_waiters: Vec::new(),
+            anchor: self::anchor::AnchorLoop::load(&anchor_config)?,
         };
 
         for addr in &relay.config.bootstrap.clone() {

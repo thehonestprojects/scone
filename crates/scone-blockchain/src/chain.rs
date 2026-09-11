@@ -70,7 +70,7 @@ pub struct Blockchain<C: Consensus = PermissiveConsensus> {
     pub(crate) tip: BlockHash,
     /// The network this chain belongs to (M8b): its genesis, its
     /// PoW parameters, the only network id its transactions may carry.
-    network: NetworkParams,
+    pub(crate) network: NetworkParams,
     pub(crate) state: ChainState,
     consensus: C,
     /// TXIDs of the transactions included **within the last
@@ -363,8 +363,37 @@ impl<C: Consensus> Blockchain<C> {
 
         let hash = block_hash(header)?;
 
-        // Consensus hooks (PoW etc. — future).
+        // Consensus hooks (PoW etc.).
         self.consensus.validate_header(header)?;
+        // M5 (.bak port): the block must be SIGNED by an allowed
+        // producer — the PoS authority is enforced here, at
+        // application time, on every node (recomputed hash, never a
+        // provided value). The genesis block (height 0, empty
+        // consensus payload) is structural and never lands here.
+        if header.height > 0 {
+            let payload = crate::producer::decode_producer_payload(&header.consensus).ok_or(
+                BlockchainError::InvalidProducer(
+                    "consensus payload is not a signed producer payload".into(),
+                ),
+            )?;
+            let signing_hash = crate::producer::producer_signing_hash(header).ok_or(
+                BlockchainError::InvalidProducer("header is not encodable".into()),
+            )?;
+            if !crate::producer::verify_block_producer(&payload, &signing_hash) {
+                return Err(BlockchainError::InvalidProducer(
+                    "producer signature does not verify over the block hash".into(),
+                ));
+            }
+            let allowed = self.allowed_producers(header.timestamp);
+            // Empty allowed set = bootstrap of a fresh chain (no live
+            // domain yet): production is open — otherwise the first
+            // REGISTER would be impossible. A non-empty set is strict.
+            if !allowed.is_empty() && !allowed.contains(&payload.producer) {
+                return Err(BlockchainError::InvalidProducer(
+                    "producer is not in the allowed set (not an anchor, not an owner of a live domain)".into(),
+                ));
+            }
+        }
 
         // Transactions: cryptographic validation (owner/key binding
         // recomputed, signature over the recomputed canonical
@@ -424,7 +453,9 @@ impl<C: Consensus> Blockchain<C> {
 
 #[cfg(test)]
 pub(crate) mod tests_support {
-    pub(crate) use super::tests::{child, claim_open_uip, register_domain_tx};
+    pub(crate) use super::tests::{
+        child, claim_open_uip, producer_key, register_domain_tx, resign,
+    };
 }
 
 #[cfg(test)]
@@ -551,8 +582,17 @@ mod tests {
         )
     }
 
+    /// Deterministic test producer key (M5: blocks must be signed).
+    /// Test producer key = the `uip` TLD owner's key (`[1; 32]`,
+    /// see `claim_open_uip`): after a claim the producer pool is
+    /// non-empty and production is restricted to live-domain owners,
+    /// so test blocks must be signed by an owner.
+    pub(crate) fn producer_key() -> SigningKey {
+        SigningKey::from_bytes([1; 32])
+    }
+
     pub(crate) fn make_block(prev: BlockHash, height: u64, txs: Vec<Transaction>) -> Block {
-        Block {
+        let mut block = Block {
             header: BlockHeader {
                 version: PROTOCOL_VERSION,
                 height,
@@ -562,7 +602,18 @@ mod tests {
                 consensus: Vec::new(),
             },
             transactions: txs,
-        }
+        };
+        resign(&mut block);
+        block
+    }
+
+    /// Re-signs a test block after its header was mutated (M5: the
+    /// producer payload covers every header field but `consensus`).
+    pub(crate) fn resign(block: &mut Block) {
+        let sh = crate::producer::producer_signing_hash(&block.header).unwrap();
+        let sig = crate::producer::sign_block_hash(&producer_key(), &sh);
+        block.header.consensus =
+            crate::producer::encode_producer_payload(&producer_key().public_key(), &sig);
     }
 
     pub(crate) fn child<C: crate::Consensus>(
@@ -1113,6 +1164,7 @@ mod tests {
                         let mut b = child(&chain, vec![register_domain_tx("ghost.uip", 1)]);
                         b.header.timestamp = 1000;
                         b.header.tx_root = tx_root(&b.transactions).unwrap();
+                        resign(&mut b);
                         b
                     })
                     .unwrap(),
@@ -1126,16 +1178,19 @@ mod tests {
         let far = 1000 + 2 * crate::state::DOMAIN_TERM_SECS;
         let mut lag = child(&chain, vec![]);
         lag.header.timestamp = far;
+        resign(&mut lag);
         let applied_lag = chain.push_block_with_gc(&lag).unwrap();
         assert!(applied_lag.gc_removed_domains.is_empty());
         let mut after = child(&chain, vec![]);
         after.header.timestamp = far + 1;
+        resign(&mut after);
         let applied = chain.push_block_with_gc(&after).unwrap();
         assert_eq!(applied.gc_removed_domains, vec![ghost]);
         assert!(chain.state().domain(&ghost).is_none());
         // Plain push_block keeps its contract: returns the hash.
         let mut empty = child(&chain, vec![]);
         empty.header.timestamp = far + 2;
+        resign(&mut empty);
         assert_eq!(chain.push_block(&empty).unwrap(), {
             let mut probe = empty.clone();
             probe.header.timestamp = far + 2;

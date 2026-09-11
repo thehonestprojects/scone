@@ -111,13 +111,18 @@ fn owner_of(sk: &SigningKey) -> OwnerId {
 fn build_store(dir: &std::path::Path, sk: &SigningKey, names: &[&str]) {
     let mut store = RedbStore::open(dir.join("chain.redb")).unwrap();
     let mut builder = scone_blockchain::BlockBuilder::after(0, scone_blockchain::genesis_hash());
+    // M5: the block must be signed by an allowed producer — here the
+    // TLD owner registers the namespace in block 1 (pool still empty
+    // at push time? No: the producer set is evaluated against the
+    // PARENT state, i.e. genesis — empty pool, open production), and
+    // the payload must still be a signed producer payload.
     builder.push_tx(signed_register_tld(sk, "uip")).unwrap();
     // M8b: the namespace must be OPEN for self-registration.
     builder.push_tx(signed_set_tld_open(sk, "uip")).unwrap();
     for name in names {
         builder.push_tx(signed_register(sk, name)).unwrap();
     }
-    let block = builder.build().unwrap();
+    let block = builder.with_producer(sk).build().unwrap();
     // Apply through a real blockchain to get canonical blocks+states,
     // exactly like the relay's acceptance path.
     let mut chain = scone_blockchain::Blockchain::<scone_blockchain::PermissiveConsensus>::new();

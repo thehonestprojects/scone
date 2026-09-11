@@ -117,6 +117,12 @@ pub enum BlockchainError {
     /// implementation).
     #[error("consensus rejection: {0}")]
     Consensus(String),
+    /// A block is not properly produced: its consensus payload is not
+    /// a valid signed producer payload, the signature does not verify
+    /// over the recomputed block hash, or the producer is not in the
+    /// allowed-producer set (M5 of the .bak port).
+    #[error("invalid block producer: {0}")]
+    InvalidProducer(String),
     /// The `owner` field of a transaction is not the identity derived
     /// from its embedded `public_key` (recomputed — never trusted).
     #[error("transaction owner does not match its public key")]

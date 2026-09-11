@@ -237,6 +237,18 @@ async fn per_domain_cap_and_replay_rejection_e2e() {
     // interval, so the cap is observable on a settled mempool.
     config.produce_interval = Duration::from_secs(5);
     config.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port));
+    // M5: blocks must be signed by an allowed producer (owner of a
+    // live domain). The anchor keyfile is generated first and its key
+    // OWNS every fixture tx below — the relay produces with it.
+    let anchor_env = "SCONE_TEST_MEMPOOL_ANCHOR_PASS_1";
+    // SAFETY: set before the relay task is spawned (no concurrent reader).
+    unsafe { std::env::set_var(anchor_env, "mempool-test-pass") };
+    let anchor_keyfile = dir.path().join("anchor.sconekey");
+    let anchor = scone_keystore::create_overwriting(&anchor_keyfile, "mempool-test-pass")
+        .expect("anchor keyfile");
+    let sk = anchor.signing_key;
+    config.anchor_key = Some(anchor_keyfile);
+    config.anchor_passphrase_env = anchor_env.to_string();
     let relay = Relay::new(config).expect("relay init");
     tokio::spawn(async move {
         if let Err(e) = relay.run().await {
@@ -244,8 +256,6 @@ async fn per_domain_cap_and_replay_rejection_e2e() {
         }
     });
     let client = wait_rpc(rpc_port, deadline).await;
-
-    let sk = SigningKey::from_bytes([7u8; 32]);
     setup_chain(&client, &sk, "spam.uip", deadline).await;
 
     // ---- per-domain cap ---------------------------------------------
@@ -334,6 +344,18 @@ async fn replayed_pending_is_evicted_at_production() {
     let mut config = Config::new(dir.path().to_path_buf());
     config.produce_interval = Duration::from_secs(1);
     config.rpc_addr = std::net::SocketAddr::from(([127, 0, 0, 1], rpc_port));
+    // M5: blocks must be signed by an allowed producer (owner of a
+    // live domain). The anchor keyfile is generated first and its key
+    // OWNS every fixture tx below — the relay produces with it.
+    let anchor_env = "SCONE_TEST_MEMPOOL_ANCHOR_PASS_2";
+    // SAFETY: set before the relay task is spawned (no concurrent reader).
+    unsafe { std::env::set_var(anchor_env, "mempool-test-pass") };
+    let anchor_keyfile = dir.path().join("anchor.sconekey");
+    let anchor = scone_keystore::create_overwriting(&anchor_keyfile, "mempool-test-pass")
+        .expect("anchor keyfile");
+    let sk = anchor.signing_key;
+    config.anchor_key = Some(anchor_keyfile);
+    config.anchor_passphrase_env = anchor_env.to_string();
     let relay = Relay::new(config).expect("relay init");
     tokio::spawn(async move {
         if let Err(e) = relay.run().await {
@@ -341,8 +363,6 @@ async fn replayed_pending_is_evicted_at_production() {
         }
     });
     let client = wait_rpc(rpc_port, deadline).await;
-
-    let sk = SigningKey::from_bytes([9u8; 32]);
     setup_chain(&client, &sk, "example.uip", deadline).await;
 
     // A renew lands in a block (its precheck is owner-only, so the

@@ -209,22 +209,17 @@ mod tests {
     use super::*;
     use crate::chain::tests_support::{child, claim_open_uip, register_domain_tx};
     use scone_crypto::SigningKey;
-    use scone_protocol::{Block, BlockHash, BlockHeader, PROTOCOL_VERSION};
+    use scone_protocol::{Block, BlockHash};
 
     /// A block building on `parent_hash` at `height` (no parent chain
-    /// object needed).
+    /// object needed). Signed by the uip owner — the producer pool of
+    /// these test chains contains her (M5: production is restricted).
     fn child_of_hash(parent: BlockHash, height: u64, _txs: Vec<()>) -> Block {
-        Block {
-            header: BlockHeader {
-                version: PROTOCOL_VERSION,
-                height,
-                prev_hash: parent,
-                tx_root: crate::merkle::tx_root(&[]).unwrap(),
-                timestamp: height,
-                consensus: Vec::new(),
-            },
-            transactions: Vec::new(),
-        }
+        crate::BlockBuilder::after(height.saturating_sub(1), parent)
+            .with_timestamp(height)
+            .with_producer(&crate::chain::tests_support::producer_key())
+            .build_with(vec![])
+            .expect("test block is well-formed")
     }
 
     /// A sister block of the current tip (same parent, same height).
@@ -266,10 +261,12 @@ mod tests {
         b1.header.timestamp = 100;
         b1.header.height = h;
         b1.header.tx_root = crate::merkle::tx_root(&b1.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b1);
         let mut b2 = child(&a, vec![]);
         b2.header.timestamp = 200;
         b2.header.height = h;
         b2.header.tx_root = crate::merkle::tx_root(&b2.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b2);
         let h1 = crate::block_hash::block_hash(&b1.header).unwrap();
         let h2 = crate::block_hash::block_hash(&b2.header).unwrap();
         let (winner, loser) = if h1.as_bytes() < h2.as_bytes() {
@@ -303,9 +300,11 @@ mod tests {
         b1.header.timestamp = 500;
         b1.header.height = fork_point + 1;
         b1.header.tx_root = crate::merkle::tx_root(&b1.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b1);
         let b1_hash = crate::block_hash::block_hash(&b1.header).unwrap();
         let mut b2 = child_of_hash(b1_hash, fork_point + 2, vec![]);
         b2.header.tx_root = crate::merkle::tx_root(&b2.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b2);
         let adopted = a.adopt_branch(&[b1, b2]).unwrap();
         assert!(adopted);
         assert_eq!(a.height(), fork_point + 2);
@@ -370,9 +369,11 @@ mod tests {
         b1.header.timestamp = 501;
         b1.header.height = fork_point + 1;
         b1.header.tx_root = crate::merkle::tx_root(&b1.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b1);
         let b1_hash = crate::block_hash::block_hash(&b1.header).unwrap();
         let mut b2 = child_of_hash(b1_hash, fork_point + 2, vec![]);
         b2.header.tx_root = crate::merkle::tx_root(&b2.transactions).unwrap();
+        crate::chain::tests_support::resign(&mut b2);
         left.adopt_branch(&[b1.clone(), b2.clone()]).unwrap();
         right.push_block(&b1).unwrap();
         right.push_block(&b2).unwrap();

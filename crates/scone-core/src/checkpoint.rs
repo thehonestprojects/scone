@@ -108,7 +108,7 @@ impl CheckpointData {
 
 /// Checkpoint + signatures agrégées du comité. Finalisé ⇔
 /// [`Checkpoint::verify_quorum`] passe contre le comité élu pour son epoch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Checkpoint {
     pub data: CheckpointData,
     /// Signatures des Anchors, triées par clé publique (canonique).

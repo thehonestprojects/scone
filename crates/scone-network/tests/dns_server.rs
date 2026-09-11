@@ -336,11 +336,24 @@ async fn dns_server_serves_verified_records_over_udp() {
     let rpc_port = free_tcp_port().await;
     let dns_port = free_udp_port().await;
     let dns_addr = SocketAddr::from(([127, 0, 0, 1], dns_port));
+    // Anchor identity of the relay: M5 blocks must be signed by an
+    // allowed producer (owner of a live domain). The keyfile is
+    // generated first and its key OWNS every fixture tx below — the
+    // relay produces with it, so blocks 1..4 apply.
+    let anchor_env = "SCONE_TEST_DNS_ANCHOR_PASS";
+    // SAFETY: set before the relay task is spawned (no concurrent reader).
+    unsafe { std::env::set_var(anchor_env, "dns-test-pass") };
+    let anchor_keyfile = dir.path().join("anchor.sconekey");
+    let anchor = scone_keystore::create_overwriting(&anchor_keyfile, "dns-test-pass")
+        .expect("anchor keyfile");
+    let sk = anchor.signing_key;
     let mut config = Config::new(dir.path().to_path_buf());
     config.produce_interval = Duration::from_secs(1);
     config.rpc_addr = SocketAddr::from(([127, 0, 0, 1], rpc_port));
     config.dns_addr = Some(dns_addr);
     config.dns_upstreams = vec![upstream_addr.to_string()];
+    config.anchor_key = Some(anchor_keyfile);
+    config.anchor_passphrase_env = anchor_env.to_string();
     let relay = Relay::new(config).expect("relay init");
     tokio::spawn(async move {
         if let Err(e) = relay.run().await {
@@ -352,7 +365,7 @@ async fn dns_server_serves_verified_records_over_udp() {
 
     // ---- claim the TLD, then register + commit a record hash ------
     // (D1, M7c: the namespace must be on-chain before the domain.)
-    let sk = SigningKey::from_bytes([9u8; 32]);
+    // `sk` = the relay's anchor key (defined above with the relay).
     let name = "example.uip";
     let tld_hex = hex(&encode_to_vec(&register_tld_tx(&sk, "uip")).expect("encode tld"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex: tld_hex }, deadline).await;

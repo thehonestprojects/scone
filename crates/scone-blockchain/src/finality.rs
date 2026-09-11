@@ -73,14 +73,14 @@ pub struct FinalizedBase {
     pub seed: [u8; 32],
 }
 
-impl Blockchain {
+impl<C: crate::consensus::Consensus> Blockchain<C> {
     /// Elected committee (recovery = 0) for the next epoch, or the
     /// recovery-k committee. Pool: owners of live domains at the
     /// LAST FINALIZED checkpoint state (bootstrap: tip state,
     /// liveness at the tip).
     #[must_use]
     pub fn committee(&self, recovery: u32) -> Vec<PublicKey> {
-        let size = self.network().consensus.committee_size;
+        let size = self.network.consensus.committee_size;
         match &self.finalized {
             None => {
                 if recovery != 0 {
@@ -155,14 +155,14 @@ impl Blockchain {
                 if d.height <= last.data.height {
                     return Err(bad("checkpoint height must advance"));
                 }
-                if d.recovery > self.network().consensus.recovery_max_epochs {
+                if d.recovery > self.network.consensus.recovery_max_epochs {
                     return Err(bad("recovery counter beyond protocol limit"));
                 }
                 // Recovery delay in CONSENSUS time (deterministic at
                 // replay — never the local clock).
                 if d.recovery >= 1 {
                     let elapsed = self.tip_ts_since_last_checkpoint();
-                    let need = u64::from(d.recovery) * self.network().consensus.epoch_secs;
+                    let need = u64::from(d.recovery) * self.network.consensus.epoch_secs;
                     if elapsed < need {
                         return Err(bad("recovery delay (consensus time) not reached"));
                     }
@@ -193,7 +193,7 @@ impl Blockchain {
     #[must_use]
     pub fn propose_checkpoint(&self) -> Option<CheckpointData> {
         let last_height = self.checkpoints.last().map(|c| c.data.height).unwrap_or(0);
-        let min_blocks = self.network().consensus.epoch_min_blocks;
+        let min_blocks = self.network.consensus.epoch_min_blocks;
         if self.height() <= last_height || self.height() - last_height < min_blocks {
             return None;
         }
@@ -277,7 +277,7 @@ impl Blockchain {
     /// recovery draws whose consensus delay is reached.
     #[must_use]
     pub fn allowed_producers(&self, block_ts: u64) -> HashSet<PublicKey> {
-        let size = self.network().consensus.committee_size;
+        let size = self.network.consensus.committee_size;
         match &self.finalized {
             None => {
                 let pool = self.state().eligible_validators(block_ts);
@@ -294,8 +294,8 @@ impl Blockchain {
                         .into_iter()
                         .collect();
                 let elapsed = block_ts.saturating_sub(base.block_ts);
-                for k in 1..=self.network().consensus.recovery_max_epochs {
-                    if elapsed >= u64::from(k) * self.network().consensus.epoch_secs {
+                for k in 1..=self.network.consensus.recovery_max_epochs {
+                    if elapsed >= u64::from(k) * self.network.consensus.epoch_secs {
                         let seed = recovery_seed(&base.seed, k);
                         set.extend(select_committee(&seed, base.pool.iter().copied(), size));
                     }
@@ -320,9 +320,10 @@ impl Blockchain {
 
 impl ChainState {
     /// PoS eligibility pool: public keys of owners of LIVE domains
-    /// (`valid_until > now`), deduplicated by key. One key with a
-    /// hundred domains = one seat (economic anti-Sybil is per
-    /// identity, linear).
+    /// (`valid_until > now`) and owners of LIVE TLDs (a claim cost a
+    /// PoW — the TLD owner is a stakeholder), deduplicated by key.
+    /// One key with a hundred domains = one seat (economic
+    /// anti-Sybil is per identity, linear).
     #[must_use]
     pub fn eligible_validators(&self, now: u64) -> Vec<PublicKey> {
         let mut seen = HashSet::new();
@@ -330,6 +331,16 @@ impl ChainState {
         for state in self.domains.values() {
             if state.valid_until > now
                 && seen.insert(state.owner)
+                && let Some(pk) = self.owner_public_key(state.owner)
+            {
+                out.push(pk);
+            }
+        }
+        for state in self.tlds.values() {
+            // A claimed TLD is live until revoked (M8b GC handles
+            // the 3-year inactivity rule); a claimed TLD cost a PoW —
+            // its owner is a stakeholder.
+            if seen.insert(state.owner)
                 && let Some(pk) = self.owner_public_key(state.owner)
             {
                 out.push(pk);

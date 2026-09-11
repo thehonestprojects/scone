@@ -21,6 +21,7 @@ pub struct BlockBuilder {
     height: u64,
     timestamp: u64,
     consensus: Vec<u8>,
+    producer: Option<scone_crypto::SigningKey>,
     transactions: Vec<scone_core::Transaction>,
 }
 
@@ -34,6 +35,7 @@ impl BlockBuilder {
             height: parent_height + 1,
             timestamp: 0,
             consensus: Vec::new(),
+            producer: None,
             transactions: Vec::new(),
         }
     }
@@ -46,9 +48,23 @@ impl BlockBuilder {
     }
 
     /// Sets the opaque consensus payload (PoW fields, etc.).
+    ///
+    /// NOTE (M5 of the .bak port): a block built for a chain whose
+    /// producer pool is non-empty MUST carry a signed producer
+    /// payload — use [`BlockBuilder::with_producer`] instead of a
+    /// raw payload.
     #[must_use]
     pub fn with_consensus(mut self, consensus: Vec<u8>) -> Self {
         self.consensus = consensus;
+        self
+    }
+
+    /// Signs the block as its producer (M5 of the .bak port): the
+    /// consensus payload becomes the signed producer payload over the
+    /// RECOMPUTED block hash (replaces any `with_consensus` value).
+    #[must_use]
+    pub fn with_producer(mut self, sk: &scone_crypto::SigningKey) -> Self {
+        self.producer = Some(sk.clone());
         self
     }
 
@@ -87,9 +103,18 @@ impl BlockBuilder {
     ///
     /// Returns a [`BlockchainError`] if a transaction or the header
     /// cannot be canonically encoded. Never panics.
+    /// [`BlockBuilder::build`] with a pre-built transaction list
+    /// (test/assembly convenience — same rules).
+    pub fn build_with(mut self, txs: Vec<scone_core::Transaction>) -> Result<Block> {
+        for tx in txs {
+            self.push_tx(tx)?;
+        }
+        self.build()
+    }
+
     pub fn build(self) -> Result<Block> {
         let tx_root = tx_root(&self.transactions)?;
-        let header = BlockHeader {
+        let mut header = BlockHeader {
             version: PROTOCOL_VERSION,
             height: self.height,
             prev_hash: self.prev_hash,
@@ -97,6 +122,16 @@ impl BlockBuilder {
             timestamp: self.timestamp,
             consensus: self.consensus,
         };
+        // Producer signature over the (unsigned-header) block hash:
+        // the hash covers every header field; the payload rides in
+        // `consensus`, signed AFTER the header is final.
+        if let Some(sk) = self.producer {
+            let sh = crate::producer::producer_signing_hash(&header)
+                .expect("header is encodable at this point");
+            let sig = crate::producer::sign_block_hash(&sk, &sh);
+            header.consensus = crate::producer::encode_producer_payload(&sk.public_key(), &sig);
+            block_hash(&header)?;
+        }
         // Encoding check (version, consensus bounds…) before handing
         // the block out.
         block_hash(&header)?;
@@ -243,7 +278,9 @@ mod tests {
     #[test]
     fn builds_on_genesis_with_recomputed_root() {
         let sk = SigningKey::from_bytes([1; 32]);
-        let mut builder = BlockBuilder::after(0, genesis_hash()).with_timestamp(1_700_000_000);
+        let mut builder = BlockBuilder::after(0, genesis_hash())
+            .with_timestamp(1_700_000_000)
+            .with_producer(&crate::chain::tests_support::producer_key());
         builder.push_tx(signed_register_tld(&sk, "uip")).unwrap();
         builder
             .push_tx(signed_set_tld_open(&sk, "uip", true))
@@ -273,7 +310,9 @@ mod tests {
         let mut chain = crate::Blockchain::new();
 
         let b1 = {
-            let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
+            let mut b = BlockBuilder::after(chain.height(), chain.tip_hash())
+                .with_timestamp(10)
+                .with_producer(&crate::chain::tests_support::producer_key());
             b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
             b.push_tx(signed_set_tld_open(&sk, "uip", true)).unwrap();
             b.push_tx(signed_register_domain(&sk, "example.uip"))
@@ -283,7 +322,9 @@ mod tests {
         chain.push_block(&b1).unwrap();
 
         let b2 = {
-            let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(20);
+            let mut b = BlockBuilder::after(chain.height(), chain.tip_hash())
+                .with_timestamp(20)
+                .with_producer(&crate::chain::tests_support::producer_key());
             b.push_tx(signed_update_domain(&sk, 1)).unwrap();
             b.build().unwrap()
         };
@@ -301,8 +342,9 @@ mod tests {
         let assemble = || {
             let mut chain = crate::Blockchain::new();
             let b1 = {
-                let mut b =
-                    BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
+                let mut b = BlockBuilder::after(chain.height(), chain.tip_hash())
+                    .with_timestamp(10)
+                    .with_producer(&crate::chain::tests_support::producer_key());
                 b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
                 b.push_tx(signed_set_tld_open(&sk, "uip", true)).unwrap();
                 b.push_tx(signed_register_domain(&sk, "example.uip"))
@@ -311,8 +353,9 @@ mod tests {
             };
             chain.push_block(&b1).unwrap();
             let b2 = {
-                let mut b =
-                    BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(20);
+                let mut b = BlockBuilder::after(chain.height(), chain.tip_hash())
+                    .with_timestamp(20)
+                    .with_producer(&crate::chain::tests_support::producer_key());
                 b.push_tx(signed_update_domain(&sk, 1)).unwrap();
                 b.push_tx(signed_update_domain(&sk, 2)).unwrap();
                 b.build().unwrap()

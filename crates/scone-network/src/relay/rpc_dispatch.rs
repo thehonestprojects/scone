@@ -37,6 +37,8 @@ impl Relay {
                     "peers": self.peers.len(),
                     "domain_count": self.chain.state().len(),
                     "mempool": self.mempool.len(),
+                    "checkpoints": self.chain.checkpoint_window().len(),
+                    "finalized_epoch": self.chain.finalized().map(|f| f.checkpoint.data.epoch),
                 });
                 Dispatched::Now(RpcResponse::ok(data))
             }

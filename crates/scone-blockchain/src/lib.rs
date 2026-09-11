@@ -47,6 +47,7 @@ pub mod finality;
 mod fork_choice;
 pub mod genesis;
 pub mod merkle;
+pub mod producer;
 pub mod signer;
 pub mod smt;
 pub mod state;

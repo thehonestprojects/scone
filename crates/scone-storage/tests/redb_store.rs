@@ -112,7 +112,8 @@ fn build_block(
             }
         }
     };
-    let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
+    let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash())
+        .with_producer(&sk.clone());
     if chain.height() == 0 {
         // First block: claim the namespace, open it, then the domain
         // (D1 + M8b: a fresh TLD is closed, self-registration
@@ -358,7 +359,8 @@ fn stored_domain_states_match_replayed_state() {
                 }
             }
         };
-        let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
+        let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash())
+            .with_producer(&sk.clone());
         builder.push_tx(tx).unwrap();
         let b2 = builder.build().unwrap();
         let h2 = chain.push_block(&b2).unwrap();
