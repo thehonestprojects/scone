@@ -16,7 +16,8 @@ pub enum SconeError {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
-    /// The TLD does not match `[a-z0-9]{{1,5}}`.
+    /// The TLD does not match `[a-z0-9-]{{1,63}}` (LDH, no leading or
+    /// trailing hyphen).
     #[error("invalid TLD: {0}")]
     InvalidTld(String),
 

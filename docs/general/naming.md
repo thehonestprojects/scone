@@ -13,9 +13,14 @@ implicite crée des ambiguïtés d'identité.
 
 ## TLD
 
-- motif : `[a-z0-9-]{1,5}` (LDH, pas de tiret initial/final)
-- valides : `uip`, `com`, `test`, `abc12`, `0x`, `a-b`
-- invalides : `abcdef` (6 caractères), `ABC`, `-ab`, `ab-`, `éxemple`,
+Un TLD est un label DNS comme les autres : la limite générique des labels
+(RFC 1035 : 63 octets) s'applique, pas une limite spécifique plus courte.
+
+- motif : `[a-z0-9-]{1,63}` (LDH, pas de tiret initial/final)
+- limite codée : `TldName::MAX_LEN = 63` octets
+- valides : `uip`, `com`, `test`, `abc12`, `0x`, `a-b`, un TLD de 63
+  octets exactement
+- invalides : un TLD de 64 octets, `ABC`, `-ab`, `ab-`, `éxemple`,
   chaîne vide
 
 ## Domaines

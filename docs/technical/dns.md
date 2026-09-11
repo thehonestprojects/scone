@@ -56,9 +56,10 @@ Client de validation : `scone dig <name> --dns 127.0.0.1:5353
    transitoire) **ni REFUSED** (état de configuration) : recalculés à
    chaque requête. Éviction FIFO à la capacité.
 2. **Forme Scone ?** Pré-filtre strict : labels `[a-z0-9-_]` (1..63),
-   ≥ 2 labels, TLD ≤ 5 chars `[a-z0-9-]`, longueur totale ≤ 253.
-   Un nom qui ne peut PAS être un nom Scone (ex. `www.example`,
-   TLD de 7 chars) part au fallback ; un nom qui POURRAIT l'être
+   ≥ 2 labels, TLD 1..63 octets `[a-z0-9-]` (cf. `TldName::MAX_LEN`),
+   longueur totale ≤ 253.
+   Un nom qui ne peut PAS être un nom Scone (ex. `www.foo_bar`,
+   underscore dans le TLD) part au fallback ; un nom qui POURRAIT l'être
    (`absent.uip`) relève de la chaîne : non enregistré → NXDOMAIN
    autoritaire, même sans upstream.
 3. **Recherche d'apex** : suffixes du plus long au plus court (min.

@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::error::{Result, SconeError};
 
-/// A top-level domain (TLD): `[a-z0-9-]{1,5}` (LDH: no leading/trailing
+/// A top-level domain (TLD): `[a-z0-9-]{1,63}` (LDH: no leading/trailing
 /// hyphen).
 ///
 /// Validation is strict: uppercase, unicode and the empty string
@@ -14,8 +14,9 @@ use crate::error::{Result, SconeError};
 pub struct TldName(String);
 
 impl TldName {
-    /// Maximum TLD length in bytes.
-    pub const MAX_LEN: usize = 5;
+    /// Maximum TLD length in bytes (RFC 1035 label limit: a TLD is a
+    /// DNS label like any other).
+    pub const MAX_LEN: usize = 63;
 
     /// Parses and validates a TLD.
     ///
@@ -197,7 +198,16 @@ mod tests {
     #[test]
     fn tld_valid() {
         for tld in [
-            "uip", "com", "test", "abc12", "0x", "a", "abcde", "a-b", "x-9",
+            "uip",
+            "com",
+            "test",
+            "abc12",
+            "0x",
+            "a",
+            "abcde",
+            "a-b",
+            "x-9",
+            "abcdefghij", // 10 chars, was invalid at the old 5-byte limit
         ] {
             assert!(TldName::new(tld).is_ok(), "{tld} should be valid");
         }
@@ -206,13 +216,12 @@ mod tests {
     #[test]
     fn tld_invalid() {
         for tld in [
-            "",       // empty
-            "abcdef", // 6 chars
-            "ABC",    // uppercase
-            "Ab",     // mixed case
-            "-ab",    // leading hyphen
-            "ab-",    // trailing hyphen
-            "-",      // hyphen only
+            "",    // empty
+            "ABC", // uppercase
+            "Ab",  // mixed case
+            "-ab", // leading hyphen
+            "ab-", // trailing hyphen
+            "-",   // hyphen only
             "a b", "éxemple", "a.b",
         ] {
             assert!(TldName::new(tld).is_err(), "{tld:?} should be invalid");
@@ -221,9 +230,14 @@ mod tests {
 
     #[test]
     fn tld_length_boundaries() {
+        // A TLD is a DNS label (RFC 1035): 1..=63 bytes.
+        assert_eq!(TldName::MAX_LEN, 63);
         assert!(TldName::new("a").is_ok());
-        assert!(TldName::new("abcde").is_ok());
-        assert!(TldName::new("abcdef").is_err());
+        assert!(TldName::new(&"a".repeat(5)).is_ok()); // old upper bound, still valid
+        assert!(TldName::new(&"a".repeat(63)).is_ok());
+        assert!(TldName::new(&"a".repeat(64)).is_err());
+        // Multi-byte characters count as bytes, not chars.
+        assert!(TldName::new(&"é".repeat(32)).is_err()); // 64 bytes, 32 chars
     }
 
     #[test]
@@ -253,18 +267,17 @@ mod tests {
     #[test]
     fn domain_invalid() {
         for name in [
-            "",               // empty
-            "uip",            // single label (TLD only)
-            ".uip",           // leading dot
-            "example.",       // trailing dot
-            "example..uip",   // empty label
-            "EXAMPLE.uip",    // uppercase
-            "example.UIP",    // uppercase TLD
-            "ex ample.uip",   // space
-            "-foo.uip",       // leading hyphen
-            "foo-.uip",       // trailing hyphen
-            "éxemple.uip",    // unicode
-            "example.abcdef", // TLD too long (6)
+            "",             // empty
+            "uip",          // single label (TLD only)
+            ".uip",         // leading dot
+            "example.",     // trailing dot
+            "example..uip", // empty label
+            "EXAMPLE.uip",  // uppercase
+            "example.UIP",  // uppercase TLD
+            "ex ample.uip", // space
+            "-foo.uip",     // leading hyphen
+            "foo-.uip",     // trailing hyphen
+            "éxemple.uip",  // unicode
         ] {
             assert!(DomainName::new(name).is_err(), "{name:?} should be invalid");
         }
@@ -303,9 +316,16 @@ mod tests {
     #[test]
     fn long_tld_inside_domain_is_invalid_tld() {
         assert!(matches!(
-            DomainName::new("example.abcdef"),
+            DomainName::new(&format!("example.{}", "a".repeat(64))),
             Err(SconeError::InvalidTld(_))
         ));
+    }
+
+    #[test]
+    fn max_length_tld_inside_domain_is_valid() {
+        let name = format!("example.{}", "a".repeat(63));
+        let name = DomainName::new(&name).unwrap();
+        assert_eq!(name.tld(), TldName::new(&"a".repeat(63)).unwrap());
     }
 
     #[test]

@@ -324,9 +324,9 @@ async fn dns_server_serves_verified_records_over_udp() {
     let resp = dns_query(&qsock, dns_addr, 0x0004, "absent.uip", 1, deadline).await;
     assert_eq!(rcode_of(&resp), 3, "NXDOMAIN");
 
-    // Structurally non-Scone name (TLD > 5 labels: cannot ever be
+    // Structurally non-Scone name (underscore TLD: cannot ever be
     // registered) → forwarded to the mock upstream.
-    let resp = dns_query(&qsock, dns_addr, 0x0005, "www.example", 1, deadline).await;
+    let resp = dns_query(&qsock, dns_addr, 0x0005, "www.foo_bar", 1, deadline).await;
     assert_eq!(rcode_of(&resp), 0, "fallback NOERROR");
     assert_eq!(first_rdata(&resp), vec![93, 184, 216, 34]);
     upstream.await.expect("upstream served one query");

@@ -227,8 +227,8 @@ fn dns_cli_end_to_end() {
         "NXDOMAIN: {lines:?}"
     );
 
-    // Structurally non-Scone name → REFUSED (5, no upstream).
-    let lines = scone_ok(&["dig", "www.example", "--dns", &dns.to_string()]);
+    // Structurally non-Scone name (underscore TLD) → REFUSED (5, no upstream).
+    let lines = scone_ok(&["dig", "www.foo_bar", "--dns", &dns.to_string()]);
     assert!(lines.iter().any(|l| l == "status: 5"), "REFUSED: {lines:?}");
 
     drop(relay_guard);

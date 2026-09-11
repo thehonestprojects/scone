@@ -49,7 +49,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scone_core::{DomainName, RecordData};
+use scone_core::{DomainName, RecordData, TldName};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
@@ -279,7 +279,7 @@ fn scone_candidate(name: &str) -> bool {
     }) && name.len() <= DomainName::MAX_TOTAL_LEN
         && name.split('.').count() >= 2
         && name.rsplit('.').next().is_some_and(|tld| {
-            (1..=5).contains(&tld.len())
+            (1..=TldName::MAX_LEN).contains(&tld.len())
                 && tld
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -822,7 +822,7 @@ mod tests {
         let mut cache2 = Cache::new();
         let resp = handle_packet(
             &resolver,
-            &query(9, false, "www.example", TYPE_A),
+            &query(9, false, "www.foo_bar", TYPE_A),
             &[],
             &mut cache2,
         )
@@ -945,7 +945,7 @@ mod tests {
         // a Scone name → not authoritative → REFUSED with no upstream.
         let resp = handle_packet(
             &resolver,
-            &query(4, false, "www.example", TYPE_A),
+            &query(4, false, "www.foo_bar", TYPE_A),
             &[],
             &mut cache,
         )
@@ -993,7 +993,7 @@ mod tests {
         let mut cache = Cache::new();
         let resp = handle_packet(
             &resolver,
-            &query(9, true, "www.example", TYPE_A),
+            &query(9, true, "www.foo_bar", TYPE_A),
             &[up_addr],
             &mut cache,
         )
@@ -1008,7 +1008,7 @@ mod tests {
         // authoritative — the chain never vouched for it).
         let cached = handle_packet(
             &resolver,
-            &query(10, true, "www.example", TYPE_A),
+            &query(10, true, "www.foo_bar", TYPE_A),
             &[],
             &mut cache,
         )
@@ -1087,7 +1087,7 @@ mod tests {
         let mut cache = Cache::new();
         let resp = handle_packet(
             &resolver,
-            &query(21, true, "www.example", TYPE_A),
+            &query(21, true, "www.foo_bar", TYPE_A),
             &[addr],
             &mut cache,
         )
@@ -1127,7 +1127,7 @@ mod tests {
         let mut cache = Cache::new();
         let resp = handle_packet(
             &resolver,
-            &query(22, true, "www.example", TYPE_A),
+            &query(22, true, "www.foo_bar", TYPE_A),
             &[addr],
             &mut cache,
         )
