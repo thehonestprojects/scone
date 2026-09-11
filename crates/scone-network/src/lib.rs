@@ -44,7 +44,7 @@ pub use config::{
 };
 pub use dns::{ANSWER_TTL, Cache, CacheEntry, MAX_INFLIGHT_UDP, MAX_PACKET_LEN, Resolved};
 pub use error::{NetworkError, Result};
-pub use mempool::Mempool;
+pub use mempool::{MAX_PENDING_PER_DOMAIN, Mempool, domain_key};
 pub use relay::Relay;
 pub use rpc::{RpcClient, RpcRequest, RpcResponse};
 pub use sync::MAX_BLOCKS_PER_RESPONSE;

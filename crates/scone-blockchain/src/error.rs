@@ -140,4 +140,10 @@ pub enum BlockchainError {
     /// must not be broadcast.
     #[error("signer guard: {0}")]
     Signer(String),
+    /// The transaction (by [`crate::TxId`]) is already included in a
+    /// canonical block within the anti-replay window
+    /// ([`crate::REPLAY_WINDOW_BLOCKS`]) — it can never enter the
+    /// chain (nor a mempool) twice (ported from the .bak).
+    #[error("transaction already included in the chain (replay)")]
+    TxReplay,
 }

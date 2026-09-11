@@ -44,6 +44,7 @@ pub mod chain;
 pub mod consensus;
 pub mod error;
 pub mod finality;
+mod fork_choice;
 pub mod genesis;
 pub mod merkle;
 pub mod signer;
@@ -54,7 +55,7 @@ pub mod validate;
 
 pub use block_hash::{BLOCK_HASH_VERSION, block_hash};
 pub use builder::BlockBuilder;
-pub use chain::{AppliedBlock, Blockchain};
+pub use chain::{AppliedBlock, Blockchain, REPLAY_WINDOW_BLOCKS};
 pub use consensus::{Consensus, PermissiveConsensus};
 pub use error::{BlockchainError, Result};
 pub use finality::FinalizedBase;

@@ -19,6 +19,7 @@ use scone_protocol::{Block, BlockHash, Message};
 use scone_storage::integration as store_integration;
 
 use crate::error::Result;
+use crate::mempool::{MAX_PENDING_PER_DOMAIN, domain_key};
 
 use super::Relay;
 use super::hex::hex;
@@ -44,7 +45,10 @@ impl Relay {
         {
             return Ok(hash); // already canonical: no store, no relay
         }
-        let applied = self.chain.push_block_with_gc(&block)?;
+        // M3 (.bak port): fork-aware attach — a block on a known
+        // non-tip parent evaluates a branch switch (tie-break by
+        // lowest tip hash) instead of a flat ParentNotTip refusal.
+        let applied = self.chain.try_attach(&block)?;
         store_integration::store_block_with_removals(
             &mut self.store,
             &self.chain,
@@ -91,6 +95,35 @@ impl Relay {
         self.precheck_state(&tx)
             .map_err(crate::error::NetworkError::Blockchain)?;
         let id = scone_blockchain::transaction_id(&tx)?;
+        // Anti-replay (ported from the .bak): a transaction already
+        // included in the chain (within the window) never re-enters
+        // a mempool. Typed rejection, logged — a peer relaying stale
+        // bytes gets a clean error, never a loop.
+        if self.chain.is_tx_included(&id) {
+            debug!(
+                txid = hex(id.as_bytes()),
+                "rejected replayed transaction (already included)"
+            );
+            return Err(crate::error::NetworkError::Blockchain(
+                scone_blockchain::BlockchainError::TxReplay,
+            ));
+        }
+        // Economic anti-spam (ported from the .bak): at most
+        // MAX_PENDING_PER_DOMAIN pending transactions per target
+        // namespace — an owner cannot fill the mempool for free with
+        // UPDATE-type operations on one domain.
+        if let Some(key) = domain_key(&tx)
+            && self.mempool.count_for_domain(key) >= MAX_PENDING_PER_DOMAIN
+        {
+            warn!(
+                txid = hex(id.as_bytes()),
+                cap = MAX_PENDING_PER_DOMAIN,
+                "rejected transaction: too many pending for this domain"
+            );
+            return Err(crate::error::NetworkError::LimitExceeded(
+                "mempool per-domain cap",
+            ));
+        }
         if !self.mempool.insert(id, tx.clone())? {
             // Duplicate: already pooled (and already broadcast when
             // first seen). Do NOT relay again.
@@ -253,9 +286,18 @@ impl Relay {
             let drained = self
                 .mempool
                 .drain_up_to(scone_protocol::limits::MAX_TXS_PER_BLOCK);
-            // 2. Evict stale transactions (state moved since admit).
+            // 2. Evict stale transactions (state moved since admit)
+            //    and replayed ones (a block accepted since admit
+            //    already contains this TXID — the push would reject
+            //    the whole block with TxReplay).
             let mut candidates: Vec<Transaction> = Vec::with_capacity(drained.len());
             for tx in drained {
+                let replayed = scone_blockchain::transaction_id(&tx)
+                    .is_ok_and(|id| self.chain.is_tx_included(&id));
+                if replayed {
+                    warn!("evicted replayed tx from the mempool (already included)");
+                    continue;
+                }
                 match self.precheck_state(&tx) {
                     Ok(()) => candidates.push(tx),
                     Err(e) => {

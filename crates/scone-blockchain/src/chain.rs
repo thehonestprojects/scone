@@ -1,11 +1,29 @@
 //! Canonical in-memory chain and block validation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use scone_protocol::limits::MAX_TXS_PER_BLOCK;
 use scone_protocol::{Block, BlockHash, PROTOCOL_VERSION};
 
 use scone_core::{DomainId, NetworkParams, TESTNET};
+
+use crate::txid::{TxId, transaction_id};
+
+/// Anti-replay window (blocks), ported from the .bak
+/// (`REPLAY_WINDOW_BLOCKS`): a transaction id stays protected against
+/// re-inclusion for this many blocks after its inclusion, then
+/// leaves the index.
+///
+/// The rule is a **pure function of the canonical chain** (inclusion
+/// height only): a live node (pruned index) and a node replaying the
+/// same blocks hold identical indices at every height and take
+/// identical decisions. RAM is bounded by `window × txs/block`,
+/// independent of the chain's lifetime. A re-inclusion after the
+/// window remains subject to the domain rules (duplicate / owner /
+/// expiry) and requires the original signed bytes: the effect is the
+/// re-application of a transaction the signer consented to, never a
+/// forgery.
+pub const REPLAY_WINDOW_BLOCKS: u64 = 256;
 
 use crate::block_hash::block_hash;
 use crate::consensus::{Consensus, PermissiveConsensus};
@@ -40,21 +58,28 @@ pub struct Blockchain<C: Consensus = PermissiveConsensus> {
     /// genesis and the tip window are in RAM: historical heights in
     /// `1..base_height` are served from the node store and
     /// [`block`](Self::block) returns `None` for them.
-    base_height: u64,
+    pub(crate) base_height: u64,
     /// Canonical blocks held in RAM: dense from genesis on a live
     /// chain (`canonical[0]` is genesis, index == height), or
     /// `[genesis, restored tip, blocks pushed since]` on a restored
     /// chain (see `base_height`).
-    canonical: Vec<Block>,
+    pub(crate) canonical: Vec<Block>,
     /// Hashes of every accepted block (parent classification for fork
     /// detection).
-    known_hashes: HashSet<BlockHash>,
-    tip: BlockHash,
+    pub(crate) known_hashes: HashSet<BlockHash>,
+    pub(crate) tip: BlockHash,
     /// The network this chain belongs to (M8b): its genesis, its
     /// PoW parameters, the only network id its transactions may carry.
     network: NetworkParams,
-    state: ChainState,
+    pub(crate) state: ChainState,
     consensus: C,
+    /// TXIDs of the transactions included **within the last
+    /// [`REPLAY_WINDOW_BLOCKS`] blocks** (anti-replay window ported
+    /// from the .bak: a transaction never enters the chain twice).
+    /// Maps TXID → inclusion height, pruned deterministically at each
+    /// push (pure function of the canonical chain — two nodes
+    /// replaying the same chain hold the same index at every height).
+    included: HashMap<TxId, u64>,
     /// Finalized checkpoints (chained, windowed — M3 of the .bak
     /// port). The last one is the PoS base.
     pub(crate) checkpoints: Vec<scone_core::checkpoint::Checkpoint>,
@@ -139,6 +164,7 @@ impl Blockchain<PermissiveConsensus> {
             network,
             state,
             consensus: PermissiveConsensus,
+            included: HashMap::new(),
             checkpoints: Vec::new(),
             finalized: None,
         }
@@ -166,6 +192,7 @@ impl<C: Consensus> Blockchain<C> {
             network,
             state: ChainState::for_network(network),
             consensus,
+            included: HashMap::new(),
             checkpoints: Vec::new(),
             finalized: None,
         }
@@ -229,6 +256,31 @@ impl<C: Consensus> Blockchain<C> {
     #[must_use]
     pub fn state(&self) -> &ChainState {
         &self.state
+    }
+
+    /// Whether `id` was included in a canonical block **within the
+    /// anti-replay window** ([`REPLAY_WINDOW_BLOCKS`]). A transaction
+    /// must never enter the chain (nor a mempool) twice while its id
+    /// is in the window (ported from the .bak).
+    #[must_use]
+    pub fn is_tx_included(&self, id: &TxId) -> bool {
+        self.included.contains_key(id)
+    }
+
+    /// Hashes of every block this chain has ever accepted (fork
+    /// classification).
+    pub(crate) fn block_hashes(&self) -> &HashSet<BlockHash> {
+        &self.known_hashes
+    }
+
+    /// Owned copy of the known-hash set (reorg swap).
+    pub(crate) fn known_hashes_vec(&self) -> HashSet<BlockHash> {
+        self.known_hashes.clone()
+    }
+
+    /// Replaces the known-hash set (reorg swap).
+    pub(crate) fn replace_hashes(&mut self, hashes: HashSet<BlockHash>) {
+        self.known_hashes = hashes;
     }
 
     /// Validates `block` and, if fully valid, appends it as the new
@@ -297,6 +349,18 @@ impl<C: Consensus> Blockchain<C> {
             return Err(BlockchainError::MerkleMismatch);
         }
 
+        // Anti-replay (ported from the .bak): a transaction already
+        // included in the chain (within the window) never re-enters
+        // it. Deterministic — the index is derivable from the blocks,
+        // so every node replaying the same chain decides identically.
+        for tx in &block.transactions {
+            if let Ok(id) = transaction_id(tx)
+                && self.included.contains_key(&id)
+            {
+                return Err(BlockchainError::TxReplay);
+            }
+        }
+
         let hash = block_hash(header)?;
 
         // Consensus hooks (PoW etc. — future).
@@ -337,6 +401,20 @@ impl<C: Consensus> Blockchain<C> {
         self.known_hashes.insert(hash);
         self.canonical.push(block.clone());
         self.tip = hash;
+        // Anti-replay index: record each transaction's inclusion
+        // height, then prune deterministically — beyond the window the
+        // TXID leaves the index (identical decision on any node that
+        // replays the same chain; ported semantics from the .bak:
+        // entry = inclusion height, `retain(h > cutoff)`).
+        for tx in &block.transactions {
+            if let Ok(id) = transaction_id(tx) {
+                self.included.insert(id, header.height);
+            }
+        }
+        let cutoff = header.height.saturating_sub(REPLAY_WINDOW_BLOCKS);
+        if header.height > REPLAY_WINDOW_BLOCKS {
+            self.included.retain(|_, h| *h > cutoff);
+        }
         Ok(AppliedBlock {
             hash,
             gc_removed_domains,
@@ -345,11 +423,15 @@ impl<C: Consensus> Blockchain<C> {
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::{child, claim_open_uip, register_domain_tx};
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::BlockchainError;
     use crate::genesis::{genesis, genesis_hash};
-    use crate::txid::transaction_id;
     use scone_core::{
         DomainId, DomainName, Proof, RecordHash, RegisterDomain, RegisterTld, TldName, Transaction,
         UpdateDomain,
@@ -411,7 +493,7 @@ mod tests {
         ))
     }
 
-    fn register_domain_tx(name: &str, seed: u8) -> Transaction {
+    pub(crate) fn register_domain_tx(name: &str, seed: u8) -> Transaction {
         sign(
             unsigned_register_domain(name, seed),
             &SigningKey::from_bytes([seed; 32]),
@@ -437,7 +519,7 @@ mod tests {
 
     /// Mines a registration proof at the testnet difficulty for
     /// `kind` ("tld" or "domain") over `name`.
-    fn mined_proof(name: &str, kind: &str) -> Proof {
+    pub(crate) fn mined_proof(name: &str, kind: &str) -> Proof {
         let (prefix, difficulty) = if kind == "tld" {
             (
                 scone_core::id::TLD_ID_VERSION,
@@ -456,7 +538,7 @@ mod tests {
         Proof::from_bytes(scone_core::pow::encode_proof(&checked))
     }
 
-    fn register_tld_tx(tld: &str, seed: u8) -> Transaction {
+    pub(crate) fn register_tld_tx(tld: &str, seed: u8) -> Transaction {
         sign(
             Transaction::RegisterTld(RegisterTld::register_tld_signed(
                 TldName::new(tld).unwrap(),
@@ -469,7 +551,7 @@ mod tests {
         )
     }
 
-    fn make_block(prev: BlockHash, height: u64, txs: Vec<Transaction>) -> Block {
+    pub(crate) fn make_block(prev: BlockHash, height: u64, txs: Vec<Transaction>) -> Block {
         Block {
             header: BlockHeader {
                 version: PROTOCOL_VERSION,
@@ -483,11 +565,14 @@ mod tests {
         }
     }
 
-    fn child<C: crate::Consensus>(chain: &Blockchain<C>, txs: Vec<Transaction>) -> Block {
+    pub(crate) fn child<C: crate::Consensus>(
+        chain: &Blockchain<C>,
+        txs: Vec<Transaction>,
+    ) -> Block {
         make_block(chain.tip_hash(), chain.height() + 1, txs)
     }
 
-    fn set_open_tx(tld: &str, seed: u8, open: bool) -> Transaction {
+    pub(crate) fn set_open_tx(tld: &str, seed: u8, open: bool) -> Transaction {
         sign(
             Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
                 scone_core::TldId::from_tld(&TldName::new(tld).unwrap()),
@@ -501,7 +586,7 @@ mod tests {
 
     /// Claims `uip` (PoW) and opens it for self-registration: the
     /// canonical precondition of every domain fixture (M8b).
-    fn claim_open_uip(chain: &mut Blockchain, seed: u8) {
+    pub(crate) fn claim_open_uip(chain: &mut Blockchain, seed: u8) {
         chain
             .push_block(&child(
                 chain,
@@ -1239,5 +1324,127 @@ mod tests {
         assert_eq!(extended.block(9), Some(&tip_block));
         assert_eq!(extended.block(10), Some(&b10));
         assert!(extended.block(8).is_none());
+    }
+
+    // ---- anti-replay window (ported from the .bak) ----
+
+    /// Empty blocks advancing the height (testnet fixtures have no
+    /// producer authorization — the permissive consensus accepts any
+    /// header, and empty blocks always apply).
+    fn advance(chain: &mut Blockchain, blocks: u64) {
+        for _ in 0..blocks {
+            chain.push_block(&child(chain, vec![])).unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_window_rejects_reinclusion_then_prunes() {
+        // Register d.uip at height 2; its TXID is protected for
+        // REPLAY_WINDOW_BLOCKS blocks, then the index entry is pruned
+        // deterministically (pure function of the inclusion height).
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        let register = register_domain_tx("d.uip", 1);
+        let txid = transaction_id(&register).unwrap();
+        chain
+            .push_block(&child(&chain, vec![register.clone()]))
+            .unwrap();
+        let tx_h = chain.height(); // 2
+        assert!(chain.is_tx_included(&txid));
+
+        // Same transaction re-included in a later block: rejected
+        // whole while its TXID is in the window (boundary-1: tip =
+        // tx_h + WINDOW - 1 still protects it).
+        advance(&mut chain, REPLAY_WINDOW_BLOCKS - 1);
+        assert_eq!(chain.height(), tx_h + REPLAY_WINDOW_BLOCKS - 1);
+        assert!(chain.is_tx_included(&txid), "still inside the window");
+        let replay_block = child(&chain, vec![register.clone()]);
+        assert_eq!(
+            chain.push_block(&replay_block),
+            Err(BlockchainError::TxReplay)
+        );
+
+        // Boundary: pushing block tx_h + WINDOW prunes the entry
+        // (retain(h > tx_h)), and a block re-including the very same
+        // bytes is no longer a replay — it applies under the ordinary
+        // domain rules (here: DomainAlreadyRegistered, NOT TxReplay).
+        advance(&mut chain, 1);
+        assert_eq!(chain.height(), tx_h + REPLAY_WINDOW_BLOCKS);
+        assert!(
+            !chain.is_tx_included(&txid),
+            "TXID pruned at the window boundary"
+        );
+        let replay_block = child(&chain, vec![register]);
+        assert_eq!(
+            chain.push_block(&replay_block),
+            Err(BlockchainError::DomainAlreadyRegistered)
+        );
+    }
+
+    #[test]
+    fn replay_window_index_is_bounded() {
+        // One tx per block over more than WINDOW blocks: the index
+        // never exceeds the window size (bounded RAM, independent of
+        // the chain lifetime).
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        chain
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .unwrap();
+        let extra: u64 = REPLAY_WINDOW_BLOCKS + 8;
+        for i in 0..extra {
+            let tx = update_domain_tx("example.uip", 1, i + 1);
+            chain.push_block(&child(&chain, vec![tx])).unwrap();
+        }
+        let _ = chain.height();
+        // The exposed predicate is window-only; the bound is checked
+        // indirectly: the very first update (height 2) is outside the
+        // window (tip = 2 + extra - 1 > 2 + WINDOW) and no longer
+        // reported as included.
+        let first = update_domain_tx("example.uip", 1, 1);
+        let id = transaction_id(&first).unwrap();
+        assert!(!chain.is_tx_included(&id));
+        // …while the LAST update is still protected.
+        let last = update_domain_tx("example.uip", 1, extra);
+        assert!(chain.is_tx_included(&transaction_id(&last).unwrap()));
+    }
+
+    #[test]
+    fn duplicate_tx_inside_one_block_is_caught_by_state_rules() {
+        // Two copies of the same RegisterDomain in one block: the
+        // anti-replay index is filled AFTER a successful push, so the
+        // first copy applies and the second is rejected by the
+        // ordinary state rule (the .bak checks intra-block
+        // duplicates with a seen-set at the same place).
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        let tx = register_domain_tx("dup.uip", 1);
+        let block = child(&chain, vec![tx.clone(), tx]);
+        assert_eq!(
+            chain.push_block(&block),
+            Err(BlockchainError::DomainAlreadyRegistered)
+        );
+    }
+
+    #[test]
+    fn restored_chain_starts_with_an_empty_replay_index() {
+        // `restore` does not replay blocks: the index starts empty
+        // (documented limitation, same as the RAM block window). The
+        // relay-side is_tx_included check is then permissive after a
+        // restart — the state rules remain the backstop, exactly like
+        // a tx whose window has expired.
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        let tx = register_domain_tx("example.uip", 1);
+        let id = transaction_id(&tx).unwrap();
+        chain.push_block(&child(&chain, vec![tx])).unwrap();
+        assert!(chain.is_tx_included(&id));
+        let restored = Blockchain::restore(
+            chain.height(),
+            chain.tip_hash(),
+            chain.block(chain.height()).unwrap().clone(),
+            chain.state().clone(),
+        );
+        assert!(!restored.is_tx_included(&id));
     }
 }

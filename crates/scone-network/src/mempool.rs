@@ -11,6 +11,37 @@ use scone_blockchain::TxId;
 
 use crate::error::{NetworkError, Result};
 
+/// Pending-transaction cap **per domain** (economic anti-spam, ported
+/// from the .bak `MAX_PENDING_PER_DOMAIN`): an owner cannot saturate
+/// the mempool for free with UPDATE/TRANSFER-type operations —
+/// beyond this many pending transactions targeting the same
+/// `DomainId` (or `TldId` for the TLD family), new ones are rejected.
+/// Multiplying domains costs a REGISTER (PoW), which keeps spam
+/// proportional to proof-of-work. Large enough for a reorg
+/// (REGISTER+UPDATE+TRANSFER+UPDATE re-inserted), low enough to
+/// matter.
+pub const MAX_PENDING_PER_DOMAIN: usize = 4;
+
+/// Byte key identifying the target namespace of a transaction for
+/// the per-domain cap: `DomainId` for domain operations, `TldId` for
+/// the TLD family (`RegisterTld`/`TransferTld`/`RevokeTld`/
+/// `SetTldOpen`). TLD and domain id spaces are disjoint by
+/// derivation, so one `[u8; 32]` space is enough.
+#[must_use]
+pub fn domain_key(tx: &scone_core::Transaction) -> Option<[u8; 32]> {
+    use scone_core::Transaction;
+    match tx {
+        Transaction::RegisterDomain(r) => Some(*r.domain_id.as_bytes()),
+        Transaction::UpdateDomain(u) => Some(*u.domain_id.as_bytes()),
+        Transaction::AssignDomain(a) => Some(*a.domain_id.as_bytes()),
+        Transaction::RenewDomain(r) => Some(*r.domain_id.as_bytes()),
+        Transaction::RegisterTld(t) => Some(*t.tld_id.as_bytes()),
+        Transaction::TransferTld(t) => Some(*t.tld_id.as_bytes()),
+        Transaction::RevokeTld(r) => Some(*r.tld_id.as_bytes()),
+        Transaction::SetTldOpen(s) => Some(*s.tld_id.as_bytes()),
+    }
+}
+
 /// A bounded set of validated transactions.
 #[derive(Debug)]
 pub struct Mempool {
@@ -76,6 +107,16 @@ impl Mempool {
     #[must_use]
     pub fn contains(&self, id: &TxId) -> bool {
         self.entries.contains_key(id)
+    }
+
+    /// Number of pooled transactions targeting `key` (per-domain
+    /// anti-spam cap, see [`MAX_PENDING_PER_DOMAIN`]).
+    #[must_use]
+    pub fn count_for_domain(&self, key: [u8; 32]) -> usize {
+        self.entries
+            .values()
+            .filter(|tx| domain_key(tx) == Some(key))
+            .count()
     }
 
     /// Drains up to `max` transactions in insertion order
@@ -179,5 +220,96 @@ mod tests {
         assert_eq!(pool.len(), 1);
         let drained = pool.drain_up_to(10);
         assert_eq!(drained.len(), 1);
+    }
+
+    // ---- per-domain anti-spam cap (ported from the .bak) ----
+
+    #[test]
+    fn domain_key_separates_namespaces() {
+        use scone_core::{DomainName, TldName};
+        let register = tx("a.uip", 1).1;
+        let update = update_tx("a.uip", 1).1;
+        let tld = register_tld("uip", 1).1;
+        let expected =
+            *scone_core::DomainId::from_name(&DomainName::new("a.uip").unwrap()).as_bytes();
+        assert_eq!(domain_key(&register), Some(expected));
+        assert_eq!(domain_key(&update), Some(expected));
+        // TLD family keys on tld_id — a different id space by
+        // derivation (no collision with domain ids).
+        let tld_expected = *scone_core::TldId::from_tld(&TldName::new("uip").unwrap()).as_bytes();
+        assert_eq!(domain_key(&tld), Some(tld_expected));
+        assert_ne!(domain_key(&tld), Some(expected));
+        // Different names -> different keys.
+        let other = tx("b.uip", 1).1;
+        assert_ne!(domain_key(&other), Some(expected));
+    }
+
+    #[test]
+    fn count_for_domain_counts_pending_per_namespace() {
+        let mut pool = Mempool::new(10);
+        // Two distinct transactions (different signers, different
+        // TxIds) targeting the SAME domain…
+        let (id_a1, a1) = tx("a.uip", 1);
+        let (id_a2, a2) = tx("a.uip", 2);
+        // …and one on another domain.
+        let (id_b, b) = tx("b.uip", 3);
+        assert!(pool.insert(id_a1, a1).unwrap());
+        assert!(pool.insert(id_a2, a2).unwrap());
+        assert!(pool.insert(id_b, b).unwrap());
+        let key_a = domain_key(&tx("a.uip", 1).1).unwrap();
+        assert_eq!(pool.count_for_domain(key_a), 2);
+        let key_b = domain_key(&tx("b.uip", 3).1).unwrap();
+        assert_eq!(pool.count_for_domain(key_b), 1);
+        // The cap threshold itself: MAX_PENDING_PER_DOMAIN pending on
+        // one domain is reachable, one more must be refused by the
+        // caller (accept_transaction).
+        assert_eq!(MAX_PENDING_PER_DOMAIN, 4);
+    }
+
+    /// Signed UpdateDomain fixture (same domain as `tx`).
+    fn update_tx(name: &str, seed: u8) -> (TxId, scone_core::Transaction) {
+        use scone_core::{DomainId, DomainName, RecordHash, UpdateDomain};
+        let sk = SigningKey::from_bytes([seed; 32]);
+        let unsigned = scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
+            DomainId::from_name(&DomainName::new(name).unwrap()),
+            1,
+            RecordHash::from_bytes([9; 32]),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        let signed = match unsigned {
+            scone_core::Transaction::UpdateDomain(mut u) => {
+                u.signature = sk.sign(&payload);
+                scone_core::Transaction::UpdateDomain(u)
+            }
+            _ => unreachable!(),
+        };
+        let id = scone_blockchain::transaction_id(&signed).unwrap();
+        (id, signed)
+    }
+
+    /// Signed RegisterTld fixture (empty proof — `transaction_id`
+    /// only needs canonical encodability).
+    fn register_tld(tld: &str, seed: u8) -> (TxId, scone_core::Transaction) {
+        use scone_core::{RegisterTld, TldName};
+        let sk = SigningKey::from_bytes([seed; 32]);
+        let unsigned = scone_core::Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            TldName::new(tld).unwrap(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        let signed = match unsigned {
+            scone_core::Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                scone_core::Transaction::RegisterTld(t)
+            }
+            _ => unreachable!(),
+        };
+        let id = scone_blockchain::transaction_id(&signed).unwrap();
+        (id, signed)
     }
 }
