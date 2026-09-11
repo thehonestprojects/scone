@@ -12,11 +12,13 @@
 //!   the Scone charset (strict subset of LDH: `[a-z0-9-]`, hyphen
 //!   neither first nor last — `_` accepted for SRV-style lookups but
 //!   rejected by `DomainName` on the authoritative path).
-//! - Response: QR|AA|RD(echo)|RA bits, the question echoed verbatim,
-//!   answers with **uncompressed** owner names (the qname), TTL 60,
-//!   bounded by [`MAX_PACKET_LEN`] (a truncated answer set is better
-//!   than an oversized datagram; real resolvers retry over TCP which
-//!   this devnet milestone does not serve).
+//! - Response: QR|RD(echo)|RA bits, AA **only** on chain-backed
+//!   (authoritative) answers, the question echoed verbatim, answers
+//!   with **uncompressed** owner names (the qname), TTL 60, bounded
+//!   by [`MAX_PACKET_LEN`]: an answer set that does not fit is cut
+//!   at the last fitting record with **TC=1** (honest truncation;
+//!   real resolvers retry over TCP which this devnet milestone does
+//!   not serve).
 //! - Anything unparseable is answered with **silence** (garbage must
 //!   cost nothing); `REFUSED` is returned for a QCLASS we refuse.
 //!
@@ -35,9 +37,12 @@
 //! ```
 //!
 //! The cache is keyed by (qname, qtype), bounded (LRU-ish: random
-//! eviction through an index map — see [`Cache`]) and only ever holds
-//! `authoritative: true` answers computed by the verified path, plus
-//! fallback answers with their own (clamped) TTL.
+//! eviction through an index map — see [`Cache`]) and holds verified
+//! authoritative answers plus validated fallback answers with their
+//! own (clamped) TTL — each entry carrying its origin so the AA bit
+//! stays honest on a cache hit. **Error rcodes are never cached**:
+//! SERVFAIL (transient local failure) and REFUSED (config state)
+//! are recomputed on every query.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -150,6 +155,12 @@ pub async fn run_udp(
 /// Handles one datagram: cache → authoritative → fallback. Returns
 /// `None` for garbage (silence). Pure-ish entry point (the cache is
 /// injected), fully covered by tests.
+///
+/// Honesty rules: the AA bit is set **only** on answers produced by
+/// the authoritative path (fresh or cached-authoritative); fallback
+/// answers and error rcodes (SERVFAIL/REFUSED) are never marked
+/// authoritative. SERVFAIL and REFUSED are never cached (a local
+/// RPC failure is transient, a missing upstream is config state).
 pub async fn handle_packet(
     resolver: &Resolver,
     data: &[u8],
@@ -157,9 +168,16 @@ pub async fn handle_packet(
     cache: &mut Cache,
 ) -> Option<Vec<u8>> {
     let q = parse_query(data)?;
-    // Cache hit (positive or negative).
+    // Cache hit (positive or negative): AA follows the origin of the
+    // cached entry, not the path that produced it.
     if let Some(entry) = cache.get(&q.name, q.qtype) {
-        return Some(build_response(&q, data, &entry.answers, entry.rcode));
+        return Some(build_response(
+            &q,
+            data,
+            &entry.answers,
+            entry.rcode,
+            entry.authoritative,
+        ));
     }
     let (answers, rcode) = if scone_candidate(&q.name) {
         authoritative(resolver, &q).await
@@ -168,35 +186,47 @@ pub async fn handle_packet(
     } else {
         match forward(data, upstreams).await {
             Some(resp) => {
-                // Pass the upstream answer through unchanged (it is a
-                // well-formed reply to our exact question) and cache
-                // its answers for the fallback path.
-                if let Some(extracted) = extract_answers(&resp, &q) {
-                    cache.put(
-                        q.name.clone(),
-                        q.qtype,
-                        CacheEntry {
-                            answers: extracted.0,
-                            rcode: RCODE_NOERROR,
-                            ttl: extracted.1.min(MAX_FALLBACK_TTL),
-                        },
-                    );
+                // Validated upstream reply (TXID + question echo +
+                // connect-checked socket — see [`forward`]). Pass it
+                // through unchanged; cache its answers on the
+                // fallback path, but never an error rcode.
+                let up_rcode = resp.get(3).map_or(RCODE_NOERROR, |b| b & 0x0F);
+                if up_rcode == RCODE_NOERROR || up_rcode == RCODE_NXDOMAIN {
+                    if let Some(extracted) = extract_answers(&resp, &q) {
+                        cache.put(
+                            q.name.clone(),
+                            q.qtype,
+                            CacheEntry {
+                                answers: extracted.0,
+                                rcode: up_rcode,
+                                ttl: extracted.1.min(MAX_FALLBACK_TTL),
+                                authoritative: false,
+                            },
+                        );
+                    }
+                } else {
+                    debug!(rcode = up_rcode, "dns: upstream error not cached");
                 }
                 return Some(resp);
             }
             None => (Vec::new(), RCODE_SERVFAIL),
         }
     };
-    cache.put(
-        q.name.clone(),
-        q.qtype,
-        CacheEntry {
-            answers: answers.clone(),
-            rcode,
-            ttl: ANSWER_TTL,
-        },
-    );
-    Some(build_response(&q, data, &answers, rcode))
+    let cacheable = rcode == RCODE_NOERROR || rcode == RCODE_NXDOMAIN;
+    if cacheable {
+        cache.put(
+            q.name.clone(),
+            q.qtype,
+            CacheEntry {
+                answers: answers.clone(),
+                rcode,
+                ttl: ANSWER_TTL,
+                authoritative: true,
+            },
+        );
+    }
+    // Only the authoritative path sets AA; REFUSED/SERVFAIL do not.
+    Some(build_response(&q, data, &answers, rcode, cacheable))
 }
 
 /// Longest-suffix apex search + record selection.
@@ -334,35 +364,67 @@ fn parse_query(b: &[u8]) -> Option<Query> {
 
 // ---- codec: write -------------------------------------------------------
 
+/// Builds a response. `authoritative` controls the AA bit honestly:
+/// only the chain-backed path sets it. If the full answer set does
+/// not fit in [`MAX_PACKET_LEN`], answers are truncated to the last
+/// one that fits and the **TC bit is set** (RFC 1035 §4.2.1: the
+/// client knows to retry over TCP / give up, instead of trusting a
+/// silently short answer).
 fn build_response(
     q: &Query,
     original: &[u8],
     answers: &[(u16, u32, Vec<u8>)],
     rcode: u8,
+    authoritative: bool,
 ) -> Vec<u8> {
     let question = question_bytes(original).unwrap_or(&[]);
     let mut out = Vec::with_capacity(12 + question.len() + 16 * answers.len());
     out.extend_from_slice(&q.id.to_be_bytes());
-    // QR | AA | RD(echo) | RA | RCODE
-    let flags: u16 = 0x8000 | 0x0400 | (u16::from(q.rd) << 8) | 0x0080 | u16::from(rcode);
-    out.extend_from_slice(&flags.to_be_bytes());
+    // Assemble with a placeholder ANCOUNT first, then fix it up once
+    // the truncation-decided count is known.
+    out.extend_from_slice(&[0, 0]); // flags placeholder
     out.extend_from_slice(&1u16.to_be_bytes());
-    out.extend_from_slice(&(u16::try_from(answers.len()).unwrap_or(u16::MAX)).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // ancount placeholder
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(question);
     let Some(question) = question_bytes(original) else {
+        let flags = 0x8000 | (u16::from(q.rd) << 8) | 0x0080 | u16::from(rcode);
+        out[2..4].copy_from_slice(&flags.to_be_bytes());
         return out;
     };
     let qname = &question[..question.len() - 4]; // without QTYPE/QCLASS
+    let mut kept = 0usize;
     for (tc, ttl, rdata) in answers {
+        // Owner + TYPE + CLASS + TTL + RDLEN + RDATA.
+        let need = qname.len() + 10 + rdata.len();
+        if out.len() + need > MAX_PACKET_LEN {
+            break;
+        }
         out.extend_from_slice(qname);
         out.extend_from_slice(&tc.to_be_bytes());
         out.extend_from_slice(&CLASS_IN.to_be_bytes());
         out.extend_from_slice(&ttl.to_be_bytes());
         out.extend_from_slice(&(u16::try_from(rdata.len()).unwrap_or(u16::MAX)).to_be_bytes());
         out.extend_from_slice(rdata);
+        kept += 1;
     }
+    let truncated = kept < answers.len();
+    // QR | AA(only if authoritative) | RD(echo) | RA | TC(if truncated) | RCODE
+    let mut flags = 0x8000 | (u16::from(q.rd) << 8) | 0x0080 | u16::from(rcode);
+    if authoritative {
+        flags |= 0x0400;
+    }
+    if truncated {
+        flags |= 0x0200;
+        warn!(
+            kept,
+            total = answers.len(),
+            "dns: response truncated (TC=1)"
+        );
+    }
+    out[2..4].copy_from_slice(&flags.to_be_bytes());
+    out[6..8].copy_from_slice(&(kept as u16).to_be_bytes());
     out
 }
 
@@ -453,22 +515,52 @@ pub fn encode_rdata_pub(r: &RecordData) -> Option<serde_json::Value> {
 
 // ---- fallback -----------------------------------------------------------
 
+/// Forwards a query and returns the reply **only if it matches the
+/// query**: same transaction ID, QR=1, question section echoed
+/// byte-for-byte (QNAME+QTYPE+QCLASS). The socket is `connect`ed to
+/// the upstream so kernel filtering replaces address spoofing — an
+/// off-path or late packet from another peer cannot be accepted.
+/// Returns `None` on timeout / no candidate / mismatch (mismatches
+/// do not fall through to the next upstream: the TXID check already
+/// burned it).
 async fn forward(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    let q_section = question_bytes(query)?; // QNAME+QTYPE+QCLASS
+    let q_txid: [u8; 2] = [query[0], query[1]];
     for up in upstreams {
         let bind_addr = if up.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let Ok(sock) = UdpSocket::bind(bind_addr).await else {
             continue;
         };
-        if sock.send_to(query, up).await.is_ok() {
-            let mut buf = vec![0u8; MAX_PACKET_LEN];
-            if let Ok(Ok(n)) = tokio::time::timeout(FORWARD_TIMEOUT, sock.recv(&mut buf)).await {
-                buf.truncate(n);
-                return Some(buf);
-            }
+        // Connected socket: recv() only accepts packets from `up`.
+        if sock.connect(up).await.is_err() {
+            continue;
         }
-        warn!("dns: upstream {up} timed out");
+        if sock.send(query).await.is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; MAX_PACKET_LEN];
+        let Ok(Ok(n)) = tokio::time::timeout(FORWARD_TIMEOUT, sock.recv(&mut buf)).await else {
+            warn!("dns: upstream {up} timed out");
+            continue;
+        };
+        buf.truncate(n);
+        if reply_matches(&buf, q_txid, q_section) {
+            return Some(buf);
+        }
+        // Well-formed-but-wrong or garbage from the upstream: do not
+        // try the next one on a TXID that was already burned.
+        return None;
     }
     None
+}
+
+/// Does `resp` answer `txid` + `question` (verbatim echo)?
+fn reply_matches(resp: &[u8], txid: [u8; 2], question: &[u8]) -> bool {
+    resp.len() >= 12
+        && resp[0] == txid[0]
+        && resp[1] == txid[1]
+        && resp[2] & 0x80 != 0 // QR=1: a response
+        && resp.get(12..12 + question.len()) == Some(question)
 }
 
 /// One wire answer: `(type_code, ttl, rdata)`.
@@ -506,13 +598,15 @@ fn extract_answers(resp: &[u8], _q: &Query) -> Option<(Vec<WireAnswer>, u32)> {
 
 // ---- cache --------------------------------------------------------------
 
-/// One cached answer (positive: answers + NOERROR/NXDOMAIN; the
-/// rcode travels with it so negative caching works).
+/// One cached answer (positive: answers + NOERROR; the rcode travels
+/// with it so negative caching of NXDOMAIN works). `authoritative`
+/// preserves the origin so a cache hit can set the AA bit honestly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheEntry {
     pub answers: Vec<(u16, u32, Vec<u8>)>,
     pub rcode: u8,
     pub ttl: u32,
+    pub authoritative: bool,
 }
 
 /// Bounded (qname, qtype) cache. Eviction: FIFO of keys when over
@@ -696,6 +790,64 @@ mod tests {
         assert!(parse_query(&c).is_none());
     }
 
+    /// AA must be set on authoritative answers, and stay set on a
+    /// cache hit of an authoritative entry.
+    #[tokio::test]
+    async fn aa_bit_honest_across_paths() {
+        let resolver = mock_resolver(vec![(
+            "example.uip",
+            vec![RecordData::A("192.0.2.10".parse().unwrap())],
+        )]);
+        let mut cache = Cache::new();
+        // Authoritative path (fresh and cached): AA set.
+        let resp = handle_packet(
+            &resolver,
+            &query(7, true, "example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp[2] & 0x04, 0x04, "AA set (authoritative)");
+        let cached = handle_packet(
+            &resolver,
+            &query(8, true, "example.uip", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached[2] & 0x04, 0x04, "AA preserved on cache hit");
+        // REFUSED (non-Scone name, no upstream): AA clear.
+        let mut cache2 = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(9, false, "www.example", TYPE_A),
+            &[],
+            &mut cache2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp[2] & 0x04, 0x00, "AA clear on REFUSED");
+        // SERVFAIL (resolver error): AA clear.
+        let failing: Resolver =
+            Arc::new(|_name| Box::pin(async { Err("local rpc down".to_string()) }));
+        let mut cache3 = Cache::new();
+        let resp = handle_packet(
+            &failing,
+            &query(10, false, "example.uip", TYPE_A),
+            &[],
+            &mut cache3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 2, "SERVFAIL");
+        assert_eq!(resp[2] & 0x04, 0x00, "AA clear on SERVFAIL");
+        assert_eq!(cache3.len(), 0, "SERVFAIL not cached");
+        // REFUSED not cached either.
+        assert_eq!(cache2.len(), 0, "REFUSED not cached");
+    }
+
     #[tokio::test]
     async fn authoritative_a_answer() {
         let resolver = mock_resolver(vec![(
@@ -852,6 +1004,138 @@ mod tests {
         up.await.unwrap();
         // cached (clamped ttl ≤ MAX_FALLBACK_TTL).
         assert_eq!(cache.len(), 1);
+        // Cached fallback answer: served without AA (not
+        // authoritative — the chain never vouched for it).
+        let cached = handle_packet(
+            &resolver,
+            &query(10, true, "www.example", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&cached), 0);
+        assert_eq!(ancount_of(&cached), 1);
+        assert_eq!(cached[2] & 0x04, 0x00, "AA clear on cached fallback");
+    }
+
+    /// An oversized answer set is cut at the last record that fits
+    /// and the TC bit is set (honest truncation, RFC 1035 §4.2.1).
+    #[tokio::test]
+    async fn oversized_answers_truncated_with_tc() {
+        // TXT records of 300 bytes each → ~316 bytes per answer;
+        // 20 of them far exceed MAX_PACKET_LEN (4096).
+        let big: Vec<RecordData> = (0..20)
+            .map(|i| RecordData::Txt(format!("{i:03}").replace('0', "x").repeat(300)))
+            .collect();
+        let resolver = mock_resolver(vec![("big.uip", big)]);
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(11, false, "big.uip", TYPE_TXT),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert!(resp.len() <= MAX_PACKET_LEN, "fits the datagram bound");
+        let an = ancount_of(&resp) as usize;
+        assert!(an >= 1, "at least one answer kept");
+        assert!(an < 20, "not all answers fit");
+        assert_eq!(resp[2] & 0x02, 0x02, "TC set on truncation");
+        assert_eq!(resp[2] & 0x04, 0x04, "still authoritative (AA)");
+        // No truncation flag on a small answer set.
+        let small = mock_resolver(vec![(
+            "small.uip",
+            vec![RecordData::A("192.0.2.1".parse().unwrap())],
+        )]);
+        let mut cache2 = Cache::new();
+        let resp = handle_packet(
+            &small,
+            &query(12, false, "small.uip", TYPE_A),
+            &[],
+            &mut cache2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp[2] & 0x02, 0x00, "TC clear when everything fits");
+    }
+
+    /// The fallback only accepts a reply that matches the query:
+    /// TXID, QR and verbatim question echo. A wrong TXID or a
+    /// different question → SERVFAIL, never a bogus answer.
+    #[tokio::test]
+    async fn upstream_reply_must_match_query() {
+        // Upstream that echoes the query but with a WRONG TXID.
+        let wrong_txid = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = wrong_txid.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, peer) = match wrong_txid.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut resp = buf[..n].to_vec();
+                resp[0] ^= 0xFF; // wrong TXID
+                resp[2] |= 0x80; // QR
+                let _ = wrong_txid.send_to(&resp, peer).await;
+            }
+        });
+        let resolver = mock_resolver(vec![]);
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(21, true, "www.example", TYPE_A),
+            &[addr],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 2, "mismatched reply → SERVFAIL");
+        assert_eq!(cache.len(), 0, "nothing cached from a bogus reply");
+        up.abort();
+
+        // Upstream that answers a DIFFERENT question (same TXID).
+        let other_q = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = other_q.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (n, peer) = match other_q.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let mut resp = buf[..n].to_vec();
+                resp[2] |= 0x80; // QR
+                // Rewrite the question to evil.example.
+                let mut q = vec![0u8; 12];
+                q[0..2].copy_from_slice(&resp[0..2]);
+                q[2..4].copy_from_slice(&resp[2..4]);
+                q[4..6].copy_from_slice(&1u16.to_be_bytes());
+                for label in "evil.example".split('.') {
+                    q.push(u8::try_from(label.len()).unwrap());
+                    q.extend_from_slice(label.as_bytes());
+                }
+                q.push(0);
+                q.extend_from_slice(&TYPE_A.to_be_bytes());
+                q.extend_from_slice(&CLASS_IN.to_be_bytes());
+                let _ = other_q.send_to(&q, peer).await;
+            }
+        });
+        let mut cache = Cache::new();
+        let resp = handle_packet(
+            &resolver,
+            &query(22, true, "www.example", TYPE_A),
+            &[addr],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 2, "foreign question → SERVFAIL");
+        assert_eq!(cache.len(), 0, "nothing cached");
+        up.abort();
     }
 
     #[test]
@@ -865,6 +1149,7 @@ mod tests {
                     answers: vec![],
                     rcode: 0,
                     ttl: 60,
+                    authoritative: true,
                 },
             );
         }
