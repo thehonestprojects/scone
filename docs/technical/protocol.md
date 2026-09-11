@@ -266,6 +266,24 @@ transport ne devrait pas dépasser `MAX_MESSAGE_LEN` (1 Mio).
 | `0x07` | `Transaction` | les deux | `Transaction` | — | — |
 | `0x08` | `GetRecord` | les deux | `domain_id[32]` | — | `Record` |
 | `0x09` | `Record` | les deux | `SignedDnsRecord` | — | — |
+| `0x0a` | `Checkpoint` | les deux | `Checkpoint` | signataires ≤ 64 | — |
+| `0x0b` | `GetCheckpoints` | les deux | — | — | fenêtre de checkpoints |
+
+### Checkpoint (M5)
+
+Un checkpoint agrégé se met en fil : balise `SCONE-CKPT-V1` || corps
+`CheckpointData` (116 o, LE — identique à la fin de la préimage de
+signature : `epoch(8) height(8) block_hash(32) prev_checkpoint_hash(32)
+state_root(32) recovery(4)`) || `count.v` || `pk[32] ‖ sig[64]` par
+signataire, **triés par pk croissant, sans doublon**, `count ≤ 64`
+(`MAX_CHECKPOINT_SIGNERS`). Décodage strict : troncature, balise fausse,
+pk non canonique, doublons ou non-tri = rejet (`None`), jamais de
+panic (fuzz de corruption testé).
+
+`GetCheckpoints` demande la fenêtre de finalité ; la réponse est la
+fenêtre `checkpoint_window()` (au plus `CHECKPOINT_KEEP` checkpoints,
+du plus ancien au plus récent) via un ou plusieurs messages
+`Checkpoint`.
 
 `TxId` est désormais défini par `scone-blockchain`
 (`BLAKE3-256("SCONE-TX-V1" || canonical(Transaction))`, voir

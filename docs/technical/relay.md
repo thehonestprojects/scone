@@ -126,13 +126,40 @@ borné : jamais plus d'un bloc en vol par pair.
 Un bloc invalide est rejeté avec une erreur typée ; le relay continue
 de tourner. Aucun panic sur données réseau.
 
-### Production de blocs (mode devnet)
+### Production de blocs (M5 : producteur signé)
 
 Toutes les `produce_interval` secondes (2 s par défaut) : si le
 mempool est non-vide, un bloc est assemblé par `BlockBuilder`
-(`timestamp = now`, consensus permissif — le vrai consensus PoW
-remacera ce mode) et suit exactement le chemin d'acceptation d'un
-bloc reçu. Un relay sans tx ne produit rien.
+(`timestamp = now`) **signé par un producteur autorisé** (payload
+`SCONE-BLOCK-V2` dans `header.consensus`, voir
+`/docs/technical/blockchain.md`) et suit exactement le chemin
+d'acceptation d'un bloc reçu. Un relay sans tx ne produit rien.
+
+Clé de production : la clé anchor (`--anchor-key`) quand le relay en
+est armé — un anchor est un producteur autorisé — sinon la clé devnet
+fixe, valide tant que le pool de producteurs est vide (bootstrap
+ouvert : genèse). Dès qu'un domaine/TLD vivant existe, un bloc signé
+par la clé devnet est rejeté (`InvalidProducer`).
+
+### Boucle anchor (finalité, M5)
+
+Avec `--anchor-key` (keyfile `.sconekey`, passphrase via
+`--anchor-passphrase-env`, défaut `SCONE_ANCHOR_PASSPHRASE`) :
+
+- après chaque bloc accepté/produit, si ce nœud est membre du comité
+  courant **et** que le comité atteint `MIN_FINALITY_COMMITTEE_SIZE`,
+  le relay signe le checkpoint proposé via son `SignerGuard`
+  (`signer-state.dat` dans le data-dir — une clé = un vote/epoch,
+  crash-safe fail-closed) et le propage (gossip) ;
+- les signatures reçues (`Message::Checkpoint`) sont accumulées par
+  hash de `CheckpointData` (borné à 256 entrées) ; à
+  `quorum_for(taille du comité)` signatures de membres sur le MÊME
+  data → `accept_checkpoint` + diffusion du checkpoint finalisé ;
+- un relay sans clé anchor reste **passif** : il accumule, finalise
+  et relaie, mais ne signe jamais ;
+- `GetCheckpoints` → la fenêtre `checkpoint_window()` est diffusée ;
+- toute erreur de boucle est journalisée et avalée — jamais fatale ;
+- le status RPC expose `checkpoints` et `finalized_epoch`.
 
 ### Sync (rattrapage)
 
