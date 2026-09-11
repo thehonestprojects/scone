@@ -22,7 +22,7 @@
 use scone_crypto::{PublicKey, Signature};
 
 use crate::error::{Result, SconeError};
-use crate::id::DomainId;
+use crate::id::{DomainId, TldId};
 use crate::owner::{OwnerId, PublicKeyRef};
 
 /// Opaque registration proof (reserved for the future proof of work).
@@ -202,6 +202,77 @@ pub enum Transaction {
     Update(Update),
 }
 
+/// Claims ownership of a top-level domain (M7a — TLD registry).
+///
+/// Mirrors [`Register`] but targets a [`TldId`] instead of a
+/// [`DomainId`]: registering the TLD `uip` is an on-chain claim over
+/// the *namespace* `*.uip`, a different object from any `name.uip`
+/// domain. The id spaces are disjoint by derivation
+/// (`SCONE-TLD-V1` vs `SCONE-DOMAIN-V1`), so no cross-squatting is
+/// possible.
+///
+/// Like every signed transaction: `owner` is ALWAYS recomputed from
+/// the embedded `public_key` (never trusted — see
+/// [`Register::register_signed`]); the `signature` must cover the
+/// canonical signing payload of `scone-protocol`; `validate` here
+/// only checks the pure invariants, not the signature itself.
+///
+/// Pure core type only for now: not yet part of the
+/// [`Transaction`] enum nor of the wire format (that is M7b) — the
+/// blockchain cannot carry it yet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegisterTld {
+    /// The claimed TLD (namespace id, disjoint from any `DomainId`).
+    pub tld_id: TldId,
+    /// Recomputed owner identity (never trusted from input).
+    pub owner: OwnerId,
+    /// Ordering information (Unix timestamp now; chain position later).
+    pub timestamp: u64,
+    /// Reserved for the registration proof of work (not yet implemented).
+    pub proof: Proof,
+    /// Ed25519 public key of the signer (32 bytes, embedded so the
+    /// signature can be verified offline).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl RegisterTld {
+    /// Builds a signed-shaped `RegisterTld`, recomputing `owner` from
+    /// `public_key` (the caller-supplied owner is never trusted —
+    /// there is none).
+    ///
+    /// See [`Register::register_signed`] for the signature contract.
+    #[must_use]
+    pub fn register_tld_signed(
+        tld_id: TldId,
+        timestamp: u64,
+        proof: Proof,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            tld_id,
+            owner: owner_of(&public_key),
+            timestamp,
+            proof,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`. The `proof` content is not
+    /// interpreted yet (future proof of work).
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
 impl Transaction {
     /// The domain this transaction applies to.
     pub fn domain_id(&self) -> DomainId {
@@ -378,5 +449,73 @@ mod tests {
         assert_eq!(upd.owner(), owner_of(&key(1).public_key()));
         assert_eq!(reg.public_key(), &key(1).public_key());
         assert_eq!(upd.signature(), &placeholder_signature());
+    }
+
+    // --- RegisterTld (M7a) ---
+
+    fn tld_id() -> TldId {
+        TldId::from_tld(&crate::name::TldName::new("uip").unwrap())
+    }
+
+    fn register_tld() -> RegisterTld {
+        RegisterTld::register_tld_signed(
+            tld_id(),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            key(1).public_key(),
+            placeholder_signature(),
+        )
+    }
+
+    #[test]
+    fn register_tld_validates_with_any_proof_content() {
+        assert!(register_tld().validate().is_ok());
+    }
+
+    #[test]
+    fn register_tld_constructor_recomputes_owner_from_the_key() {
+        let sk = key(9);
+        let tx = RegisterTld::register_tld_signed(
+            tld_id(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(tx.owner, owner_of(&sk.public_key()));
+    }
+
+    #[test]
+    fn register_tld_owner_key_mismatch_is_invalid() {
+        let sk_a = key(1);
+        let sk_b = key(2);
+        let mut tx = RegisterTld::register_tld_signed(
+            tld_id(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
+        // Forged owner: not the derivation of the embedded key.
+        tx.owner = owner_of(&sk_b.public_key());
+        assert!(matches!(tx.validate(), Err(SconeError::InvalidOwner(_))));
+    }
+
+    #[test]
+    fn register_tld_shares_owner_identity_with_domain_register() {
+        // Same key ⇒ same owner on both registries: one identity can
+        // hold domains and TLDs.
+        let reg = register();
+        let tld_reg = register_tld();
+        assert_eq!(reg.owner, tld_reg.owner);
+    }
+
+    #[test]
+    fn register_tld_target_is_a_tld_id_not_a_domain_id() {
+        let tx = register_tld();
+        // The claimed namespace id is the TLD derivation of "uip"…
+        assert_eq!(tx.tld_id, tld_id());
+        // …and is disjoint from any domain derivation.
+        assert_ne!(tx.tld_id.as_bytes(), domain_id().as_bytes());
     }
 }

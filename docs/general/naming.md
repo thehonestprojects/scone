@@ -84,6 +84,33 @@ aucune autre (pas de troncature, pas de préfixe, pas de majuscules).
 ## Limites et règles futures (non figées)
 
 - noms internationalisés (IDN) via punycode ;
-- réservation/gouvernance des TLDs ;
 - longueur minimale des labels de second niveau ;
 - expiration/renouvellement des claims de domaine.
+
+## TLDId (M7a)
+
+Un TLD enregistrable porte sa propre identité, distincte de celle de
+tout domaine :
+
+```text
+TldId = BLAKE3-256("SCONE-TLD-V1" || tld)
+```
+
+- le préfixe `SCONE-TLD-V1` est **distinct** de `SCONE-DOMAIN-V1` :
+  les espaces d'ids TLD et domaine sont disjoints par construction —
+  enregistrer le TLD `uip` (une claim sur le namespace `*.uip`) ne
+  peut jamais squatter l'identité d'un domaine, ni l'inverse ;
+- mêmes règles d'affichage que `DomainId` : hex minuscule, 64
+  caractères, jamais tronqué ;
+- vecteur épinglé (dérivation figée par test) :
+  `TldId("uip") = ad5a86d68643d5c22d6a959bb1a315530c77dfda241f1ac1a8107450f3fab25e`.
+
+La transaction `RegisterTld` (claim signée d'un TLD, `owner` toujours
+recomputé de la clé embarquée) est définie dans `scone-core` ; le
+format wire et l'enum `Transaction` suivent en M7b.
+
+## Réservation/gouvernance des TLDs
+
+Ouverte par M7a : `RegisterTld` réclame un TLD libre au profit de
+l'identité dérivée de la clé signataire. Règles de gouvernance
+(dépôt, expiration, révocation) : non figées.
