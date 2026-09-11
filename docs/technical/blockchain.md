@@ -133,25 +133,47 @@ sur tous les nœuds).
 
 ```text
 DomainState  = { owner: OwnerId, sequence: u64, record_hash: Option<RecordHash> }
+TldState     = { owner: OwnerId }
 ChainState   = DomainId -> DomainState        (accès direct, en mémoire)
+               + TldId -> TldState            (registre TLD, M7b)
 ```
 
 - accès direct par `DomainId` (32 octets) : jamais de `String` comme
   clé, jamais de scan complet — condition nécessaire pour viser des
   centaines de milliards de domaines ;
-- `record_hash == None` tant qu'aucun `UpdateDomain` n'a été appliqué.
+- `record_hash == None` tant qu'aucun `UpdateDomain` n'a été appliqué ;
+- les espaces d'ids TLD et domaine sont **disjoints par construction**
+  (préfixes de dérivation distincts, voir `/docs/general/naming.md`) :
+  enregistrer le TLD `uip` ne peut jamais squatter l'identité d'un
+  domaine, ni l'inverse.
 
 ### Règles d'application
 
 `state.apply(transaction)` est déterministe et atomique (en cas
 d'erreur, l'état est inchangé) :
 
+**REGISTER_TLD** :
+
+- le TLD doit être **libre** (absent du registre TLD) ;
+- à l'application : `{ owner }`.
+
 **REGISTER** :
 
+- **le TLD du nom porté doit être enregistré** : la chaîne dérive
+  elle-même `TldId(nom.tld())` (préfixe `SCONE-TLD-V1`, jamais une
+  valeur fournie) et exige sa présence dans le registre TLD, sinon
+  `UnknownTld` (décision D1, M7c : la chaîne est aussi l'autorité des
+  namespaces) ;
 - le domaine doit être **libre** (absent de l'état) ;
 - à l'application : `{ owner, sequence: 0, record_hash: None }` ;
 - la `proof` n'est **pas** interprétée ici : sa validation (PoW de
   registration) est un crochet du consensus (différé).
+
+L'ordre intra-bloc est significatif pour D1 : `[RegisterTld, RegisterDomain]`
+dans un même bloc est valide (le namespace existe quand la claim
+s'applique), `[RegisterDomain, RegisterTld]` est rejeté en bloc entier
+(undo-log) — de même que `[REGISTER, UPDATE]` s'applique mais pas
+`[UPDATE, REGISTER]`.
 
 **UPDATE** :
 

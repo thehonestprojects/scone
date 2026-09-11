@@ -161,7 +161,9 @@ impl ChainState {
     ///
     /// Rules (see `/docs/technical/blockchain.md`):
     ///
-    /// - **RegisterDomain**: the domain must be free; it becomes
+    /// - **RegisterDomain**: the TLD of the carried name must be
+    ///   registered (else [`BlockchainError::UnknownTld`] — D1, M7c)
+    ///   and the domain must be free; it becomes
     ///   `{ owner, sequence: 0, record_hash: None }`. The proof is not
     ///   interpreted here — that is a consensus concern
     ///   (see [`crate::Consensus`]).
@@ -206,6 +208,16 @@ impl ChainState {
         tx.validate()?;
         match tx {
             Transaction::RegisterDomain(register) => {
+                // D1 (M7c): the TLD namespace must already be claimed
+                // on-chain — a `RegisterDomain` for `name.tld` requires
+                // the TldId of `tld` in the registry, else
+                // `UnknownTld`. The name is carried by the transaction
+                // (M7b), so the chain derives the namespace id itself
+                // (recompute, never trust a provided value).
+                let tld_id = TldId::from_tld(&register.name.tld());
+                if !self.tlds.contains_key(&tld_id) {
+                    return Err(BlockchainError::UnknownTld);
+                }
                 if self.domains.contains_key(&register.domain_id) {
                     return Err(BlockchainError::DomainAlreadyRegistered);
                 }
@@ -338,6 +350,12 @@ mod tests {
         crate::validate::owner_from_public_key(&key(seed).public_key())
     }
 
+    /// Registers the TLD `uip` (D1 prerequisite of every domain
+    /// fixture below — M7c).
+    fn seed_uip(state: &mut ChainState) {
+        state.apply(&register_tld("uip", 1)).unwrap();
+    }
+
     #[test]
     fn new_state_is_empty() {
         let state = ChainState::new();
@@ -349,6 +367,7 @@ mod tests {
     #[test]
     fn register_creates_initial_domain_state() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         let domain = state.domain(&domain_id("example.uip")).unwrap();
         assert_eq!(domain.owner, owner(1));
@@ -360,6 +379,7 @@ mod tests {
     #[test]
     fn double_register_is_rejected() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         assert_eq!(
             state.apply(&register("example.uip", 1)),
@@ -385,6 +405,7 @@ mod tests {
     #[test]
     fn update_wrong_owner_is_rejected() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         assert_eq!(
             state.apply(&update("example.uip", 2, 1)),
@@ -399,6 +420,7 @@ mod tests {
     #[test]
     fn update_requires_exactly_next_sequence() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
 
         // Zero violates the core invariant (checked first).
@@ -422,6 +444,7 @@ mod tests {
     #[test]
     fn update_zero_sequence_fails_core_validation() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         assert!(matches!(
             state.apply(&update("example.uip", 1, 0)),
@@ -432,6 +455,7 @@ mod tests {
     #[test]
     fn register_then_update_then_update() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         state.apply(&update("example.uip", 1, 1)).unwrap();
         state.apply(&update("example.uip", 1, 2)).unwrap();
@@ -445,6 +469,7 @@ mod tests {
     #[test]
     fn failed_apply_leaves_state_unchanged() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("example.uip", 1)).unwrap();
         let snapshot = state.clone();
 
@@ -467,6 +492,8 @@ mod tests {
         ];
         let mut left = ChainState::new();
         let mut right = ChainState::new();
+        seed_uip(&mut left);
+        seed_uip(&mut right);
         for tx in &txs {
             left.apply(tx).unwrap();
             right.apply(tx).unwrap();
@@ -478,6 +505,7 @@ mod tests {
     #[test]
     fn independent_domains_do_not_interfere() {
         let mut state = ChainState::new();
+        seed_uip(&mut state);
         state.apply(&register("a.uip", 1)).unwrap();
         state.apply(&register("b.uip", 2)).unwrap();
         state.apply(&update("b.uip", 2, 1)).unwrap();
@@ -539,5 +567,70 @@ mod tests {
         state.apply(&register("example.uip", 1)).unwrap();
         assert_eq!(state.len(), 1);
         assert_eq!(state.tld_len(), 1);
+    }
+
+    // --- D1: RegisterDomain requires its TLD on-chain (M7c) ---
+
+    #[test]
+    fn register_under_unknown_tld_is_rejected() {
+        let mut state = ChainState::new();
+        assert_eq!(
+            state.apply(&register("example.uip", 1)),
+            Err(BlockchainError::UnknownTld)
+        );
+        // Nothing was created, in either registry.
+        assert_eq!(state.len(), 0);
+        assert_eq!(state.tld_len(), 0);
+    }
+
+    #[test]
+    fn register_under_registered_tld_is_accepted() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&register("example.uip", 2)).unwrap();
+        // A second domain under the same TLD is fine (D2: allocation
+        // under a TLD is open in v3).
+        state.apply(&register("other.uip", 3)).unwrap();
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.tld_len(), 1);
+    }
+
+    #[test]
+    fn register_checks_the_tld_of_the_carried_name_not_the_owner() {
+        // The TLD exists but was registered by a DIFFERENT key than
+        // the domain registrant: still accepted (D2 — allocation
+        // under a TLD is open, not gated by the TLD owner).
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&register("example.uip", 9)).unwrap();
+        assert_eq!(
+            state.domain(&domain_id("example.uip")).unwrap().owner,
+            owner(9)
+        );
+    }
+
+    #[test]
+    fn another_registered_tld_does_not_help() {
+        // Registering "com" does not open "uip": each namespace is
+        // claimed independently.
+        let mut state = ChainState::new();
+        state.apply(&register_tld("com", 1)).unwrap();
+        assert_eq!(
+            state.apply(&register("example.uip", 1)),
+            Err(BlockchainError::UnknownTld)
+        );
+    }
+
+    #[test]
+    fn unknown_tld_is_checked_before_domain_freedom() {
+        // A double register under an unclaimed TLD reports
+        // UnknownTld first: the namespace error dominates.
+        let mut state = ChainState::new();
+        state.apply(&register_tld("com", 1)).unwrap();
+        state.apply(&register("example.com", 1)).unwrap();
+        assert_eq!(
+            state.apply(&register("example.uip", 1)),
+            Err(BlockchainError::UnknownTld)
+        );
     }
 }

@@ -38,21 +38,16 @@ fn state_bytes(seed: u8) -> DomainStateBytes {
 }
 
 /// Builds and pushes one block with a register tx, returning
-/// `(chain, block, hash)` — the canonical M3 block path.
+/// `(chain, block, hash)` — the canonical M3 block path. Since M7c
+/// (D1) the block first claims the `uip` TLD: no domain under an
+/// unregistered TLD can be applied.
 fn build_block(
     chain: &mut scone_blockchain::Blockchain,
     sk: &scone_crypto::SigningKey,
     name: &str,
 ) -> (scone_protocol::Block, scone_protocol::BlockHash) {
-    use scone_core::{Proof, RegisterDomain, Transaction};
-    let tx = {
-        let unsigned = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
-            scone_core::DomainName::new(name).unwrap(),
-            1,
-            Proof::from_bytes(Vec::new()),
-            sk.public_key(),
-            scone_crypto::Signature::from_bytes([0; 64]),
-        ));
+    use scone_core::{Proof, RegisterDomain, RegisterTld, TldId, TldName, Transaction};
+    let sign_tx = |unsigned: Transaction| {
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
             Transaction::RegisterDomain(mut r) => {
@@ -70,7 +65,34 @@ fn build_block(
         }
     };
     let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
-    builder.push_tx(tx).unwrap();
+    if chain.height() == 0 {
+        // First block: claim the namespace before the domain (D1).
+        builder
+            .push_tx(sign_tx(Transaction::RegisterTld(
+                RegisterTld::register_tld_signed(
+                    TldId::from_tld(
+                        &TldName::new(DomainName::new(name).expect("valid name").tld().as_str())
+                            .expect("valid TLD"),
+                    ),
+                    1,
+                    Proof::from_bytes(Vec::new()),
+                    sk.public_key(),
+                    scone_crypto::Signature::from_bytes([0; 64]),
+                ),
+            )))
+            .unwrap();
+    }
+    builder
+        .push_tx(sign_tx(Transaction::RegisterDomain(
+            RegisterDomain::register_domain_signed(
+                scone_core::DomainName::new(name).unwrap(),
+                1,
+                Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                scone_crypto::Signature::from_bytes([0; 64]),
+            ),
+        )))
+        .unwrap();
     let block = builder.build().unwrap();
     let hash = chain.push_block(&block).unwrap();
     (block, hash)

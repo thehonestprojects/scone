@@ -167,10 +167,26 @@ mod tests {
         }
     }
 
+    /// Signs a TLD claim over the canonical payload (test helper, M7c:
+    /// D1 requires the namespace on-chain before any domain under it).
+    fn signed_register_tld(sk: &SigningKey, tld: &str) -> Transaction {
+        sign(
+            Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+                scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+                1,
+                Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            sk,
+        )
+    }
+
     #[test]
     fn builds_on_genesis_with_recomputed_root() {
         let sk = SigningKey::from_bytes([1; 32]);
         let mut builder = BlockBuilder::after(0, genesis_hash()).with_timestamp(1_700_000_000);
+        builder.push_tx(signed_register_tld(&sk, "uip")).unwrap();
         builder
             .push_tx(signed_register_domain(&sk, "example.uip"))
             .unwrap();
@@ -197,6 +213,7 @@ mod tests {
 
         let b1 = {
             let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
+            b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
             b.push_tx(signed_register_domain(&sk, "example.uip"))
                 .unwrap();
             b.build().unwrap()
@@ -224,6 +241,7 @@ mod tests {
             let b1 = {
                 let mut b =
                     BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
+                b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
                 b.push_tx(signed_register_domain(&sk, "example.uip"))
                     .unwrap();
                 b.build().unwrap()

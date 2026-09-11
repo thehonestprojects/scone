@@ -75,6 +75,27 @@ mod tests {
         }
     }
 
+    fn register_tld_tx(tld: &str, seed: u8) -> scone_core::Transaction {
+        use scone_core::{Proof, RegisterTld, TldId, TldName};
+        use scone_crypto::{Signature, SigningKey};
+        let sk = SigningKey::from_bytes([seed; 32]);
+        let unsigned = scone_core::Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            TldId::from_tld(&TldName::new(tld).unwrap()),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        match unsigned {
+            scone_core::Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                scone_core::Transaction::RegisterTld(t)
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[test]
     fn serves_bounded_ranges() {
         let dir = tempfile::tempdir().unwrap();
@@ -83,6 +104,10 @@ mod tests {
         for i in 0..5 {
             let mut builder =
                 BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(i + 1);
+            if i == 0 {
+                // D1 (M7c): claim the namespace before any domain.
+                builder.push_tx(register_tld_tx("uip", 1)).unwrap();
+            }
             builder
                 .push_tx(register_domain_tx(
                     &format!("d{i}.uip"),

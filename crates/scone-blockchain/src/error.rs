@@ -44,6 +44,11 @@ pub enum BlockchainError {
     /// A `RegisterTld` targets an already-registered TLD.
     #[error("TLD already registered")]
     TldAlreadyRegistered,
+    /// A `RegisterDomain` targets a TLD that is not registered: the
+    /// namespace must be claimed first with a `RegisterTld` (D1, M7c
+    /// — the chain is the authority over TLDs too).
+    #[error("unknown TLD")]
+    UnknownTld,
     /// An `UpdateDomain` targets an unregistered domain.
     #[error("unknown domain")]
     UnknownDomain,

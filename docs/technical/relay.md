@@ -91,8 +91,10 @@ borné : jamais plus d'un bloc en vol par pair.
 1. décodage strict borné (`MAX_MESSAGE_LEN`) ;
 2. validation cryptographique complète (`validate_transaction` :
    binding owner/clé, `verify_strict` sur le payload canonique) ;
-3. pré-contrôle d'état : `RegisterDomain` → nom libre ; `UpdateDomain` → domaine
-   connu, séquence exacte `current + 1`, propriétaire ;
+3. pré-contrôle d'état : `RegisterDomain` → TLD du nom enregistré
+   (`UnknownTld` sinon, D1/M7c) puis nom libre ; `UpdateDomain` → domaine
+   connu, séquence exacte `current + 1`, propriétaire ; `RegisterTld` →
+   TLD libre ;
 4. insertion au mempool (capacité fixe, dédup par `TxId` —
    re-soumettre une tx déjà en pool est un no-op) ;
 5. broadcast aux pairs (sauf l'émetteur).

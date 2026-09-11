@@ -107,6 +107,12 @@ impl Relay {
         use scone_blockchain::BlockchainError;
         match tx {
             Transaction::RegisterDomain(r) => {
+                // D1 (M7c): the TLD of the carried name must be
+                // registered (checked identically at push time).
+                let tld_id = scone_core::TldId::from_tld(&r.name.tld());
+                if self.chain.state().tld(&tld_id).is_none() {
+                    return Err(BlockchainError::UnknownTld);
+                }
                 if self.chain.state().domain(&r.domain_id).is_some() {
                     return Err(BlockchainError::DomainAlreadyRegistered);
                 }

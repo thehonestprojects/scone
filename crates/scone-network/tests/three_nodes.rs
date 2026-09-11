@@ -52,6 +52,19 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     }
 }
 
+fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
+    sign(
+        Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
 fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
@@ -281,6 +294,29 @@ async fn three_nodes_cycle_security_regression() {
     let status = status_of(nodes[0].client_ref(), deadline).await;
     assert_eq!(status["height"], 0, "no block from a forged tx: {status}");
 
+    // ---- D1 (M7c): claim the namespace before the domain ----------
+    let tld_hex = hex(&encode_to_vec(&register_tld_tx(&sk, "uip")).expect("encode tld"));
+    let response = nodes[0]
+        .client_ref()
+        .request(RpcRequest::SubmitTx { tx_hex: tld_hex })
+        .await;
+    match response {
+        Ok(RpcResponse::Ok { data }) => {
+            assert!(
+                data["txid"].as_str().is_some_and(|t| t.len() == 64),
+                "{data}"
+            );
+        }
+        other => panic!("tld tx rejected: {other:?}"),
+    }
+    for node in &nodes {
+        let status = wait_for_height(node.client_ref(), 1, deadline).await;
+        assert_eq!(
+            status["domain_count"], 0,
+            "TLD claimed, no domain yet: {status}"
+        );
+    }
+
     // ---- H2: one valid tx on the cycle must settle, not loop ------
     let name = "cycle.uip";
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
@@ -300,9 +336,9 @@ async fn three_nodes_cycle_security_regression() {
         other => panic!("valid tx rejected: {other:?}"),
     }
 
-    // A produces a block; everyone syncs to height 1.
+    // A produces a block; everyone syncs to height 2.
     for node in &nodes {
-        let status = wait_for_height(node.client_ref(), 1, deadline).await;
+        let status = wait_for_height(node.client_ref(), 2, deadline).await;
         assert_eq!(
             status["domain_count"], 1,
             "domain registered everywhere: {status}"
@@ -354,7 +390,7 @@ async fn three_nodes_cycle_security_regression() {
         "update tx accepted: {response:?}"
     );
     for node in &nodes {
-        wait_for_height(node.client_ref(), 2, deadline).await;
+        wait_for_height(node.client_ref(), 3, deadline).await;
     }
 
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));
@@ -416,6 +452,6 @@ async fn three_nodes_cycle_security_regression() {
     // Final liveness check on all three nodes.
     for node in &nodes {
         let status = status_of(node.client_ref(), deadline).await;
-        assert_eq!(status["height"], 2, "everyone at height 2: {status}");
+        assert_eq!(status["height"], 3, "everyone at height 3: {status}");
     }
 }

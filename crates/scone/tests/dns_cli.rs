@@ -118,7 +118,7 @@ fn dns_cli_end_to_end() {
         std::thread::sleep(Duration::from_millis(150));
     }
 
-    // ---- identity + register + update (record published) ------------
+    // ---- identity + TLD claim + register + update ------------------
     let keys = work.path().join("keys");
     let pass_var = "SCONE_TEST_PASS_M6";
     // SAFETY: single-threaded test.
@@ -141,6 +141,54 @@ fn dns_cli_end_to_end() {
         "--passphrase-env".to_string(),
         pass_var.to_string(),
     ];
+
+    // ---- claim the TLD namespace (D1, M7c) ------------------------
+    // `scone tld register` arrives in M7e; until then the e2e path is
+    // the offline tx surface: build → sign → submit.
+    let tld_payload = scone_ok(&[
+        "tx",
+        "build",
+        "register-tld",
+        "--tld",
+        "uip",
+        "--timestamp",
+        "42",
+    ])
+    .into_iter()
+    .find_map(|l| l.strip_prefix("signing payload: ").map(String::from))
+    .expect("signing payload line");
+    let tld_signed = scone_ok(&[
+        "tx",
+        "sign",
+        &tld_payload,
+        "--identity",
+        "owner",
+        "--dir",
+        keys.to_str().expect("keys"),
+        "--passphrase-env",
+        pass_var,
+    ])
+    .into_iter()
+    .find_map(|l| l.strip_prefix("transaction: ").map(String::from))
+    .expect("signed transaction line");
+    scone_ok(&[
+        "submit",
+        "tx",
+        "--hex",
+        &tld_signed,
+        "--rpc",
+        &rpc.to_string(),
+    ]);
+    let tld_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let lines = scone_ok(&["status", "--rpc", &rpc.to_string()]);
+        if lines.iter().any(|l| l.starts_with("height: 1")) {
+            break;
+        }
+        assert!(Instant::now() < tld_deadline, "tld claim never mined");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     let name = "m6.uip";
     let reg_deadline = Instant::now() + Duration::from_secs(30);
     loop {

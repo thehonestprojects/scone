@@ -188,7 +188,8 @@ Une transaction est valide si et seulement si :
    payload signé **recomputé de zéro** (jamais pris d'un pair ni de
    la transaction telle que fournie) ;
 5. **règles d'état** (à l'application dans un bloc) :
-   RegisterDomain → domaine libre ; RegisterTld → TLD libre ;
+   RegisterDomain → TLD du nom **enregistré** (`UnknownTld` sinon — D1)
+   puis domaine libre ; RegisterTld → TLD libre ;
    UpdateDomain → domaine existant, `owner` courant,
    `sequence == current + 1`.
 

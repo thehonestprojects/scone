@@ -48,6 +48,19 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     }
 }
 
+fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
+    sign(
+        Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
 fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
@@ -150,9 +163,26 @@ async fn two_nodes_sync_blocks_and_records() {
     let status = status_of(&client_b, deadline).await;
     assert_eq!(status["height"], 0, "B starts at genesis: {status}");
 
-    // ---- submit a RegisterDomain to A -------------------------------------
+    // ---- claim the TLD namespace, then the domain (D1, M7c) --------
     let sk = SigningKey::from_bytes([7u8; 32]);
     let name = "example.uip";
+    let tld_hex = hex(&encode_to_vec(&register_tld_tx(&sk, "uip")).expect("encode tld tx"));
+    let response = request(
+        &client_a,
+        RpcRequest::SubmitTx { tx_hex: tld_hex },
+        deadline,
+    )
+    .await;
+    assert!(
+        response["txid"].as_str().is_some_and(|t| t.len() == 64),
+        "tld txid expected: {response}"
+    );
+    let status_a = wait_for_height(&client_a, 1, deadline).await;
+    assert_eq!(status_a["domain_count"], 0, "{status_a}");
+    let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
+    assert_eq!(status_b["height"], 1, "B synced the TLD block: {status_b}");
+
+    // ---- submit a RegisterDomain to A -------------------------------------
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
     let response = request(
         &client_a,
@@ -168,12 +198,12 @@ async fn two_nodes_sync_blocks_and_records() {
     );
 
     // Wait for A to produce the block (devnet: ≤ ~2 s).
-    let status_a = wait_for_height(&client_a, 1, deadline).await;
+    let status_a = wait_for_height(&client_a, 2, deadline).await;
     assert_eq!(status_a["domain_count"], 1, "{status_a}");
 
     // ---- B syncs the block -------------------------------------------
     let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
-    assert_eq!(status_b["height"], 1, "B synced: {status_b}");
+    assert_eq!(status_b["height"], 2, "B synced: {status_b}");
     assert_eq!(status_b["tip"], status_a["tip"], "same tip hash");
 
     // lookup at B: the domain registered via A is visible.
@@ -204,9 +234,9 @@ async fn two_nodes_sync_blocks_and_records() {
     .await;
     assert!(response["txid"].is_string(), "{response}");
 
-    let status_a = wait_for_height(&client_a, 2, deadline).await;
+    let status_a = wait_for_height(&client_a, 3, deadline).await;
     let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
-    assert_eq!(status_b["height"], 2, "B synced block 2: {status_b}");
+    assert_eq!(status_b["height"], 3, "B synced block 3: {status_b}");
 
     // Publish the signed record in the DHT via A's RPC.
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));
@@ -255,6 +285,15 @@ async fn concurrent_registers_never_kill_the_producer() {
 
     let client = wait_rpc(rpc_port, deadline).await;
 
+    // D1 (M7c): the namespace must exist before anyone races for a
+    // name under it.
+    let tld_sk = SigningKey::from_bytes([0x99; 32]);
+    let tld_hex = hex(&encode_to_vec(&register_tld_tx(&tld_sk, "uip")).expect("encode tld"));
+    let response = request(&client, RpcRequest::SubmitTx { tx_hex: tld_hex }, deadline).await;
+    assert!(response["txid"].is_string(), "{response}");
+    let status = wait_for_height(&client, 1, deadline).await;
+    assert_eq!(status["domain_count"], 0, "{status}");
+
     // Two DIFFERENT owners race for the same name; both pass the
     // precheck while the domain is still free.
     let winner = SigningKey::from_bytes([0x11; 32]);
@@ -266,11 +305,11 @@ async fn concurrent_registers_never_kill_the_producer() {
         assert!(response["txid"].is_string(), "{response}");
     }
 
-    // Height 1 gets mined with EXACTLY one of the two (the block must
+    // Height 2 gets mined with EXACTLY one of the two (the block must
     // apply cleanly); the relay stays alive and keeps answering. The
     // loser is either still pooled or already evicted by a later
     // production tick (both are non-fatal outcomes).
-    let status = wait_for_height(&client, 1, deadline).await;
+    let status = wait_for_height(&client, 2, deadline).await;
     assert_eq!(status["domain_count"], 1, "{status}");
     assert!(
         status["mempool"].as_u64().is_some_and(|m| m <= 1),
@@ -288,12 +327,12 @@ async fn concurrent_registers_never_kill_the_producer() {
     );
 
     // The relay must still work afterwards: a fresh register of a
-    // DIFFERENT name goes through (height 2, still alive).
+    // DIFFERENT name goes through (height 3, still alive).
     let third = SigningKey::from_bytes([0x33; 32]);
     let tx_hex = hex(&encode_to_vec(&register_tx_sk(&third, "after.uip")).expect("encode"));
     let response = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
     assert!(response["txid"].is_string(), "{response}");
-    let status = wait_for_height(&client, 2, deadline).await;
+    let status = wait_for_height(&client, 3, deadline).await;
     assert_eq!(status["domain_count"], 2, "{status}");
 }
 

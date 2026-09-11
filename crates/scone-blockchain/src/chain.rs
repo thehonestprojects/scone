@@ -269,7 +269,8 @@ mod tests {
     use crate::error::BlockchainError;
     use crate::txid::transaction_id;
     use scone_core::{
-        DomainId, DomainName, Proof, RecordHash, RegisterDomain, Transaction, UpdateDomain,
+        DomainId, DomainName, Proof, RecordHash, RegisterDomain, RegisterTld, TldId, TldName,
+        Transaction, UpdateDomain,
     };
     use scone_crypto::{Signature, SigningKey};
     use scone_protocol::codec::{decode_complete, encode_to_vec};
@@ -332,6 +333,19 @@ mod tests {
         )
     }
 
+    fn register_tld_tx(tld: &str, seed: u8) -> Transaction {
+        sign(
+            Transaction::RegisterTld(RegisterTld::register_tld_signed(
+                TldId::from_tld(&TldName::new(tld).unwrap()),
+                1,
+                Proof::from_bytes(Vec::new()),
+                SigningKey::from_bytes([seed; 32]).public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            &SigningKey::from_bytes([seed; 32]),
+        )
+    }
+
     fn make_block(prev: BlockHash, height: u64, txs: Vec<Transaction>) -> Block {
         Block {
             header: BlockHeader {
@@ -380,7 +394,13 @@ mod tests {
     #[test]
     fn valid_blocks_extend_the_chain() {
         let mut chain = Blockchain::new();
-        let b1 = child(&chain, vec![register_domain_tx("example.uip", 1)]);
+        let b1 = child(
+            &chain,
+            vec![
+                register_tld_tx("uip", 1),
+                register_domain_tx("example.uip", 1),
+            ],
+        );
         let h1 = chain.push_block(&b1).unwrap();
         assert_eq!(chain.height(), 1);
         assert_eq!(chain.tip_hash(), h1);
@@ -398,7 +418,13 @@ mod tests {
     fn register_then_update_reaches_the_state() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         chain
             .push_block(&child(&chain, vec![update_domain_tx("example.uip", 1, 1)]))
@@ -421,6 +447,7 @@ mod tests {
             .push_block(&child(
                 &chain,
                 vec![
+                    register_tld_tx("uip", 1),
                     register_domain_tx("example.uip", 1),
                     update_domain_tx("example.uip", 1, 1),
                 ],
@@ -441,6 +468,7 @@ mod tests {
         let b1 = child(
             &left,
             vec![
+                register_tld_tx("uip", 1),
                 register_domain_tx("a.uip", 1),
                 register_domain_tx("b.uip", 2),
             ],
@@ -473,7 +501,10 @@ mod tests {
         let mut chain = Blockchain::new();
         let genesis_hash = chain.tip_hash();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("a.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![register_tld_tx("uip", 1), register_domain_tx("a.uip", 1)],
+            ))
             .unwrap();
 
         // Competing block on the same (now non-tip) genesis parent.
@@ -585,6 +616,7 @@ mod tests {
         let block = child(
             &chain,
             vec![
+                register_tld_tx("uip", 1),
                 register_domain_tx("a.uip", 1),
                 register_domain_tx("b.uip", 2),
                 register_domain_tx("a.uip", 3), // double register: fails
@@ -601,12 +633,13 @@ mod tests {
 
     #[test]
     fn transaction_order_is_significant() {
-        // [register, update] applies; [update, register] does not.
+        // [tld, register, update] applies; [update, register] does not.
         let mut chain = Blockchain::new();
         chain
             .push_block(&child(
                 &chain,
                 vec![
+                    register_tld_tx("uip", 1),
                     register_domain_tx("example.uip", 1),
                     update_domain_tx("example.uip", 1, 1),
                 ],
@@ -628,11 +661,52 @@ mod tests {
     }
 
     #[test]
+    fn tld_then_domain_in_same_block_applies_but_not_the_reverse() {
+        // D1 intra-block ordering (M7c): [RegisterTld, RegisterDomain]
+        // is valid — the namespace exists when the domain claim applies
+        // (transactions apply strictly in block order)…
+        let mut chain = Blockchain::new();
+        chain
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 2),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(chain.height(), 1);
+        assert!(chain.state().domain(&domain_id("example.uip")).is_some());
+        assert!(chain.state().tld(&tld_id_of("uip")).is_some());
+
+        // …while [RegisterDomain, RegisterTld] is rejected whole: at
+        // the moment the domain claim applies, the TLD does not exist
+        // yet, and the undo-log rolls the whole block back.
+        let mut other = Blockchain::new();
+        let block = child(
+            &other,
+            vec![
+                register_domain_tx("example.uip", 2),
+                register_tld_tx("uip", 1),
+            ],
+        );
+        assert_eq!(other.push_block(&block), Err(BlockchainError::UnknownTld));
+        assert_eq!(other.height(), 0);
+        assert!(other.state().is_empty());
+        assert!(other.state().tld_is_empty());
+    }
+
+    fn tld_id_of(tld: &str) -> scone_core::TldId {
+        scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap())
+    }
+
+    #[test]
     fn reversed_transactions_different_block_hash() {
         let mut chain = Blockchain::new();
         let ab = child(
             &chain,
             vec![
+                register_tld_tx("uip", 1),
                 register_domain_tx("a.uip", 1),
                 register_domain_tx("b.uip", 1),
             ],
@@ -640,6 +714,7 @@ mod tests {
         let ba = child(
             &chain,
             vec![
+                register_tld_tx("uip", 1),
                 register_domain_tx("b.uip", 1),
                 register_domain_tx("a.uip", 1),
             ],
@@ -657,7 +732,13 @@ mod tests {
     fn long_update_chain() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         for sequence in 1..=50 {
             chain
@@ -676,7 +757,13 @@ mod tests {
     fn update_from_previous_block_owner_rules_hold() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         // Wrong owner, correct sequence.
         let block = child(&chain, vec![update_domain_tx("example.uip", 2, 1)]);
@@ -739,7 +826,13 @@ mod tests {
         ));
         // The chain still accepts blocks without a `pow.uip` register.
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("other.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("other.uip", 1),
+                ],
+            ))
             .unwrap();
     }
 
@@ -747,7 +840,13 @@ mod tests {
     fn chain_unchanged_after_every_rejection_kind() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         let (height, tip, state) = (chain.height(), chain.tip_hash(), chain.state().clone());
 
@@ -772,7 +871,13 @@ mod tests {
     #[test]
     fn corrupted_encoded_blocks_never_panic() {
         let mut chain = Blockchain::new();
-        let block = child(&chain, vec![register_domain_tx("example.uip", 1)]);
+        let block = child(
+            &chain,
+            vec![
+                register_tld_tx("uip", 1),
+                register_domain_tx("example.uip", 1),
+            ],
+        );
         let bytes = encode_to_vec(&block).unwrap();
         chain.push_block(&block).unwrap();
 
@@ -884,7 +989,13 @@ mod tests {
         // domain belongs to seed 1: NotOwner at application time.
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         let attack = update_domain_tx("example.uip", 2, 1);
         let block = child(&chain, vec![attack]);
@@ -897,7 +1008,13 @@ mod tests {
             let sk = SigningKey::from_bytes([5; 32]);
             let mut chain = Blockchain::new();
             chain
-                .push_block(&child(&chain, vec![register_domain_tx("example.uip", 5)]))
+                .push_block(&child(
+                    &chain,
+                    vec![
+                        register_tld_tx("uip", 1),
+                        register_domain_tx("example.uip", 5),
+                    ],
+                ))
                 .unwrap();
             let _ = sk;
             chain
@@ -926,7 +1043,13 @@ mod tests {
         // are the node store's job.
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .push_block(&child(
+                &chain,
+                vec![
+                    register_tld_tx("uip", 1),
+                    register_domain_tx("example.uip", 1),
+                ],
+            ))
             .unwrap();
         for height in 2..=8 {
             chain

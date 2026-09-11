@@ -56,6 +56,19 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     }
 }
 
+fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
+    sign(
+        Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
 fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
@@ -277,21 +290,27 @@ async fn dns_server_serves_verified_records_over_udp() {
 
     let client = wait_rpc(rpc_port, deadline).await;
 
-    // ---- register + commit a record hash ----------------------------
+    // ---- claim the TLD, then register + commit a record hash ------
+    // (D1, M7c: the namespace must be on-chain before the domain.)
     let sk = SigningKey::from_bytes([9u8; 32]);
     let name = "example.uip";
+    let tld_hex = hex(&encode_to_vec(&register_tld_tx(&sk, "uip")).expect("encode tld"));
+    let resp = request(&client, RpcRequest::SubmitTx { tx_hex: tld_hex }, deadline).await;
+    assert!(resp["txid"].is_string(), "{resp}");
+    wait_for_height(&client, 1, deadline).await;
+
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
-    wait_for_height(&client, 1, deadline).await;
+    wait_for_height(&client, 2, deadline).await;
 
     let record = signed_record(&sk, name, 1);
     let expected_hash = *scone_protocol::record_hash(&record.record).as_bytes();
     let upd_hex =
-        hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode"));
+        hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode update"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex: upd_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
-    wait_for_height(&client, 2, deadline).await;
+    wait_for_height(&client, 3, deadline).await;
 
     // Publish the signed record (DHT + local cache).
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));
