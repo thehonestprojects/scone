@@ -204,9 +204,12 @@ pour argent comptant :
    **cryptographique** (`validate_transaction` : binding
    owner/clé recomputé + `verify_strict` sur le payload signé
    recomputé de zéro, voir `/docs/technical/transactions.md`), puis
-   application à un état de travail ;
-8. commit atomique : tout passe ⇒ bloc ajouté, état remplacé ; la
-   moindre erreur ⇒ chaîne rigoureusement inchangée.
+   application à l'état canonique sous **journal d'annulation**
+   (undo-log : une entrée par transaction appliquée, coût
+   O(transactions du bloc) et non O(domaines)) ;
+8. commit atomique : tout passe ⇒ bloc ajouté, journal jeté ; la
+   moindre erreur ⇒ rembobinage du journal (ordre inverse) et chaîne
+   rigoureusement inchangée, bit à bit.
 
 Aucune fonction de validation ne panique ; toute entrée malformée ou
 hostile produit une `BlockchainError` typée

@@ -233,20 +233,32 @@ impl<C: Consensus> Blockchain<C> {
 
         // Transactions: cryptographic validation (owner/key binding
         // recomputed, signature over the recomputed canonical
-        // payload), consensus hooks and deterministic application, on
-        // a scratch state (atomic per block).
-        // ponytail: full state clone per block; revert-journal if the domain count makes it costly
-        let mut next_state = self.state.clone();
-        for tx in &block.transactions {
-            validate_transaction(tx)?;
-            self.consensus.validate_tx(tx)?;
-            next_state.apply(tx)?;
+        // payload), consensus hooks and deterministic application.
+        // Atomicity per block is provided by an undo journal (one
+        // entry per applied transaction, O(txs per block)) instead of
+        // cloning the whole state per block: on any failure below,
+        // rollback restores the exact pre-push state.
+        let mut journal = crate::state::UndoLog::default();
+        let apply = (|| {
+            for tx in &block.transactions {
+                validate_transaction(tx)?;
+                self.consensus.validate_tx(tx)?;
+                self.state.apply_journaled(tx, &mut journal)?;
+            }
+            Ok(())
+        })();
+
+        match apply {
+            Ok(()) => {}
+            Err(e) => {
+                self.state.rollback(journal);
+                return Err(e);
+            }
         }
 
         self.known_hashes.insert(hash);
         self.canonical.push(block.clone());
         self.tip = hash;
-        self.state = next_state;
         Ok(hash)
     }
 }

@@ -36,6 +36,36 @@ pub struct ChainState {
     domains: HashMap<DomainId, DomainState>,
 }
 
+/// One reversible state change, as recorded by [`ChainState`]'s
+/// undo log while a block is being applied.
+///
+/// Rollback replays the entries in **reverse** order, which restores
+/// the exact pre-block state even when a block registers then
+/// updates the same domain.
+#[derive(Debug, Clone, Copy)]
+enum UndoEntry {
+    /// A `Register` created the domain: rolling back removes it.
+    Register(DomainId),
+    /// An `Update` mutated the domain: rolling back restores `prior`.
+    Update {
+        domain: DomainId,
+        prior: DomainState,
+    },
+}
+
+/// Revert journal of a block application (see
+/// [`ChainState::apply_journaled`]).
+///
+/// Cost model: one entry per applied transaction (O(transactions per
+/// block)), instead of cloning the whole domain map (O(domains)) per
+/// block. Atomicity is identical: rollback restores the exact
+/// pre-block state bit for bit, so two nodes applying the same blocks
+/// still reach the same state (determinism preserved).
+#[derive(Debug, Default)]
+pub(crate) struct UndoLog {
+    entries: Vec<UndoEntry>,
+}
+
 impl ChainState {
     /// Empty state (genesis state: no domain registered).
     #[must_use]
@@ -65,6 +95,9 @@ impl ChainState {
     /// integration, see `scone-storage`). No rule is applied: the
     /// bytes were validated when the block was accepted; the decoded
     /// [`DomainState`] comes from the node's own store.
+    ///
+    /// Not journaled: this is a storage-load path, never part of a
+    /// block application.
     ///
     /// # Errors
     ///
@@ -96,20 +129,49 @@ impl ChainState {
     ///
     /// See [`BlockchainError`]; never panics.
     pub fn apply(&mut self, tx: &Transaction) -> Result<()> {
+        let mut journal = UndoLog::default();
+        match self.apply_journaled(tx, &mut journal) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.rollback(journal);
+                Err(e)
+            }
+        }
+    }
+
+    /// Applies `tx`, recording how to undo it in `journal` (no clone
+    /// of the domain map). Block-level atomicity: the caller (see
+    /// `Blockchain::push_block`) applies every transaction of a block
+    /// into one shared [`UndoLog`] and calls [`ChainState::rollback`]
+    /// with it if anything fails.
+    ///
+    /// On error the state is left unchanged **for this transaction**
+    /// (nothing is journaled past the failing rule); rolling back the
+    /// whole journal is the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// See [`BlockchainError`]; never panics.
+    pub(crate) fn apply_journaled(
+        &mut self,
+        tx: &Transaction,
+        journal: &mut UndoLog,
+    ) -> Result<()> {
         tx.validate()?;
         match tx {
             Transaction::Register(register) => {
                 if self.domains.contains_key(&register.domain_id) {
                     return Err(BlockchainError::DomainAlreadyRegistered);
                 }
-                self.domains.insert(
-                    register.domain_id,
-                    DomainState {
-                        owner: register.owner,
-                        sequence: 0,
-                        record_hash: None,
-                    },
-                );
+                let new_state = DomainState {
+                    owner: register.owner,
+                    sequence: 0,
+                    record_hash: None,
+                };
+                self.domains.insert(register.domain_id, new_state);
+                journal
+                    .entries
+                    .push(UndoEntry::Register(register.domain_id));
             }
             Transaction::Update(update) => {
                 let state = self
@@ -133,11 +195,30 @@ impl ChainState {
                         got: update.sequence,
                     });
                 }
+                journal.entries.push(UndoEntry::Update {
+                    domain: update.domain_id,
+                    prior: *state,
+                });
                 state.sequence = expected;
                 state.record_hash = Some(update.record_hash);
             }
         }
         Ok(())
+    }
+
+    /// Undoes every journaled change, most recent first, restoring
+    /// the exact state captured before the journal started.
+    pub(crate) fn rollback(&mut self, journal: UndoLog) {
+        for entry in journal.entries.into_iter().rev() {
+            match entry {
+                UndoEntry::Register(domain) => {
+                    self.domains.remove(&domain);
+                }
+                UndoEntry::Update { domain, prior } => {
+                    self.domains.insert(domain, prior);
+                }
+            }
+        }
     }
 }
 

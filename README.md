@@ -1,140 +1,93 @@
 # Scone
 
-Scone est un protocole DNS décentralisé P2P.
+**DNS décentralisé, sans registrar.** Un nom de domaine se réclame, il ne
+s'achète pas : la propriété est cryptographique, inscrite sur une blockchain,
+et les données DNS sont servies par un réseau de pairs.
 
-Le DNS traditionnel repose sur des registrars, des registres et une chaîne
-de délégation centralisée. Scone supprime le registrar central : la
-propriété d'un nom est cryptographique, inscrite sur une blockchain, et les
-données DNS elles-mêmes sont servies depuis une DHT par des nœuds pairs.
+## Pourquoi Scone
 
-- **Pas de registrar central** — un nom se réclame, il ne s'achète pas auprès d'une autorité.
-- **Propriété cryptographique** — un nom appartient à qui détient la clé qui l'a enregistré ; toute mise à jour doit être signée.
-- **Blockchain pour l'autorité et l'ordre** — ownership, autorisation, séquences et record hashes relèvent du consensus. La chaîne est la source de vérité sur *qui possède quoi* et *dans quel ordre*.
-- **DHT pour les données DNS** — les enregistrements complets sont répliqués entre pairs ; la DHT fournit de la disponibilité, pas de l'autorité. Un nœud considère les données DHT comme non fiables tant qu'elles ne sont pas vérifiées cryptographiquement contre la chaîne.
-- **Nœuds P2P** — tout nœud peut résoudre, servir et répliquer.
-- **Local-first** — chaque nœud conserve son état, ses index et ses caches localement et peut opérer de façon autonome.
-- **Très grande échelle** — la chaîne reste fine (des hashs, pas des payloads) ; la DHT absorbe le volume.
+- **Pas d'autorité centrale à payer ou à convaincre** — le registrar est
+  remplacé par une chaîne : un nom appartient à qui détient la clé qui l'a
+  enregistré, point final. Toute modification doit être signée par cette clé.
+- **Impossible à falsifier silencieusement** — la chaîne est la source de
+  vérité (*qui possède quoi, dans quel ordre*) ; les records circulant sur la
+  DHT ne sont jamais crus : chaque nœud les re-vérifie cryptographiquement
+  contre la chaîne avant de les servir. Un record falsifié est simplement
+  ignoré.
+- **Résistant et local-first** — pas de serveur à abattre : chaque nœud est
+  autonome (état, index, caches locaux), tout nœud peut résoudre, servir et
+  répliquer.
+- **Conçu pour l'échelle** — la chaîne reste fine (des hashs, pas des
+  payloads) ; la DHT absorbe le volume. Empreinte mémoire maîtrisée :
+  persistance redb avec curseurs, jamais tout en RAM.
 
-```text
-                 Scone
-                   │
-       ┌───────────┴───────────┐
-       │                       │
-  Blockchain                  DHT
-       │                       │
- ownership/order          DNS records
-       │                       │
-       └───────────┬───────────┘
-                   │
-                Node
-                   │
-                  DNS
-```
+## Pourquoi laisser tourner un relay
 
-## Crates
+Chaque relay fait vivre le réseau :
 
-| Crate | Rôle |
-|---|---|
-| `scone-core` | Types purs du protocole : noms, identifiants, records DNS, transactions |
-| `scone-crypto` | Primitives cryptographiques (hash BLAKE3, clés/signatures Ed25519 RFC 8032) |
-| `scone-protocol` | Format binaire canonique wire/blockchain : encodage/décodage des transactions, records DNS, blocs et messages P2P |
-| `scone-blockchain` | Logique de chaîne et état canonique en RAM (validation des transactions, Merkle, chaîne de blocs) |
-| `scone-storage` | Persistance locale (trait `NodeStore` + backend redb) |
-| `scone-keystore` | Clés Ed25519 chiffrées sur disque (Argon2id + XChaCha20-Poly1305) |
-| `scone-network` | Relay P2P libp2p (swarm QUIC, sync blocs, DHT Kademlia, RPC de contrôle) |
-| `scone` | Binaire / CLI (`scone relay/status/submit/lookup/record`, `scone identity …`, `scone tx build/sign/verify`) |
-
-Documentation : [`docs/README.md`](docs/README.md) (plan complet) — volet
-général « comment ça marche » :
-[`docs/general/architecture.md`](docs/general/architecture.md),
-[`docs/general/naming.md`](docs/general/naming.md) ; volet technique
-développeurs : [`docs/technical/protocol.md`](docs/technical/protocol.md),
-[`docs/technical/blockchain.md`](docs/technical/blockchain.md),
-[`docs/technical/transactions.md`](docs/technical/transactions.md), etc.
-
-## Status
-
-Early development — **Jalon M5 (exploration réseau riche et CLI signé) atteint**.
-
-En place :
-
-- **Types purs** (`scone-core`) : noms, `DomainId`, records DNS,
-  transactions **signées v2** (`public_key` + `signature`,
-  owner recomputé), `OwnerId`.
-- **Primitives cryptographiques** (`scone-crypto`) : `hash256`
-  (BLAKE3), clés et signatures **Ed25519** (`ed25519-dalek` 3.0,
-  vecteurs de test RFC 8032, vérification stricte).
-- **Format binaire canonique** (`scone-protocol`) : transactions
-  **signées v2** (payload `SCONE-TX-SIG-V1`, bornes strictes pk
-  32 o / signature 64 o, rejet explicite du format v1), records DNS,
-  blocs, messages P2P, limites, version 2.
-- **Blockchain** (`scone-blockchain`) : chaîne, état canonique en
-  RAM, racines Merkle, bloc genesis, **validation cryptographique des
-  transactions** (binding owner/clé + `verify_strict`), BlockBuilder,
-  cadre de consensus (le consensus réel — PoW/difficulté/fork choice
-  — reste à implémenter).
-- **Keystore chiffré** (`scone-keystore`) : keyfiles `.sconekey`
-  (Argon2id + XChaCha20-Poly1305), voir
-  [`docs/technical/keystore.md`](docs/technical/keystore.md).
-- **Stockage persistant** (`scone-storage`, M3) : trait `NodeStore` +
-  backend redb (appends delta atomiques, états paginés), voir
-  [`docs/technical/storage.md`](docs/technical/storage.md).
-- **Relay réseau** (`scone-network`, M4) : nœud libp2p complet —
-  QUIC, identify, ping, Kademlia (records DNS signés), sync de blocs
-  bornée, mempool, production devnet, RPC de contrôle local. Voir
-  [`docs/technical/relay.md`](docs/technical/relay.md).
-- **Exploration riche + CLI signé** (M5) : RPC `domain_info`
-  (état on-chain + records DNS vérifiés en lecture locale), commandes
-  `scone domain register|update` (build → sign → submit →
-  confirmation en une invocation ; le fichier de records est
-  l'unique source de vérité : séquence et record hash dérivés), et
-  tests e2e multi-nœuds pilotant le **binaire réel**.
-- **CLI** (`scone`) : `scone show <name>`, `scone identity …`,
-  `scone tx build/sign/verify`, `scone relay` (daemon),
-  `scone status / lookup / domain register|update|info /
-  submit tx / record put|get` (parlent au RPC du relay).
-
-Non implémentés : PoW/consensus réel, serveur DNS, gouvernance des
-forks, identité réseau persistante du relay.
-
-## Essayer le relay (devnet)
+- **Vous servez le DNS décentralisé** — votre nœud répond aux requêtes DNS
+  des autres (serveur UDP intégré) et réplique les records : plus de relays,
+  plus de disponibilité et de résilience pour tout le monde.
+- **Vous renforcez la sécurité collective** — chaque relay est un validateur
+  de plus : blocs et transactions re-validés intégralement, données DHT
+  re-vérifiées contre la chaîne. Un réseau de relays honnêtes rend la
+  censure et la corruption pratiquement impossibles.
+- **C'est léger et sûr** — un process unique, stockage local borné, clés
+  chiffrées au repos, aucune donnée personnelle. Vous gardez le contrôle :
+  tout est local, rien n'est téléphoné.
 
 ```bash
-# Terminal 1 — le nœud
-scone relay --data-dir /tmp/node-a
-
-# Terminal 2 — enregistrer un nom et publier ses records
-scone identity generate --name alice
-scone domain register example.uip --identity alice
-
-printf 'A 192.0.2.1\nTXT hello scone\n' > /tmp/records.txt
-scone domain update example.uip --file /tmp/records.txt --identity alice
-
-# Explorer
-scone domain info example.uip     # état on-chain + records DNS
-scone lookup example.uip          # état on-chain seul
+scone relay              # c'est tout. Logs sur stderr, adresse p2p sur stdout.
 ```
 
-Deux nœuds sur une machine : `scone relay --rpc 127.0.0.1:7475
---data-dir /tmp/node-b --bootstrap <addr-p2p-de-A>` (le relay
-affiche son adresse p2p au démarrage), puis ajoutez `--rpc
-127.0.0.1:7475` aux commandes ci-dessus pour parler au nœud B.
+## Utiliser le CLI
 
-### Logging
+```bash
+# Identités (clés Ed25519 chiffrées sur disque)
+scone identity generate --name alice
+scone identity list
+scone identity show --name alice
 
-Les logs vont **sur stderr** (stdout reste réservé aux sorties de
-commandes — fiable en script). Verbosité : `-v` (info), `-vv`
-(debug), `-vvv` (trace) ; sans `-v`, les commandes one-shot loggent
-à WARN et `scone relay` reste à INFO (un daemon doit logger son
-activité). `RUST_LOG` (syntaxe env-filter) remplace ces défauts,
-par ex. `RUST_LOG=scone_network=trace scone relay`. Détails :
-[`docs/technical/cli.md`](docs/technical/cli.md).
+# Domaines
+scone domain register example.uip --identity alice
+printf 'A 192.0.2.1\nTXT "hello scone"\n' > records.txt
+scone domain update example.uip --file records.txt --identity alice
+scone domain info example.uip      # exploration : état chaîne + records vérifiés
+scone lookup example.uip           # état on-chain seul
+scone show example.uip             # DomainId (hex)
+
+# Records DNS (DHT)
+scone record get example.uip       # résolution + vérification cryptographique
+scone record put <hex>
+
+# Réseau
+scone relay                        # lancer un nœud (voir ci-dessus)
+scone status                       # tip, hauteur, pairs, domaines
+scone dig example.uip --dns <addr> # requête DNS réelle au serveur du relay
+
+# Transactions (avancé / hors-ligne)
+scone tx build | sign | verify
+scone submit tx --hex <hex>
+```
+
+La mise à jour des records est **atomique** : le fichier est l'unique source
+de vérité, l'ensemble remplace le précédent en une transaction signée.
+
+Documentation complète : [`docs/README.md`](docs/README.md) — volet
+[général](docs/general/architecture.md) (« comment ça marche ») et volet
+[technique](docs/technical/protocol.md) (formats, invariants, développeurs).
+
+## Statut
+
+Devnet fonctionnel de bout en bout : identités, transactions signées,
+blockchain locale, stockage persistant, réseau P2P multi-nœuds, serveur DNS
+UDP. Consensus réel (PoW/sélection de producteur) non implémenté — voir
+[docs](docs/README.md) pour l'état détaillé.
 
 ## Développement
 
 ```bash
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace && cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
