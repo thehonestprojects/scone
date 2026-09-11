@@ -79,9 +79,49 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
 fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
     sign(
         Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            scone_core::TldName::new(tld).expect("valid tld"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_tld_proof(tld),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
+/// Mines a testnet TLD registration proof (M8b).
+fn mined_tld_proof(tld: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+    challenge.extend_from_slice(tld.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.tld_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Mines a testnet domain registration proof (M8b).
+fn mined_domain_proof(name: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+    challenge.extend_from_slice(name.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.domain_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Signs a SetTldOpen tx (M8b: a fresh TLD is closed; the canonical
+/// domain-registration fixture opens it).
+fn set_tld_open_tx(sk: &SigningKey, tld: &str, open: bool) -> Transaction {
+    sign(
+        Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            open,
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -94,7 +134,7 @@ fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
             DomainName::new(name).expect("valid name"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_domain_proof(name),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -319,10 +359,17 @@ async fn dns_server_serves_verified_records_over_udp() {
     assert!(resp["txid"].is_string(), "{resp}");
     wait_for_height(&client, 1, deadline).await;
 
+    // M8b: a fresh TLD is closed (assign-only); open it for
+    // self-registration.
+    let open_hex = hex(&encode_to_vec(&set_tld_open_tx(&sk, "uip", true)).expect("encode open"));
+    let resp = request(&client, RpcRequest::SubmitTx { tx_hex: open_hex }, deadline).await;
+    assert!(resp["txid"].is_string(), "{resp}");
+    wait_for_height(&client, 2, deadline).await;
+
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
-    wait_for_height(&client, 2, deadline).await;
+    wait_for_height(&client, 3, deadline).await;
 
     let record = signed_record(&sk, name, 1);
     let expected_hash = *scone_protocol::record_hash(&record.record).as_bytes();
@@ -330,7 +377,7 @@ async fn dns_server_serves_verified_records_over_udp() {
         hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode update"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex: upd_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
-    wait_for_height(&client, 3, deadline).await;
+    wait_for_height(&client, 4, deadline).await;
 
     // Publish the signed record (DHT + local cache).
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));

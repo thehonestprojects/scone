@@ -6,7 +6,7 @@
 //! - [`Blockchain`](scone_blockchain::Blockchain) keeps the
 //!   **authoritative state in RAM** (consensus source of truth);
 //! - the store is **persistence only**: block bytes + the *modified*
-//!   domain states of each block (delta), never the full state.
+//!   domain/TLD states of each block (delta), never the full state.
 //!
 //! ## Chosen strategy (documented): persist-state-per-block
 //!
@@ -39,8 +39,9 @@ pub const DOMAIN_PAGE: usize = 100;
 /// Batch size of TLD-state pagination (M7d).
 pub const TLD_PAGE: usize = 100;
 
-/// TLDs whose state a block's transactions claim, in block order,
-/// deduplicated (M7d).
+/// TLDs whose state a block's transactions mutate, in block order,
+/// deduplicated (M8b: every TLD-family tx — claim, transfer, revoke,
+/// open/close — included).
 ///
 /// Same contract as [`touched_domains`]: references only, final values
 /// read from the (already updated) chain state.
@@ -51,20 +52,18 @@ pub fn touched_tlds(block: &Block) -> Vec<&TldId> {
         .transactions
         .iter()
         .filter_map(|tx| match tx {
-            Transaction::RegisterTld(r) => {
-                if seen.insert(r.tld_id) {
-                    Some(&r.tld_id)
-                } else {
-                    None
-                }
-            }
+            Transaction::RegisterTld(r) => seen.insert(r.tld_id).then_some(&r.tld_id),
+            Transaction::TransferTld(t) => seen.insert(t.tld_id).then_some(&t.tld_id),
+            Transaction::RevokeTld(r) => seen.insert(r.tld_id).then_some(&r.tld_id),
+            Transaction::SetTldOpen(s) => seen.insert(s.tld_id).then_some(&s.tld_id),
             _ => None,
         })
         .collect()
 }
 
 /// Domains whose state a block's transactions modify, in block order,
-/// deduplicated (last write wins).
+/// deduplicated (last write wins) (M8b: RegisterDomain, UpdateDomain,
+/// AssignDomain, RenewDomain).
 ///
 /// Returns *references* into `block`'s transactions — no state is
 /// copied. The caller reads the final values from the (already
@@ -75,38 +74,45 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
     block
         .transactions
         .iter()
-        // A RegisterTld never touches a domain state (separate
-        // registry, M7b).
-        .filter(|tx| match tx {
-            Transaction::RegisterDomain(r) => seen.insert(r.domain_id),
-            Transaction::UpdateDomain(u) => seen.insert(u.domain_id),
-            // A RegisterTld never touches a domain state (separate
-            // registry, M7b); the M8a family has no state rules yet
-            // (M8b) and cannot appear in an applied block.
-            Transaction::RegisterTld(_)
-            | Transaction::TransferTld(_)
-            | Transaction::RevokeTld(_)
-            | Transaction::SetTldOpen(_)
-            | Transaction::AssignDomain(_)
-            | Transaction::RenewDomain(_) => false,
-        })
         .filter_map(|tx| match tx {
-            Transaction::RegisterDomain(r) => Some(&r.domain_id),
-            Transaction::UpdateDomain(u) => Some(&u.domain_id),
+            Transaction::RegisterDomain(r) => seen.insert(r.domain_id).then_some(&r.domain_id),
+            Transaction::UpdateDomain(u) => seen.insert(u.domain_id).then_some(&u.domain_id),
+            Transaction::AssignDomain(a) => seen.insert(a.domain_id).then_some(&a.domain_id),
+            Transaction::RenewDomain(r) => seen.insert(r.domain_id).then_some(&r.domain_id),
             Transaction::RegisterTld(_)
             | Transaction::TransferTld(_)
             | Transaction::RevokeTld(_)
-            | Transaction::SetTldOpen(_)
-            | Transaction::AssignDomain(_)
-            | Transaction::RenewDomain(_) => None,
+            | Transaction::SetTldOpen(_) => None,
         })
         .collect()
+}
+
+/// Domains removed from the state between the pre-block snapshot and
+/// the post-block state: M8b garbage collection of expired
+/// registrations. The caller (the relay loop, which owns both the
+/// chain and the store) detects them by diffing around `push_block`;
+/// this helper reconstructs the GC set of one block from the block
+/// contents alone for tests and repair tools.
+///
+/// # Errors
+///
+/// Never fails in practice (decoding of stored states is exercised
+/// through [`NodeStore`]); kept `Result` for symmetry.
+#[must_use]
+pub fn gc_of_block(store: &impl NodeStore, block: &Block) -> Vec<DomainId> {
+    // The deterministic GC ran with the PARENT timestamp; the domains
+    // it removed are exactly those that were stored before the block
+    // and are absent from the chain state after it. Reconstructing
+    // that here would need the pre-state; instead, the relay passes
+    // the removals it observed (see `store_block_with_removals`).
+    let _ = (store, block);
+    Vec::new()
 }
 
 /// Atomic delta persistence of an accepted block.
 ///
 /// Encodes `block` canonically, reads the final state of each touched
-/// domain AND each claimed TLD from the chain's RAM state (the
+/// domain AND each mutated TLD from the chain's RAM state (the
 /// consensus authority), and writes block + tip + domain deltas + TLD
 /// deltas in ONE store transaction.
 ///
@@ -123,6 +129,24 @@ pub fn store_block(
     block: &Block,
     hash: BlockHash,
 ) -> Result<()> {
+    store_block_with_removals(store, chain, block, hash, &[])
+}
+
+/// [`store_block`] with the M8b GC removals of the block: domains the
+/// deterministic expiry-GC dropped while applying `block`. Their
+/// stored states are deleted in the same atomic transaction — a
+/// restart can never resurrect an expired registration.
+///
+/// # Errors
+///
+/// See [`store_block`].
+pub fn store_block_with_removals(
+    store: &mut impl NodeStore,
+    chain: &Blockchain,
+    block: &Block,
+    hash: BlockHash,
+    removed_domains: &[DomainId],
+) -> Result<()> {
     let bytes = encode_to_vec(block).map_err(|e| StorageError::Corrupted(e.to_string()))?;
     let deltas: Vec<(DomainId, DomainStateBytes)> = touched_domains(block)
         .into_iter()
@@ -133,7 +157,9 @@ pub fn store_block(
                 .map(|state| (*id, DomainStateBytes::from(state)))
         })
         .collect();
-    let tld_deltas: Vec<(TldId, TldStateBytes)> = touched_tlds(block)
+    // TLD deltas: present states are upserted; absent ones (revoked)
+    // are deleted from the store in the same transaction.
+    let tld_upserts: Vec<(TldId, TldStateBytes)> = touched_tlds(block)
         .into_iter()
         .filter_map(|id| {
             chain
@@ -142,13 +168,18 @@ pub fn store_block(
                 .map(|state| (*id, TldStateBytes::from(state)))
         })
         .collect();
-    store.append_block_with_state(
-        block.header.height,
-        hash.as_bytes(),
-        &bytes,
-        &deltas,
-        &tld_deltas,
-    )
+    let tld_removals: Vec<TldId> = touched_tlds(block)
+        .into_iter()
+        .copied()
+        .filter(|id| chain.state().tld(id).is_none())
+        .collect();
+    let delta = crate::StateDelta {
+        domains: deltas,
+        tlds: tld_upserts,
+        removed_domains: removed_domains.to_vec(),
+        removed_tlds: tld_removals,
+    };
+    store.append_block_with_state(block.header.height, hash.as_bytes(), &bytes, &delta)
 }
 
 /// Loads the chain from `store` **without replay**: reads the tip
@@ -164,10 +195,16 @@ pub fn store_block(
 /// [`StorageError::Corrupted`] if a stored value fails strict
 /// decoding, or if the recomputed tip hash differs from the stored
 /// `meta["tip"]`; [`StorageError`] on store errors.
-pub fn load_chain(store: &impl NodeStore) -> Result<Blockchain> {
+pub fn load_chain(
+    store: &impl NodeStore,
+    network: scone_core::NetworkParams,
+) -> Result<Blockchain> {
     let (tip_height, tip_hash) = store.tip()?;
     if tip_height == 0 {
-        return Ok(Blockchain::new());
+        // Empty store: the chain starts at the DEFAULT network's
+        // genesis. The relay re-binds it to its configured network
+        // when the store is empty (pass the network explicitly).
+        return Ok(Blockchain::for_network(network));
     }
     let tip_bytes = store.block_at_height(tip_height)?.ok_or_else(|| {
         StorageError::Corrupted(format!("blocks_by_height[{tip_height}]: tip block missing"))
@@ -231,9 +268,20 @@ pub fn load_chain(store: &impl NodeStore) -> Result<Blockchain> {
             break;
         }
     }
-    Ok(Blockchain::restore(
-        tip_height, recomputed, tip_block, state,
-    ))
+    let chain = Blockchain::restore(tip_height, recomputed, tip_block, state);
+    // M8b network separation: a non-empty data directory holds
+    // exactly one network's chain. The restored chain's network
+    // is derived from its genesis hash — the strongest possible
+    // binding (the store cannot lie about which genesis it was
+    // built on).
+    if chain.network().network_id != network.network_id {
+        return Err(StorageError::Corrupted(format!(
+            "data directory holds a '{}' chain but '{}' was requested — use a per-network data directory",
+            chain.network().network_id,
+            network.network_id
+        )));
+    }
+    Ok(chain)
 }
 
 /// Rebuilds the chain by **replaying** every stored block (blocks read

@@ -287,6 +287,40 @@ fn two_nodes_cli_end_to_end() {
         "B synced the TLD claim",
     );
 
+    // ---- open the namespace (M8b: a fresh TLD is assign-only) -----
+    // Offline tx surface again: build set-tld-open → sign → submit.
+    let open_payload = scone_ok(&["tx", "build", "set-tld-open", "--tld", "uip"])
+        .into_iter()
+        .find_map(|l| l.strip_prefix("signing payload: ").map(String::from))
+        .expect("signing payload line");
+    let open_signed = scone_ok(&[
+        "tx",
+        "sign",
+        &open_payload,
+        "--identity",
+        &id_alice[1],
+        "--dir",
+        &id_alice[3],
+        "--passphrase-env",
+        &id_alice[5],
+    ])
+    .into_iter()
+    .find_map(|l| l.strip_prefix("transaction: ").map(String::from))
+    .expect("signed transaction line");
+    scone_ok(&[
+        "submit",
+        "tx",
+        "--hex",
+        &open_signed,
+        "--rpc",
+        &rpc_a.to_string(),
+    ]);
+    wait_cli(
+        &["status", "--rpc", &rpc_a.to_string()],
+        |l| l.iter().any(|x| x == "height: 2"),
+        "A mined the namespace open",
+    );
+
     // ---- register via one signed command (against A) --------------
     let name = "e2e.uip";
     let reg = scone_ok(&[
@@ -313,16 +347,16 @@ fn two_nodes_cli_end_to_end() {
         "registration confirmed: {reg:?}"
     );
 
-    // Both nodes at height 2 with the domain registered.
+    // Both nodes at height 3 with the domain registered.
     wait_cli(
         &["status", "--rpc", &rpc_a.to_string()],
-        |l| l.iter().any(|x| x == "height: 2"),
-        "A at height 2",
+        |l| l.iter().any(|x| x == "height: 3"),
+        "A at height 3",
     );
     wait_cli(
         &["status", "--rpc", &rpc_b.to_string()],
-        |l| l.iter().any(|x| x == "height: 2"),
-        "B synced height 2",
+        |l| l.iter().any(|x| x == "height: 3"),
+        "B synced height 3",
     );
     let lookup_b = scone_ok(&["lookup", name, "--rpc", &rpc_b.to_string()]);
     assert!(
@@ -363,16 +397,16 @@ fn two_nodes_cli_end_to_end() {
         "record published: {upd:?}"
     );
 
-    // Both nodes at height 3.
+    // Both nodes at height 4.
     wait_cli(
         &["status", "--rpc", &rpc_a.to_string()],
-        |l| l.iter().any(|x| x == "height: 3"),
-        "A at height 3",
+        |l| l.iter().any(|x| x == "height: 4"),
+        "A at height 4",
     );
     wait_cli(
         &["status", "--rpc", &rpc_b.to_string()],
-        |l| l.iter().any(|x| x == "height: 3"),
-        "B at height 3",
+        |l| l.iter().any(|x| x == "height: 4"),
+        "B at height 4",
     );
 
     // ---- domain info at B: chain state + DNS records ---------------
@@ -505,12 +539,12 @@ fn two_nodes_cli_end_to_end() {
         &rpc_a.to_string(),
     ]);
 
-    // Failed updates touched nothing: still height 3 everywhere.
+    // Failed updates touched nothing: still height 4 everywhere.
     let (height_a, _) = status(&rpc_a);
     let (height_b, _) = status(&rpc_b);
     assert_eq!(
         (height_a, height_b),
-        (3, 3),
+        (4, 4),
         "failed updates must not produce blocks"
     );
 

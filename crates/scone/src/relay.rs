@@ -10,6 +10,7 @@ use crate::rpc::DEFAULT_RPC_ADDR;
 /// Runs `scone relay …` (foreground daemon).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_relay(
+    network: String,
     data_dir: Option<PathBuf>,
     listen: Option<String>,
     bootstrap: Vec<String>,
@@ -17,11 +18,20 @@ pub(crate) fn run_relay(
     dns: Option<String>,
     dns_upstream: Vec<String>,
 ) -> Result<Vec<String>, CliError> {
+    // M8b: named network — testnet is the development default,
+    // mainnet must be explicit.
+    let network = scone_core::NetworkParams::by_name(&network).ok_or_else(|| {
+        CliError::RelayError(format!(
+            "unknown network '{network}' (expected 'testnet' or 'mainnet')"
+        ))
+    })?;
+    // Per-network data directory: chains NEVER mix on disk.
     let data_dir = data_dir.unwrap_or_else(|| match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".scone"),
-        None => PathBuf::from(".scone"),
+        Some(home) => PathBuf::from(home).join(".scone").join(network.dir_name()),
+        None => PathBuf::from(".scone").join(network.dir_name()),
     });
     let mut config = scone_network::Config::new(data_dir);
+    config.network = network;
     if let Some(listen) = listen {
         config.listen = Some(listen);
     }

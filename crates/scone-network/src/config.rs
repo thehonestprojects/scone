@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use scone_core::{NetworkParams, TESTNET};
+
 /// Default mempool capacity (transactions). The mempool is a strict
 /// LRU-ish bounded structure: beyond this, new transactions are
 /// rejected until blocks consume the queue.
@@ -31,8 +33,15 @@ const _: () = assert!(MAX_RPC_CONNECTIONS > 0);
 /// Configuration of a relay.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Data directory (`chain.redb` lives here).
+    /// Data directory (`chain.redb` lives here). The caller is
+    /// responsible for giving each network its own directory (the
+    /// CLI does: `~/.scone/testnet/`, `~/.scone/mainnet/`).
     pub data_dir: PathBuf,
+    /// The network this relay belongs to (M8b): testnet by default
+    /// while the project is in development; `mainnet` must be
+    /// explicit. Drives the genesis, the PoW difficulties and the
+    /// `WrongNetwork` rejection of foreign transactions.
+    pub network: NetworkParams,
     /// P2P listen address (e.g. `/ip4/0.0.0.0/udp/0/quic-v1`).
     pub listen: Option<String>,
     /// Bootstrap multiaddrs dialed at startup.
@@ -57,6 +66,7 @@ impl Config {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
+            network: TESTNET,
             listen: None,
             bootstrap: Vec::new(),
             mempool_capacity: DEFAULT_MEMPOOL_CAPACITY,
@@ -75,6 +85,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let config = Config::new(PathBuf::from("/tmp/x"));
+        assert_eq!(config.network, TESTNET);
         assert_eq!(config.mempool_capacity, DEFAULT_MEMPOOL_CAPACITY);
         assert_eq!(config.produce_interval, DEFAULT_PRODUCE_INTERVAL);
         assert_eq!(config.rpc_addr.port(), 0);

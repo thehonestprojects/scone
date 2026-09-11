@@ -71,9 +71,49 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
 fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
     sign(
         Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            scone_core::TldName::new(tld).expect("valid tld"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_tld_proof(tld),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
+/// Mines a testnet TLD registration proof (M8b).
+fn mined_tld_proof(tld: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+    challenge.extend_from_slice(tld.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.tld_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Mines a testnet domain registration proof (M8b).
+fn mined_domain_proof(name: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+    challenge.extend_from_slice(name.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.domain_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Signs a SetTldOpen tx (M8b: a fresh TLD is closed; the canonical
+/// domain-registration fixture opens it).
+fn set_tld_open_tx(sk: &SigningKey, tld: &str, open: bool) -> Transaction {
+    sign(
+        Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            open,
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -86,7 +126,7 @@ fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
             DomainName::new(name).expect("valid name"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_domain_proof(name),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -199,8 +239,25 @@ async fn two_nodes_sync_blocks_and_records() {
     );
     let status_a = wait_for_height(&client_a, 1, deadline).await;
     assert_eq!(status_a["domain_count"], 0, "{status_a}");
+    // M8b: open the namespace (a fresh TLD is assign-only).
+    let open_hex = hex(&encode_to_vec(&set_tld_open_tx(&sk, "uip", true)).expect("encode open"));
+    let response = request(
+        &client_a,
+        RpcRequest::SubmitTx { tx_hex: open_hex },
+        deadline,
+    )
+    .await;
+    assert!(
+        response["txid"].as_str().is_some_and(|t| t.len() == 64),
+        "open txid expected: {response}"
+    );
+    let status_a = wait_for_height(&client_a, 2, deadline).await;
+    assert_eq!(status_a["domain_count"], 0, "{status_a}");
     let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
-    assert_eq!(status_b["height"], 1, "B synced the TLD block: {status_b}");
+    assert_eq!(
+        status_b["height"], 2,
+        "B synced the claim+open blocks: {status_b}"
+    );
 
     // ---- submit a RegisterDomain to A -------------------------------------
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
@@ -218,12 +275,12 @@ async fn two_nodes_sync_blocks_and_records() {
     );
 
     // Wait for A to produce the block (devnet: ≤ ~2 s).
-    let status_a = wait_for_height(&client_a, 2, deadline).await;
+    let status_a = wait_for_height(&client_a, 3, deadline).await;
     assert_eq!(status_a["domain_count"], 1, "{status_a}");
 
     // ---- B syncs the block -------------------------------------------
     let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
-    assert_eq!(status_b["height"], 2, "B synced: {status_b}");
+    assert_eq!(status_b["height"], 3, "B synced: {status_b}");
     assert_eq!(status_b["tip"], status_a["tip"], "same tip hash");
 
     // lookup at B: the domain registered via A is visible.
@@ -254,9 +311,9 @@ async fn two_nodes_sync_blocks_and_records() {
     .await;
     assert!(response["txid"].is_string(), "{response}");
 
-    let status_a = wait_for_height(&client_a, 3, deadline).await;
+    let status_a = wait_for_height(&client_a, 4, deadline).await;
     let status_b = wait_for_same_tip(&client_b, &status_a, deadline).await;
-    assert_eq!(status_b["height"], 3, "B synced block 3: {status_b}");
+    assert_eq!(status_b["height"], 4, "B synced block 4: {status_b}");
 
     // Publish the signed record in the DHT via A's RPC.
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));
@@ -311,7 +368,16 @@ async fn concurrent_registers_never_kill_the_producer() {
     let tld_hex = hex(&encode_to_vec(&register_tld_tx(&tld_sk, "uip")).expect("encode tld"));
     let response = request(&client, RpcRequest::SubmitTx { tx_hex: tld_hex }, deadline).await;
     assert!(response["txid"].is_string(), "{response}");
+    // The claim block must exist before the namespace can be opened
+    // (SetTldOpen prechecks against the registry).
     let status = wait_for_height(&client, 1, deadline).await;
+    assert_eq!(status["domain_count"], 0, "{status}");
+    // M8b: open the namespace before the concurrent claims.
+    let open_hex =
+        hex(&encode_to_vec(&set_tld_open_tx(&tld_sk, "uip", true)).expect("encode open"));
+    let response = request(&client, RpcRequest::SubmitTx { tx_hex: open_hex }, deadline).await;
+    assert!(response["txid"].is_string(), "{response}");
+    let status = wait_for_height(&client, 2, deadline).await;
     assert_eq!(status["domain_count"], 0, "{status}");
 
     // Two DIFFERENT owners race for the same name; both pass the
@@ -325,11 +391,11 @@ async fn concurrent_registers_never_kill_the_producer() {
         assert!(response["txid"].is_string(), "{response}");
     }
 
-    // Height 2 gets mined with EXACTLY one of the two (the block must
+    // Height 3 gets mined with EXACTLY one of the two (the block must
     // apply cleanly); the relay stays alive and keeps answering. The
     // loser is either still pooled or already evicted by a later
     // production tick (both are non-fatal outcomes).
-    let status = wait_for_height(&client, 2, deadline).await;
+    let status = wait_for_height(&client, 3, deadline).await;
     assert_eq!(status["domain_count"], 1, "{status}");
     assert!(
         status["mempool"].as_u64().is_some_and(|m| m <= 1),
@@ -347,12 +413,12 @@ async fn concurrent_registers_never_kill_the_producer() {
     );
 
     // The relay must still work afterwards: a fresh register of a
-    // DIFFERENT name goes through (height 3, still alive).
+    // DIFFERENT name goes through (height 4, still alive).
     let third = SigningKey::from_bytes([0x33; 32]);
     let tx_hex = hex(&encode_to_vec(&register_tx_sk(&third, "after.uip")).expect("encode"));
     let response = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
     assert!(response["txid"].is_string(), "{response}");
-    let status = wait_for_height(&client, 3, deadline).await;
+    let status = wait_for_height(&client, 4, deadline).await;
     assert_eq!(status["domain_count"], 2, "{status}");
 }
 

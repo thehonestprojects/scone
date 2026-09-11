@@ -19,6 +19,7 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
         match &mut tx {
             Transaction::RegisterDomain(r) => r.signature = sig,
             Transaction::RegisterTld(t) => t.signature = sig,
+            Transaction::SetTldOpen(t) => t.signature = sig,
             _ => unreachable!("test helper"),
         }
         tx
@@ -28,18 +29,59 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
 }
 
 /// Signs a `RegisterTld` for `tld` (needed since M7c: a domain can
-/// only be registered under a known TLD).
+/// only be registered under a known TLD; M8b: registration requires
+/// a mined PoW and an OPEN namespace).
 fn signed_register_tld(sk: &SigningKey, tld: &str) -> Transaction {
     sign(
         Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+            scone_core::TldName::new(tld).unwrap(),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_tld_proof(tld),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
         sk,
     )
+}
+
+/// Signs a `SetTldOpen` opening the namespace (M8b: a fresh TLD is
+/// assign-only; `RegisterDomain` requires open).
+fn signed_set_tld_open(sk: &SigningKey, tld: &str) -> Transaction {
+    sign(
+        Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+            true,
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
+/// Mines a testnet TLD registration proof (M8b).
+fn mined_tld_proof(tld: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+    challenge.extend_from_slice(tld.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.tld_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Mines a testnet domain registration proof (M8b).
+fn mined_domain_proof(name: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+    challenge.extend_from_slice(name.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.domain_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
 }
 
 /// Signs a register transaction over its canonical payload.
@@ -48,7 +90,7 @@ fn signed_register(sk: &SigningKey, name: &str) -> Transaction {
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
             DomainName::new(name).unwrap(),
             1,
-            Proof::from_bytes(Vec::new()),
+            mined_domain_proof(name),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -70,6 +112,8 @@ fn build_store(dir: &std::path::Path, sk: &SigningKey, names: &[&str]) {
     let mut store = RedbStore::open(dir.join("chain.redb")).unwrap();
     let mut builder = scone_blockchain::BlockBuilder::after(0, scone_blockchain::genesis_hash());
     builder.push_tx(signed_register_tld(sk, "uip")).unwrap();
+    // M8b: the namespace must be OPEN for self-registration.
+    builder.push_tx(signed_set_tld_open(sk, "uip")).unwrap();
     for name in names {
         builder.push_tx(signed_register(sk, name)).unwrap();
     }
@@ -93,8 +137,10 @@ fn build_store(dir: &std::path::Path, sk: &SigningKey, names: &[&str]) {
             1,
             hash.as_bytes(),
             &scone_protocol::encode_to_vec(&block).unwrap(),
-            &deltas,
-            &[],
+            &scone_storage::StateDelta {
+                domains: deltas,
+                ..scone_storage::StateDelta::empty()
+            },
         )
         .unwrap();
 }

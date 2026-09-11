@@ -29,6 +29,7 @@ mod dig;
 mod domain;
 mod error;
 mod identity;
+mod pow;
 mod relay;
 mod rpc;
 mod tx;
@@ -79,13 +80,14 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
         Command::Identity { command } => run_identity(command),
         Command::Tx { command } => run_tx(command),
         Command::Relay {
+            network,
             data_dir,
             listen,
             bootstrap,
             rpc,
             dns,
             dns_upstream,
-        } => run_relay(data_dir, listen, bootstrap, rpc, dns, dns_upstream),
+        } => run_relay(network, data_dir, listen, bootstrap, rpc, dns, dns_upstream),
         Command::Status { rpc } => run_status(rpc),
         Command::Submit { command } => run_submit(command),
         Command::Lookup { name, rpc } => run_lookup(name, rpc),

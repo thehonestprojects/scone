@@ -46,10 +46,13 @@ pub enum BlockchainError {
     TldAlreadyRegistered,
     /// A `RegisterDomain` targets a TLD that is not registered: the
     /// namespace must be claimed first with a `RegisterTld` (D1, M7c
-    /// — the chain is the authority over TLDs too).
+    /// — the chain is the authority over TLDs too). Also returned by
+    /// `TransferTld`/`RevokeTld`/`SetTldOpen` on an unregistered TLD
+    /// (M8b).
     #[error("unknown TLD")]
     UnknownTld,
-    /// An `UpdateDomain` targets an unregistered domain.
+    /// An `UpdateDomain` targets an unregistered domain. Also
+    /// returned by `RenewDomain` (M8b).
     #[error("unknown domain")]
     UnknownDomain,
     /// An `UpdateDomain` is not signed by the current domain owner.
@@ -64,12 +67,52 @@ pub enum BlockchainError {
         got: u64,
     },
     /// A transaction of the M8a family (`TransferTld`, `RevokeTld`,
-    /// `SetTldOpen`, `AssignDomain`, `RenewDomain`): the types and the
-    /// wire format exist, but their state-transition rules are not
-    /// implemented yet (M8b). Rejected explicitly instead of being
-    /// silently accepted.
+    /// `SetTldOpen`, `AssignDomain`, `RenewDomain`) reached a chain
+    /// still running pre-M8b rules. Since M8b these variants have
+    /// full state rules; the error remains for future, genuinely
+    /// unknown variants.
     #[error("transaction type not yet applicable: {0}")]
     UnsupportedTransaction(&'static str),
+    /// The transaction is built for another network: its
+    /// `network` field does not match this chain's network id
+    /// (M8b separation — a testnet tx never applies on mainnet and
+    /// vice versa).
+    #[error("wrong network: transaction targets {tx}, chain is {chain}")]
+    WrongNetwork {
+        /// Network the transaction is built for.
+        tx: scone_core::NetworkId,
+        /// Network of this chain.
+        chain: scone_core::NetworkId,
+    },
+    /// A `RegisterDomain` targets a TLD closed for self-service
+    /// registration: domains under it are created exclusively by the
+    /// TLD owner with `AssignDomain` (M8b).
+    #[error("TLD is closed for self-registration (assign-only)")]
+    TldClosed,
+    /// A TLD-owner operation (`TransferTld`, `RevokeTld`,
+    /// `SetTldOpen`, `AssignDomain`) is not signed by the current
+    /// TLD owner.
+    #[error("transaction owner is not the TLD owner")]
+    NotTldOwner,
+    /// A `RenewDomain` would not extend the registration: the new
+    /// expiry must be later than the current one (M8b).
+    #[error("renewal does not extend the registration: current {current}, proposed {proposed}")]
+    RenewalNotExtending {
+        /// Current registration expiry (Unix seconds).
+        current: u64,
+        /// Proposed expiry (Unix seconds).
+        proposed: u64,
+    },
+    /// A `RenewDomain` extends the registration by more than one
+    /// renewal term beyond the current expiry (M8b anti-hoarding
+    /// bound: 3 years per renewal, 3 years max ahead).
+    #[error("renewal exceeds the maximum term: max {max}, proposed {proposed}")]
+    RenewalExceedsTerm {
+        /// Maximum allowed expiry (Unix seconds).
+        max: u64,
+        /// Proposed expiry (Unix seconds).
+        proposed: u64,
+    },
     /// A consensus hook rejected data (reason defined by the consensus
     /// implementation).
     #[error("consensus rejection: {0}")]
@@ -82,8 +125,10 @@ pub enum BlockchainError {
     /// over the recomputed canonical signing payload.
     #[error("invalid transaction signature")]
     InvalidSignature,
-    /// A transaction violates a `scone-core` invariant.
-    #[error(transparent)]
+    /// A transaction violates a `scone-core` invariant, or its
+    /// registration proof of work does not solve the network's
+    /// difficulty (M8b).
+    #[error("{0}")]
     Core(#[from] SconeError),
     /// The canonical encoding of a value failed (malformed header or
     /// transaction fields, e.g. oversized proof).

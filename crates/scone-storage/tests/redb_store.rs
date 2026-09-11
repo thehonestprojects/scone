@@ -34,7 +34,35 @@ fn state_bytes(seed: u8) -> DomainStateBytes {
         } else {
             Some(RecordHash::from_bytes([seed; 32]))
         },
+        registered_at: 1_700_000_000,
+        valid_until: 1_731_248_000,
     })
+}
+
+/// Mines a testnet TLD registration proof (M8b).
+fn mined_tld_proof(tld: &scone_core::TldName) -> scone_core::Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+    challenge.extend_from_slice(tld.as_str().as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.tld_pow_difficulty,
+    );
+    scone_core::Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Mines a testnet domain registration proof (M8b).
+fn mined_domain_proof(name: &str) -> scone_core::Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+    challenge.extend_from_slice(name.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.domain_pow_difficulty,
+    );
+    scone_core::Proof::from_bytes(scone_core::pow::encode_proof(&checked))
 }
 
 /// Builds and pushes one block with a register tx, returning
@@ -46,7 +74,7 @@ fn build_block(
     sk: &scone_crypto::SigningKey,
     name: &str,
 ) -> (scone_protocol::Block, scone_protocol::BlockHash) {
-    use scone_core::{Proof, RegisterDomain, RegisterTld, TldId, TldName, Transaction};
+    use scone_core::{RegisterDomain, RegisterTld, TldName, Transaction};
     let sign_tx = |unsigned: Transaction| {
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
@@ -86,16 +114,27 @@ fn build_block(
     };
     let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
     if chain.height() == 0 {
-        // First block: claim the namespace before the domain (D1).
+        // First block: claim the namespace, open it, then the domain
+        // (D1 + M8b: a fresh TLD is closed, self-registration
+        // requires SetTldOpen, both registrations require PoW).
+        let tld_name = TldName::new(DomainName::new(name).expect("valid name").tld().as_str())
+            .expect("valid TLD");
         builder
             .push_tx(sign_tx(Transaction::RegisterTld(
                 RegisterTld::register_tld_signed(
-                    TldId::from_tld(
-                        &TldName::new(DomainName::new(name).expect("valid name").tld().as_str())
-                            .expect("valid TLD"),
-                    ),
+                    tld_name.clone(),
                     1,
-                    Proof::from_bytes(Vec::new()),
+                    mined_tld_proof(&tld_name),
+                    sk.public_key(),
+                    scone_crypto::Signature::from_bytes([0; 64]),
+                ),
+            )))
+            .unwrap();
+        builder
+            .push_tx(sign_tx(Transaction::SetTldOpen(
+                scone_core::SetTldOpen::set_tld_open_signed(
+                    scone_core::TldId::from_tld(&tld_name),
+                    true,
                     sk.public_key(),
                     scone_crypto::Signature::from_bytes([0; 64]),
                 ),
@@ -107,7 +146,7 @@ fn build_block(
             RegisterDomain::register_domain_signed(
                 scone_core::DomainName::new(name).unwrap(),
                 1,
-                Proof::from_bytes(Vec::new()),
+                mined_domain_proof(name),
                 sk.public_key(),
                 scone_crypto::Signature::from_bytes([0; 64]),
             ),
@@ -247,7 +286,7 @@ fn chain_roundtrip_genesis_to_n_restart_replay() {
     }
     // Restart 1: fast load (no replay).
     let store = RedbStore::open(&path).unwrap();
-    let chain = load_chain(&store).unwrap();
+    let chain = load_chain(&store, scone_core::TESTNET).unwrap();
     assert_eq!(chain.height(), expected_height);
     assert_eq!(chain.tip_hash(), expected_tip);
     assert_eq!(chain.state().len(), 8);
@@ -326,7 +365,7 @@ fn stored_domain_states_match_replayed_state() {
         store_block(&mut store, &chain, &b2, h2).unwrap();
     }
     let store = RedbStore::open(&path).unwrap();
-    let fast = load_chain(&store).unwrap();
+    let fast = load_chain(&store, scone_core::TESTNET).unwrap();
     let replay = load_chain_replay(&store).unwrap();
     assert_eq!(fast.state().len(), replay.state().len());
     let a = domain_id("a.uip");
@@ -359,8 +398,10 @@ fn failed_append_leaves_nothing_partial() {
                 9,
                 &[2; 32],
                 b"bad",
-                &[(domain_id("x.uip"), state_bytes(1))],
-                &[]
+                &scone_storage::StateDelta {
+                    domains: vec![(domain_id("x.uip"), state_bytes(1))],
+                    ..scone_storage::StateDelta::empty()
+                }
             )
             .is_err()
     );
@@ -381,9 +422,12 @@ fn block_and_state_are_written_together_or_not_at_all() {
     // duplicate domain delta in the SAME append cannot double-count.
     let (_dir, mut store) = tmp_store();
     let d = domain_id("dup.uip");
-    let deltas = vec![(d, state_bytes(1)), (d, state_bytes(2))];
+    let deltas = scone_storage::StateDelta {
+        domains: vec![(d, state_bytes(1)), (d, state_bytes(2))],
+        ..scone_storage::StateDelta::empty()
+    };
     store
-        .append_block_with_state(1, &[3; 32], b"b1", &deltas, &[])
+        .append_block_with_state(1, &[3; 32], b"b1", &deltas)
         .unwrap();
     // Duplicate delta counts ONE domain (last write wins).
     assert_eq!(store.domain_count().unwrap(), 1);
@@ -653,7 +697,7 @@ fn corrupted_tip_hash_in_meta_fails_load_chain_cleanly() {
         let (block, hash) = build_block(&mut chain, &sk, "example.uip");
         store_block(&mut store, &chain, &block, hash).unwrap();
         // Sanity: untampered load works.
-        assert!(load_chain(&store).is_ok());
+        assert!(load_chain(&store, scone_core::TESTNET).is_ok());
     }
     // Drop every handle, then tamper meta["tip"] with a raw redb
     // write (bypassing the reserved-key guard, like a corrupting
@@ -672,7 +716,7 @@ fn corrupted_tip_hash_in_meta_fails_load_chain_cleanly() {
     }
     // Re-open: load_chain must refuse the mismatched tip.
     let store = RedbStore::open(&path).unwrap();
-    let err = load_chain(&store).unwrap_err();
+    let err = load_chain(&store, scone_core::TESTNET).unwrap_err();
     assert!(
         matches!(err, StorageError::Corrupted(ref msg) if msg.contains("recomputed tip hash")),
         "unexpected error: {err:?}"
@@ -740,6 +784,7 @@ fn tld_id(tld: &str) -> scone_core::TldId {
 fn tld_bytes(seed: u8) -> scone_storage::TldStateBytes {
     scone_storage::TldStateBytes::from(&scone_blockchain::TldState {
         owner: scone_core::OwnerId::from_bytes([seed; 32]),
+        open: seed.is_multiple_of(2),
     })
 }
 
@@ -829,8 +874,11 @@ fn block_with_tld_delta_persists_registry_atomically() {
             1,
             &[4; 32],
             b"block-1",
-            &[(domain_id("a.uip"), state_bytes(1))],
-            &[(uip, tld_bytes(3))],
+            &scone_storage::StateDelta {
+                domains: vec![(domain_id("a.uip"), state_bytes(1))],
+                tlds: vec![(uip, tld_bytes(3))],
+                ..scone_storage::StateDelta::empty()
+            },
         )
         .unwrap();
     // Block, domain delta, TLD delta, counters and tip all landed.
@@ -848,7 +896,15 @@ fn failed_append_leaves_no_tld_behind() {
     // Non-monotonic height: nothing at all is written.
     assert!(
         store
-            .append_block_with_state(9, &[5; 32], b"bad", &[], &[(tld_id("uip"), tld_bytes(1))])
+            .append_block_with_state(
+                9,
+                &[5; 32],
+                b"bad",
+                &scone_storage::StateDelta {
+                    tlds: vec![(tld_id("uip"), tld_bytes(1))],
+                    ..scone_storage::StateDelta::empty()
+                }
+            )
             .is_err()
     );
     assert_eq!(store.tld_count().unwrap(), 0);
@@ -883,7 +939,7 @@ fn restart_restores_tld_registry_and_admits_new_domains() {
     }
     // Restart: fast load must restore the TLD registry.
     let mut store = RedbStore::open(&path).unwrap();
-    let mut chain = load_chain(&store).unwrap();
+    let mut chain = load_chain(&store, scone_core::TESTNET).unwrap();
     let uip = tld_id("uip");
     assert!(
         chain.state().tld(&uip).is_some(),

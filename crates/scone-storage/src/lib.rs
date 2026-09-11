@@ -57,6 +57,28 @@ pub const META_FORMAT_VERSION: &[u8] = b"format_version";
 /// returned id.
 pub type DomainPage = (Vec<(DomainId, DomainStateBytes)>, Option<DomainId>);
 
+/// The state changes of one block (M8b): upserts and removals for
+/// both registries, applied atomically with the block bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateDelta {
+    /// Domain states to write (last write wins per id).
+    pub domains: Vec<(DomainId, DomainStateBytes)>,
+    /// TLD states to write.
+    pub tlds: Vec<(TldId, TldStateBytes)>,
+    /// Domain states to delete (M8b GC of expired registrations).
+    pub removed_domains: Vec<DomainId>,
+    /// TLD states to delete (M8b RevokeTld).
+    pub removed_tlds: Vec<TldId>,
+}
+
+impl StateDelta {
+    /// An empty delta (block with no state change).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// One page of TLD states returned by [`NodeStore::iterate_tlds`]:
 /// same cursor contract as [`DomainPage`], over `TldId`s (M7d).
 pub type TldPage = (Vec<(TldId, TldStateBytes)>, Option<TldId>);
@@ -104,8 +126,7 @@ pub trait NodeStore {
         height: u64,
         hash: &[u8; 32],
         block_bytes: &[u8],
-        state_deltas: &[(DomainId, DomainStateBytes)],
-        tld_deltas: &[(TldId, TldStateBytes)],
+        deltas: &StateDelta,
     ) -> Result<()>;
 
     /// Encoded canonical block at `height`, if stored.

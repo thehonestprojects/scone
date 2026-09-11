@@ -31,6 +31,7 @@ impl Relay {
             RpcRequest::Status => {
                 let data = json!({
                     "peer_id": self.peer_id().to_string(),
+                    "network": self.chain.network().network_id.to_string(),
                     "tip": hex(self.chain.tip_hash().as_bytes()),
                     "height": self.chain.height(),
                     "peers": self.peers.len(),

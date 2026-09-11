@@ -15,6 +15,7 @@
 pub mod error;
 pub mod id;
 pub mod name;
+pub mod network;
 pub mod owner;
 pub mod pow;
 pub mod record;
@@ -23,11 +24,9 @@ pub mod transaction;
 pub use error::{Result, SconeError};
 pub use id::{DomainId, TldId};
 pub use name::{DomainName, TldName};
+pub use network::{MAINNET, NetworkId, NetworkParams, TESTNET};
 pub use owner::{OwnerId, PublicKeyRef};
-pub use pow::{
-    CheckedPow, DOMAIN_POW_DIFFICULTY, TLD_POW_DIFFICULTY, check, encode_proof, leading_zero_bits,
-    verify,
-};
+pub use pow::{CheckedPow, check, encode_proof, leading_zero_bits, mine, verify};
 pub use record::{DnsRecord, RecordData, Signature, SignedDnsRecord};
 pub use transaction::{
     AssignDomain, Proof, RecordHash, RegisterDomain, RegisterTld, RenewDomain, RevokeTld,

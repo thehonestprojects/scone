@@ -7,6 +7,14 @@
 //! (`SCONE-TX-SIG-V1` || canonical encoding of the transaction without
 //! the signature — see `/docs/technical/transactions.md`).
 //!
+//! Since M8b every transaction also carries a [`NetworkId`] field
+//! (`scone-testnet` / `scone-mainnet`): it is a **signed** field of the
+//! payload, so a transaction built for one network never verifies on
+//! another (network separation, see `crate::network`). The constructors
+//! default it to the testnet id (the project is in development); the
+//! chain layer enforces the match with its own network typedly
+//! (`WrongNetwork`) at application time.
+//!
 //! The `owner` field is deliberately redundant with `public_key`: it is
 //! ALWAYS recomputed from the embedded key and never trusted. A
 //! transaction whose `owner` does not match the derivation of its own
@@ -23,12 +31,15 @@ use scone_crypto::{PublicKey, Signature};
 
 use crate::error::{Result, SconeError};
 use crate::id::{DomainId, TldId};
-use crate::name::DomainName;
+use crate::name::{DomainName, TldName};
+use crate::network::{NetworkId, TESTNET};
 use crate::owner::{OwnerId, PublicKeyRef};
 
-/// Opaque registration proof (reserved for the future proof of work).
+/// Opaque registration proof (the registration proof of work, M8b).
 ///
-/// Not implemented yet: `RegisterDomain` validation ignores its content.
+/// Pure types never interpret it; the state layer verifies it via
+/// [`crate::pow`] when a proof is required (`RegisterTld`,
+/// `RegisterDomain` under an open TLD).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Proof(Vec<u8>);
 
@@ -91,6 +102,8 @@ fn check_owner_binding(owner: &OwnerId, public_key: &PublicKey) -> Result<()> {
 /// transaction that claims it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegisterDomain {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// Claimed domain, by canonical name (wire-visible).
     pub name: DomainName,
     /// Derived identity of `name` (recomputed, never trusted — see
@@ -99,7 +112,7 @@ pub struct RegisterDomain {
     pub owner: OwnerId,
     /// Ordering information (Unix timestamp now; chain position later).
     pub timestamp: u64,
-    /// Reserved for the registration proof of work (not yet implemented).
+    /// Registration proof of work (verified by the state layer, M8b).
     pub proof: Proof,
     /// Ed25519 public key of the signer (32 bytes, embedded so the
     /// signature can be verified offline).
@@ -109,9 +122,12 @@ pub struct RegisterDomain {
 }
 
 impl RegisterDomain {
-    /// Builds a signed-shaped `RegisterDomain`, recomputing `owner` from
-    /// `public_key` (the caller-supplied owner is never trusted —
-    /// there is none).
+    /// Builds a signed-shaped `RegisterDomain` for the **testnet**
+    /// (development default), recomputing `owner` from `public_key`
+    /// (the caller-supplied owner is never trusted — there is none).
+    ///
+    /// Use [`RegisterDomain::register_domain_on`] to target another
+    /// network explicitly.
     ///
     /// The signature must have been produced over
     /// `scone_protocol::signing_payload` of the resulting transaction;
@@ -125,7 +141,30 @@ impl RegisterDomain {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::register_domain_on(
+            TESTNET.network_id,
+            name,
+            timestamp,
+            proof,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a signed-shaped `RegisterDomain` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn register_domain_on(
+        network: NetworkId,
+        name: DomainName,
+        timestamp: u64,
+        proof: Proof,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             domain_id: DomainId::from_name(&name),
             owner: owner_of(&public_key),
             name,
@@ -145,8 +184,8 @@ impl RegisterDomain {
     /// - [`SconeError::InvalidDomain`] when `domain_id` is not the
     ///   derivation of `name`.
     ///
-    /// The `proof` content is not interpreted yet (future proof of
-    /// work).
+    /// The `proof` content is not interpreted here (the state layer
+    /// verifies it via `crate::pow`).
     pub fn validate(&self) -> Result<()> {
         check_owner_binding(&self.owner, &self.public_key)?;
         if self.domain_id != DomainId::from_name(&self.name) {
@@ -166,6 +205,8 @@ impl RegisterDomain {
 /// whose hash must equal `record_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpdateDomain {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     pub domain_id: DomainId,
     pub owner: OwnerId,
     /// Monotonic version of the record set (ordering lives here, not
@@ -180,8 +221,8 @@ pub struct UpdateDomain {
 }
 
 impl UpdateDomain {
-    /// Builds a signed-shaped `UpdateDomain`, recomputing `owner` from
-    /// `public_key`.
+    /// Builds a signed-shaped `UpdateDomain` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
@@ -192,7 +233,30 @@ impl UpdateDomain {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::update_domain_on(
+            TESTNET.network_id,
+            domain_id,
+            sequence,
+            record_hash,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a signed-shaped `UpdateDomain` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn update_domain_on(
+        network: NetworkId,
+        domain_id: DomainId,
+        sequence: u64,
+        record_hash: RecordHash,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             domain_id,
             owner: owner_of(&public_key),
             sequence,
@@ -226,23 +290,31 @@ impl UpdateDomain {
 /// (`SCONE-TLD-V1` vs `SCONE-DOMAIN-V1`), so no cross-squatting is
 /// possible.
 ///
-/// Like every signed transaction: `owner` is ALWAYS recomputed from
-/// the embedded `public_key` (never trusted — see
-/// [`RegisterDomain::register_domain_signed`]); the `signature` must cover the
-/// canonical signing payload of `scone-protocol`; `validate` here
-/// only checks the pure invariants, not the signature itself.
+/// Since M8b the transaction carries the **TLD name in clear**
+/// ([`TldName`], like `RegisterDomain` carries the domain name): the
+/// registration PoW challenge is `"SCONE-TLD-V1" || tld` and the chain
+/// must be able to recompute it from the transaction alone. `tld_id`
+/// stays the consensus identity and is re-derived from the carried
+/// name on decode/validate.
 ///
-/// Since M7b the type is part of the [`Transaction`] enum and of the
-/// wire format (discriminator `0x03`, see `scone-protocol`).
+/// Like every signed transaction: `owner` is ALWAYS recomputed from
+/// the embedded `public_key` (never trusted); the `signature` must
+/// cover the canonical signing payload of `scone-protocol`; `validate`
+/// here only checks the pure invariants, not the signature itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegisterTld {
-    /// The claimed TLD (namespace id, disjoint from any `DomainId`).
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
+    /// The claimed TLD, by canonical name (wire-visible, M8b).
+    pub name: TldName,
+    /// Derived identity of `name` (recomputed, never trusted — see
+    /// [`RegisterTld::validate`]).
     pub tld_id: TldId,
     /// Recomputed owner identity (never trusted from input).
     pub owner: OwnerId,
     /// Ordering information (Unix timestamp now; chain position later).
     pub timestamp: u64,
-    /// Reserved for the registration proof of work (not yet implemented).
+    /// Registration proof of work (verified by the state layer, M8b).
     pub proof: Proof,
     /// Ed25519 public key of the signer (32 bytes, embedded so the
     /// signature can be verified offline).
@@ -252,21 +324,47 @@ pub struct RegisterTld {
 }
 
 impl RegisterTld {
-    /// Builds a signed-shaped `RegisterTld`, recomputing `owner` from
+    /// Builds a signed-shaped `RegisterTld` for the **testnet**,
+    /// deriving `tld_id` from `name` and recomputing `owner` from
     /// `public_key` (the caller-supplied owner is never trusted —
     /// there is none).
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
     pub fn register_tld_signed(
-        tld_id: TldId,
+        name: TldName,
+        timestamp: u64,
+        proof: Proof,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self::register_tld_on(
+            TESTNET.network_id,
+            name,
+            timestamp,
+            proof,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a signed-shaped `RegisterTld` for `network`, deriving
+    /// `tld_id` from the carried `name` (canonical constructor, M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn register_tld_on(
+        network: NetworkId,
+        name: TldName,
         timestamp: u64,
         proof: Proof,
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
         Self {
-            tld_id,
+            network,
+            tld_id: TldId::from_tld(&name),
+            name,
             owner: owner_of(&public_key),
             timestamp,
             proof,
@@ -279,11 +377,19 @@ impl RegisterTld {
     ///
     /// # Errors
     ///
-    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
-    /// identity derived from `public_key`. The `proof` content is not
-    /// interpreted yet (future proof of work).
+    /// - [`SconeError::InvalidOwner`] when `owner` is not the identity
+    ///   derived from `public_key`;
+    /// - [`SconeError::InvalidTld`] when `tld_id` is not the
+    ///   derivation of the carried `name`.
     pub fn validate(&self) -> Result<()> {
-        check_owner_binding(&self.owner, &self.public_key)
+        check_owner_binding(&self.owner, &self.public_key)?;
+        if self.tld_id != TldId::from_tld(&self.name) {
+            return Err(SconeError::InvalidTld(format!(
+                "tld_id is not the derivation of the carried name {:?}",
+                self.name.as_str()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -292,13 +398,15 @@ impl RegisterTld {
 /// Signed by the **current** owner (the `owner`/`public_key` binding
 /// rule applies as everywhere): the recipient only appears as
 /// [`new_owner`](Self::new_owner), an opaque [`OwnerId`] that the
-/// state layer (M8b) will match against the new claimant of any
-/// subsequent transaction on this TLD. Ordering between conflicting
-/// transfers is resolved by chain order alone (no sequence number:
-/// a TLD has exactly one owner at a time, the first applied transfer
-/// wins) — see `/docs/technical/transactions.md`.
+/// state layer matches against the new claimant of any subsequent
+/// transaction on this TLD. Ordering between conflicting transfers is
+/// resolved by chain order alone (no sequence number: a TLD has
+/// exactly one owner at a time, the first applied transfer wins) —
+/// see `/docs/technical/transactions.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransferTld {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// The TLD being transferred.
     pub tld_id: TldId,
     /// Current owner (recomputed from `public_key`, never trusted).
@@ -313,8 +421,8 @@ pub struct TransferTld {
 }
 
 impl TransferTld {
-    /// Builds a signed-shaped `TransferTld`, recomputing `owner` from
-    /// `public_key`.
+    /// Builds a signed-shaped `TransferTld` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
@@ -324,7 +432,22 @@ impl TransferTld {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::transfer_tld_on(TESTNET.network_id, tld_id, new_owner, public_key, signature)
+    }
+
+    /// Builds a signed-shaped `TransferTld` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn transfer_tld_on(
+        network: NetworkId,
+        tld_id: TldId,
+        new_owner: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             tld_id,
             owner: owner_of(&public_key),
             new_owner,
@@ -349,10 +472,12 @@ impl TransferTld {
 ///
 /// Signed by the current owner. Deliberately carries no timestamp and
 /// no sequence: a revoke is one-shot against the current state (TLD
-/// exists and is owned by the signer — enforced at application time,
-/// M8b), so chain order is the only ordering it needs.
+/// exists and is owned by the signer — enforced at application time),
+/// so chain order is the only ordering it needs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RevokeTld {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// The TLD being relinquished.
     pub tld_id: TldId,
     /// Current owner (recomputed from `public_key`, never trusted).
@@ -364,13 +489,27 @@ pub struct RevokeTld {
 }
 
 impl RevokeTld {
-    /// Builds a signed-shaped `RevokeTld`, recomputing `owner` from
-    /// `public_key`.
+    /// Builds a signed-shaped `RevokeTld` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
     pub fn revoke_tld_signed(tld_id: TldId, public_key: PublicKey, signature: Signature) -> Self {
+        Self::revoke_tld_on(TESTNET.network_id, tld_id, public_key, signature)
+    }
+
+    /// Builds a signed-shaped `RevokeTld` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn revoke_tld_on(
+        network: NetworkId,
+        tld_id: TldId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             tld_id,
             owner: owner_of(&public_key),
             public_key,
@@ -393,13 +532,15 @@ impl RevokeTld {
 /// registration (M8a).
 ///
 /// A **closed** TLD is assign-only: domains under it can be created
-/// exclusively by the TLD owner with [`AssignDomain`]. An **open**
-/// TLD lets anyone run the registration PoW and claim a free domain
-/// with [`RegisterDomain`]. The flag is pure chain state material —
-/// its effect on `RegisterDomain` application rules arrives with the
-/// state layer (M8b).
+/// exclusively by the TLD owner with [`AssignDomain`]. An **open** TLD
+/// lets anyone run the registration PoW and claim a free domain with
+/// [`RegisterDomain`]. The flag is chain state (M8b): a `RegisterDomain`
+/// under an open TLD requires the domain PoW; under a closed TLD it is
+/// rejected outright (assign-only path).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SetTldOpen {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// The TLD whose registration policy changes.
     pub tld_id: TldId,
     /// Current owner (recomputed from `public_key`, never trusted).
@@ -414,8 +555,8 @@ pub struct SetTldOpen {
 }
 
 impl SetTldOpen {
-    /// Builds a signed-shaped `SetTldOpen`, recomputing `owner` from
-    /// `public_key`.
+    /// Builds a signed-shaped `SetTldOpen` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
@@ -425,7 +566,22 @@ impl SetTldOpen {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::set_tld_open_on(TESTNET.network_id, tld_id, open, public_key, signature)
+    }
+
+    /// Builds a signed-shaped `SetTldOpen` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn set_tld_open_on(
+        network: NetworkId,
+        tld_id: TldId,
+        open: bool,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             tld_id,
             owner: owner_of(&public_key),
             open,
@@ -448,12 +604,14 @@ impl SetTldOpen {
 /// Assigns a domain directly, signed by the **TLD owner** (M8a).
 ///
 /// The assign-only path of a closed namespace: the signer must own
-/// the TLD of `name` (checked at application time, M8b — pure types
-/// cannot see the registry), and `assignee` becomes the first owner
-/// of the domain. Mirrors [`RegisterDomain`]: the canonical name is
-/// carried in clear and `domain_id` must be its derivation.
+/// the TLD of `name` (checked at application time — pure types cannot
+/// see the registry), and `assignee` becomes the first owner of the
+/// domain. Mirrors [`RegisterDomain`]: the canonical name is carried
+/// in clear and `domain_id` must be its derivation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AssignDomain {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// The assigned domain, by canonical name (wire-visible).
     pub name: DomainName,
     /// Derived identity of `name` (recomputed, never trusted).
@@ -470,8 +628,9 @@ pub struct AssignDomain {
 }
 
 impl AssignDomain {
-    /// Builds a signed-shaped `AssignDomain`, deriving `domain_id`
-    /// from `name` and recomputing `owner` from `public_key`.
+    /// Builds a signed-shaped `AssignDomain` for the **testnet**,
+    /// deriving `domain_id` from `name` and recomputing `owner` from
+    /// `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
@@ -481,7 +640,22 @@ impl AssignDomain {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::assign_domain_on(TESTNET.network_id, name, assignee, public_key, signature)
+    }
+
+    /// Builds a signed-shaped `AssignDomain` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn assign_domain_on(
+        network: NetworkId,
+        name: DomainName,
+        assignee: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             domain_id: DomainId::from_name(&name),
             owner: owner_of(&public_key),
             name,
@@ -519,6 +693,8 @@ impl AssignDomain {
 /// at most one renewal term) is a state rule (M8b).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenewDomain {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
     /// The domain whose registration is extended.
     pub domain_id: DomainId,
     /// Current owner (recomputed from `public_key`, never trusted).
@@ -532,8 +708,8 @@ pub struct RenewDomain {
 }
 
 impl RenewDomain {
-    /// Builds a signed-shaped `RenewDomain`, recomputing `owner` from
-    /// `public_key`.
+    /// Builds a signed-shaped `RenewDomain` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
     ///
     /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
     #[must_use]
@@ -543,7 +719,28 @@ impl RenewDomain {
         public_key: PublicKey,
         signature: Signature,
     ) -> Self {
+        Self::renew_domain_on(
+            TESTNET.network_id,
+            domain_id,
+            valid_until,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a signed-shaped `RenewDomain` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn renew_domain_on(
+        network: NetworkId,
+        domain_id: DomainId,
+        valid_until: u64,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
         Self {
+            network,
             domain_id,
             owner: owner_of(&public_key),
             valid_until,
@@ -585,6 +782,21 @@ pub enum Transaction {
 }
 
 impl Transaction {
+    /// The network this transaction is built for (M8b).
+    #[must_use]
+    pub fn network(&self) -> NetworkId {
+        match self {
+            Self::RegisterDomain(tx) => tx.network,
+            Self::UpdateDomain(tx) => tx.network,
+            Self::RegisterTld(tx) => tx.network,
+            Self::TransferTld(tx) => tx.network,
+            Self::RevokeTld(tx) => tx.network,
+            Self::SetTldOpen(tx) => tx.network,
+            Self::AssignDomain(tx) => tx.network,
+            Self::RenewDomain(tx) => tx.network,
+        }
+    }
+
     /// The declared owner (always re-derived from
     /// [`Transaction::public_key`] by [`Transaction::validate`]).
     pub fn owner(&self) -> OwnerId {
@@ -635,7 +847,9 @@ impl Transaction {
     /// - [`SconeError::InvalidSequence`] for an `UpdateDomain` with a zero
     ///   sequence;
     /// - [`SconeError::InvalidDomain`] for a `RegisterDomain` whose
-    ///   `domain_id` does not match its carried name;
+    ///   `domain_id` does not match its carried name (same for
+    ///   `AssignDomain`, and `InvalidTld` for a `RegisterTld` whose
+    ///   `tld_id` does not match its carried name);
     /// - [`SconeError::InvalidOwner`] when `owner` does not match the
     ///   embedded public key.
     ///
@@ -658,7 +872,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::name::{DomainName, TldName};
+    use crate::network::MAINNET;
     use scone_crypto::SigningKey;
 
     fn domain_id() -> DomainId {
@@ -797,17 +1011,24 @@ mod tests {
         assert_eq!(upd.owner(), owner_of(&key(1).public_key()));
         assert_eq!(reg.public_key(), &key(1).public_key());
         assert_eq!(upd.signature(), &placeholder_signature());
+        assert_eq!(reg.network(), TESTNET.network_id);
+        assert_eq!(upd.network(), TESTNET.network_id);
     }
 
     // --- RegisterTld (M7a) ---
 
+    fn tld_name() -> TldName {
+        TldName::new("uip").unwrap()
+    }
+
     fn tld_id() -> TldId {
-        TldId::from_tld(&TldName::new("uip").unwrap())
+        TldId::from_tld(&tld_name())
     }
 
     fn register_tld() -> RegisterTld {
-        RegisterTld::register_tld_signed(
-            tld_id(),
+        RegisterTld::register_tld_on(
+            TESTNET.network_id,
+            tld_name(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             key(1).public_key(),
@@ -823,8 +1044,9 @@ mod tests {
     #[test]
     fn register_tld_constructor_recomputes_owner_from_the_key() {
         let sk = key(9);
-        let tx = RegisterTld::register_tld_signed(
-            tld_id(),
+        let tx = RegisterTld::register_tld_on(
+            TESTNET.network_id,
+            tld_name(),
             1,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -837,8 +1059,9 @@ mod tests {
     fn register_tld_owner_key_mismatch_is_invalid() {
         let sk_a = key(1);
         let sk_b = key(2);
-        let mut tx = RegisterTld::register_tld_signed(
-            tld_id(),
+        let mut tx = RegisterTld::register_tld_on(
+            TESTNET.network_id,
+            tld_name(),
             1,
             Proof::from_bytes(Vec::new()),
             sk_a.public_key(),
@@ -863,8 +1086,17 @@ mod tests {
         let tx = register_tld();
         // The claimed namespace id is the TLD derivation of "uip"…
         assert_eq!(tx.tld_id, tld_id());
-        // …and is disjoint from any domain derivation.
+        // …derived from the carried name…
+        assert_eq!(tx.tld_id, TldId::from_tld(&tx.name));
+        // …and disjoint from any domain derivation.
         assert_ne!(tx.tld_id.as_bytes(), domain_id().as_bytes());
+    }
+
+    #[test]
+    fn register_tld_name_id_mismatch_is_invalid() {
+        let mut tx = register_tld();
+        tx.tld_id = TldId::from_tld(&TldName::new("com").unwrap());
+        assert!(matches!(tx.validate(), Err(SconeError::InvalidTld(_))));
     }
 
     // --- M8a: TransferTld / RevokeTld / SetTldOpen / AssignDomain
@@ -877,7 +1109,8 @@ mod tests {
     #[test]
     fn m8a_constructors_recompute_owner_and_derive_ids() {
         let sk = key(5);
-        let transfer = TransferTld::transfer_tld_signed(
+        let transfer = TransferTld::transfer_tld_on(
+            TESTNET.network_id,
             tld_id(),
             assignee(),
             sk.public_key(),
@@ -887,12 +1120,17 @@ mod tests {
         assert_eq!(transfer.new_owner, assignee());
         assert!(transfer.validate().is_ok());
 
-        let revoke =
-            RevokeTld::revoke_tld_signed(tld_id(), sk.public_key(), placeholder_signature());
+        let revoke = RevokeTld::revoke_tld_on(
+            TESTNET.network_id,
+            tld_id(),
+            sk.public_key(),
+            placeholder_signature(),
+        );
         assert_eq!(revoke.owner, owner_of(&sk.public_key()));
         assert!(revoke.validate().is_ok());
 
-        let set_open = SetTldOpen::set_tld_open_signed(
+        let set_open = SetTldOpen::set_tld_open_on(
+            TESTNET.network_id,
             tld_id(),
             true,
             sk.public_key(),
@@ -901,7 +1139,8 @@ mod tests {
         assert_eq!(set_open.owner, owner_of(&sk.public_key()));
         assert!(set_open.validate().is_ok());
 
-        let assign = AssignDomain::assign_domain_signed(
+        let assign = AssignDomain::assign_domain_on(
+            TESTNET.network_id,
             name(),
             assignee(),
             sk.public_key(),
@@ -911,7 +1150,8 @@ mod tests {
         assert_eq!(assign.domain_id, domain_id());
         assert!(assign.validate().is_ok());
 
-        let renew = RenewDomain::renew_domain_signed(
+        let renew = RenewDomain::renew_domain_on(
+            TESTNET.network_id,
             domain_id(),
             1_800_000_000,
             sk.public_key(),
@@ -927,7 +1167,8 @@ mod tests {
         let sk_b = key(2);
         let forged = owner_of(&sk_b.public_key());
 
-        let mut transfer = TransferTld::transfer_tld_signed(
+        let mut transfer = TransferTld::transfer_tld_on(
+            TESTNET.network_id,
             tld_id(),
             assignee(),
             sk_a.public_key(),
@@ -939,15 +1180,20 @@ mod tests {
             Err(SconeError::InvalidOwner(_))
         ));
 
-        let mut revoke =
-            RevokeTld::revoke_tld_signed(tld_id(), sk_a.public_key(), placeholder_signature());
+        let mut revoke = RevokeTld::revoke_tld_on(
+            TESTNET.network_id,
+            tld_id(),
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
         revoke.owner = forged;
         assert!(matches!(
             revoke.validate(),
             Err(SconeError::InvalidOwner(_))
         ));
 
-        let mut set_open = SetTldOpen::set_tld_open_signed(
+        let mut set_open = SetTldOpen::set_tld_open_on(
+            TESTNET.network_id,
             tld_id(),
             false,
             sk_a.public_key(),
@@ -959,7 +1205,8 @@ mod tests {
             Err(SconeError::InvalidOwner(_))
         ));
 
-        let mut assign = AssignDomain::assign_domain_signed(
+        let mut assign = AssignDomain::assign_domain_on(
+            TESTNET.network_id,
             name(),
             assignee(),
             sk_a.public_key(),
@@ -971,7 +1218,8 @@ mod tests {
             Err(SconeError::InvalidOwner(_))
         ));
 
-        let mut renew = RenewDomain::renew_domain_signed(
+        let mut renew = RenewDomain::renew_domain_on(
+            TESTNET.network_id,
             domain_id(),
             1,
             sk_a.public_key(),
@@ -983,7 +1231,8 @@ mod tests {
 
     #[test]
     fn assign_domain_name_id_mismatch_is_invalid() {
-        let mut assign = AssignDomain::assign_domain_signed(
+        let mut assign = AssignDomain::assign_domain_on(
+            TESTNET.network_id,
             name(),
             assignee(),
             key(1).public_key(),
@@ -998,7 +1247,8 @@ mod tests {
 
     #[test]
     fn m8a_transaction_accessors_cover_the_new_variants() {
-        let renew = Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+        let renew = Transaction::RenewDomain(RenewDomain::renew_domain_on(
+            TESTNET.network_id,
             domain_id(),
             1,
             key(3).public_key(),
@@ -1009,7 +1259,8 @@ mod tests {
         assert_eq!(renew.signature(), &placeholder_signature());
         assert!(renew.validate().is_ok());
 
-        let transfer = Transaction::TransferTld(TransferTld::transfer_tld_signed(
+        let transfer = Transaction::TransferTld(TransferTld::transfer_tld_on(
+            TESTNET.network_id,
             tld_id(),
             assignee(),
             key(3).public_key(),
@@ -1017,5 +1268,65 @@ mod tests {
         ));
         assert_eq!(transfer.owner(), renew.owner());
         assert!(transfer.validate().is_ok());
+    }
+
+    // --- M8b: network field ---
+
+    #[test]
+    fn on_network_constructors_set_the_network() {
+        let sk = key(4);
+        let reg = RegisterDomain::register_domain_on(
+            MAINNET.network_id,
+            name(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(reg.network, MAINNET.network_id);
+        assert_eq!(
+            Transaction::RegisterDomain(reg).network(),
+            MAINNET.network_id
+        );
+
+        let tld = RegisterTld::register_tld_on(
+            MAINNET.network_id,
+            tld_name(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(tld.network, MAINNET.network_id);
+        assert_eq!(tld.tld_id, tld_id());
+        assert!(tld.validate().is_ok());
+
+        let renew = RenewDomain::renew_domain_on(
+            MAINNET.network_id,
+            domain_id(),
+            1,
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(
+            Transaction::RenewDomain(renew).network(),
+            MAINNET.network_id
+        );
+    }
+
+    #[test]
+    fn legacy_default_constructors_target_testnet() {
+        // The `*_signed` shapes keep their M7 signatures and default
+        // to the testnet: development stays zero-friction, the chain
+        // layer is the one that enforces the real network.
+        let reg = register();
+        assert_eq!(reg.network, TESTNET.network_id);
+        let renew = RenewDomain::renew_domain_signed(
+            domain_id(),
+            1,
+            key(1).public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(renew.network, TESTNET.network_id);
     }
 }

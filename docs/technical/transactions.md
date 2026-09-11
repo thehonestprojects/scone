@@ -24,6 +24,13 @@ Transaction = disc u8 || version u8 || payload
 | `disc` | 1 o | type de transaction (table ci-dessous) |
 | `version` | 1 o | **exactement `0x01`** (version du format tx) |
 
+Depuis M8b, **le premier champ de chaque payload est le
+`network_id`** (`str` ≤ 16, ASCII `[a-z0-9-]` — ex. `scone-testnet`,
+13 octets) : c'est un champ **signé** (couvert par le payload de
+signature) et séparé par réseau dans le digest PoW. Une transaction
+construite pour un réseau ne vérifie jamais sur un autre (voir
+`/docs/technical/blockchain.md` — réseaux et genèse).
+
 ### Discriminants (table normative)
 
 Chaque discriminant est une **constante opaque, fixe et arbitraire** :
@@ -51,7 +58,7 @@ n'est jamais analysé par accident.
 ## REGISTER_DOMAIN (0x21)
 
 ```text
-name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+network(str ≤ 16) name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
@@ -80,12 +87,13 @@ signature.
 Claim d'un top-level domain (registre TLD, M7) :
 
 ```text
-tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+network(str ≤ 16) tld(str ≤ 63) tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
 |---|---|---|
-| `tld_id` | 32 octets nus | identité du TLD : `BLAKE3-256("SCONE-TLD-V1" || tld)` |
+| `tld` | `str` ≤ 63 | nom canonique du TLD **porté en clair** (M8b : le challenge PoW se dérive du nom, comme `RegisterDomain` porte le sien) |
+| `tld_id` | 32 octets nus | identité du TLD : `BLAKE3-256("SCONE-TLD-V1" || tld)` — **doit** être la dérivation de `tld` (recomputé) |
 | `owner` | 32 octets nus | dérivation de `public_key` |
 | `timestamp` | varint | information d'ordre (Unix, secondes) |
 | `proof` | `bytes` ≤ 256 | charge utile du PoW de registration (voir [ci-dessous](#preuve-de-travail-pow-de-registration)) |
@@ -102,16 +110,16 @@ domaines).
 ## Famille M8a — formats wire
 
 Cinq types complètent le registre TLD et le cycle de vie des
-domaines. Leurs **types et formats wire sont normatifs dès M8a** ;
-leurs **règles d'état** (conditions d'application dans un bloc)
-arrivent en M8b : jusqu'alors la chaîne les rejette explicitement
-avec `UnsupportedTransaction(nom)` — jamais de silence, jamais de
-panic.
+domaines. Formats wire normatifs depuis M8a ; **règles d'état
+complètes depuis M8b** (voir `/docs/technical/blockchain.md`) :
+owner-du-TLD requis, PoW là où une claim est auto-service,
+expirations et grâce côté domaines. Chaque payload commence par le
+champ `network` (M8b).
 
 ### TRANSFER_TLD (0x47)
 
 ```text
-tld_id[32] owner[32] new_owner[32] public_key[32] signature[64]
+network(str ≤ 16) tld_id[32] owner[32] new_owner[32] public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
@@ -128,7 +136,7 @@ fois, le premier transfert appliqué gagne (ordre de chaîne seul).
 ### REVOKE_TLD (0x6B)
 
 ```text
-tld_id[32] owner[32] public_key[32] signature[64]
+network(str ≤ 16) tld_id[32] owner[32] public_key[32] signature[64]
 ```
 
 Abandon volontaire d'un TLD (re-claimable ensuite par un
@@ -138,7 +146,7 @@ timestamp ni séquence — un revoke est one-shot contre l'état courant.
 ### SET_TLD_OPEN (0xB8)
 
 ```text
-tld_id[32] owner[32] open u8 public_key[32] signature[64]
+network(str ≤ 16) tld_id[32] owner[32] open u8 public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
@@ -152,7 +160,7 @@ PoW de registration et claimer un domaine libre (`RegisterDomain`).
 ### ASSIGN_DOMAIN (0xD4)
 
 ```text
-name(str ≤ 253) domain_id[32] owner[32] assignee[32] public_key[32] signature[64]
+network(str ≤ 16) name(str ≤ 253) domain_id[32] owner[32] assignee[32] public_key[32] signature[64]
 ```
 
 Miroir de `RegisterDomain` : le nom canonique est porté en clair et
@@ -164,7 +172,7 @@ du domaine (opaque, comme `new_owner`).
 ### RENEW_DOMAIN (0x3C)
 
 ```text
-domain_id[32] owner[32] valid_until.v public_key[32] signature[64]
+network(str ≤ 16) domain_id[32] owner[32] valid_until.v public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
@@ -178,7 +186,7 @@ renouvellement) est une règle d'état (M8b).
 ## UPDATE_DOMAIN (0x52)
 
 ```text
-domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
+network(str ≤ 16) domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
 ```
 
 | Champ | Type | Contraintes |
@@ -235,21 +243,21 @@ structure wire ci-dessus, discriminant et octet de version compris,
 en s'arrêtant avant `signature` :
 
 ```text
-REGISTER_DOMAIN_sans_sig = disc(0x21) version(0x01) name domain_id[32] owner[32]
+REGISTER_DOMAIN_sans_sig = disc(0x21) version(0x01) network name domain_id[32] owner[32]
                             timestamp.v proof public_key[32]
-REGISTER_TLD_sans_sig    = disc(0x93) version(0x01) tld_id[32] owner[32]
+REGISTER_TLD_sans_sig    = disc(0x93) version(0x01) network tld tld_id[32] owner[32]
                             timestamp.v proof public_key[32]
-UPDATE_DOMAIN_sans_sig   = disc(0x52) version(0x01) domain_id[32] owner[32]
+UPDATE_DOMAIN_sans_sig   = disc(0x52) version(0x01) network domain_id[32] owner[32]
                             sequence.v record_hash[32] public_key[32]
-TRANSFER_TLD_sans_sig    = disc(0x47) version(0x01) tld_id[32] owner[32]
+TRANSFER_TLD_sans_sig    = disc(0x47) version(0x01) network tld_id[32] owner[32]
                             new_owner[32] public_key[32]
-REVOKE_TLD_sans_sig      = disc(0x6B) version(0x01) tld_id[32] owner[32]
+REVOKE_TLD_sans_sig      = disc(0x6B) version(0x01) network tld_id[32] owner[32]
                             public_key[32]
-SET_TLD_OPEN_sans_sig    = disc(0xB8) version(0x01) tld_id[32] owner[32]
+SET_TLD_OPEN_sans_sig    = disc(0xB8) version(0x01) network tld_id[32] owner[32]
                             open(0x00|0x01) public_key[32]
-ASSIGN_DOMAIN_sans_sig   = disc(0xD4) version(0x01) name domain_id[32] owner[32]
+ASSIGN_DOMAIN_sans_sig   = disc(0xD4) version(0x01) network name domain_id[32] owner[32]
                             assignee[32] public_key[32]
-RENEW_DOMAIN_sans_sig    = disc(0x3C) version(0x01) domain_id[32] owner[32]
+RENEW_DOMAIN_sans_sig    = disc(0x3C) version(0x01) network domain_id[32] owner[32]
                             valid_until.v public_key[32]
 ```
 
@@ -271,7 +279,11 @@ de travail de registration (module `scone-core::pow`).
 ### Digest
 
 ```text
-digest = BLAKE3-256("SCONE-POW-V1" || challenge || nonce_le64)
+digest = BLAKE3-256("SCONE-POW-V1" || network || challenge || nonce_le64)
+```
+
+`network` est le `network_id` canonique (M8b) : une preuve minée pour
+un réseau n'est pas une preuve sur un autre.
 ```
 
 `challenge` est l'entrée de dérivation de l'objet claimé —
@@ -298,21 +310,22 @@ basse *ou* plus haute) est rejeté (`InvalidProof`). Le nonce est
 ensuite re-vérifié à la difficulté constante, digest recomputé de
 zéro.
 
-### Constantes de difficulté (paramètres protocole)
+### Difficultés (paramètres **par réseau**, M8b)
 
-| Kind | Constante | Difficulté |
+| Kind | testnet | mainnet |
 |---|---|---|
-| `RegisterTld` | `TLD_POW_DIFFICULTY` | 24 bits |
-| `RegisterDomain` (TLD ouvert) | `DOMAIN_POW_DIFFICULTY` | 20 bits |
+| `RegisterTld` | 8 bits (symbolique, ms) | 24 bits |
+| `RegisterDomain` (TLD ouvert) | 4 bits (symbolique) | 20 bits |
 
-Claimer un namespace entier coûte ~16× le claim d'un nom à
-l'intérieur. Changer une constante = changement de consensus (les
-deux bornes divergent selon le fork).
+Claimer un namespace entier coûte toujours ~16× le claim d'un nom à
+l'intérieur. Les difficultés vivent dans
+`scone-core::network::NetworkParams` ; changer une valeur = changement
+de consensus **pour ce réseau**.
 
-Note d'étape : la vérification (`pow::verify`) est en place et
-normative ; le branchement à l'application d'état (quand la preuve
-est exigée — TLD ouvert — vs interdite — chemin assign-only) est la
-règle d'état M8b.
+Branchements d'état (M8b, livré) : `RegisterTld` exige TOUJOURS son
+PoW ; `RegisterDomain` l'exige sur un TLD **ouvert** (le chemin
+fermé est assign-only — `AssignDomain`, sans PoW, signé par l'owner
+du TLD).
 
 ## Règles de validation
 
@@ -328,15 +341,19 @@ Une transaction est valide si et seulement si :
 4. **signature** : `verify_strict` Ed25519 de `signature` sur le
    payload signé **recomputé de zéro** (jamais pris d'un pair ni de
    la transaction telle que fournie) ;
-5. **règles d'état** (à l'application dans un bloc) :
-   RegisterDomain → TLD du nom **enregistré** (`UnknownTld` sinon — D1)
-   puis domaine libre ; RegisterTld → TLD libre ;
+5. **règles d'état** (à l'application dans un bloc — M8b, voir
+   `/docs/technical/blockchain.md`) :
+   toutes → `network` == celui de la chaîne (`WrongNetwork` sinon) ;
+   RegisterTld → TLD libre + PoW (difficulté réseau) ;
+   RegisterDomain → TLD enregistré **et ouvert** + domaine libre
+   (grâce comprise) + PoW ;
    UpdateDomain → domaine existant, `owner` courant,
    `sequence == current + 1` ;
-   famille M8a (TransferTld, RevokeTld, SetTldOpen, AssignDomain,
-   RenewDomain) → **rejet explicite** `UnsupportedTransaction(nom)`
-   jusqu'à M8b (les règles d'état correspondantes ne sont pas encore
-   définies ; le rejet est typé et atomique, l'état reste inchangé).
+   TransferTld / RevokeTld / SetTldOpen → TLD existant, signataire =
+   owner du TLD ;
+   AssignDomain → TLD existant, signataire = owner du TLD, domaine
+   libre (sans PoW) ;
+   RenewDomain → domaine existant, owner, extension stricte ≤ 3 ans.
 
 La vérification utilise `verify_strict` (rejet des signatures
 malléables et des clés faibles/non canoniques), comme exigé pour des
@@ -422,4 +439,4 @@ depuis l'identité du keystore, jamais repris de l'entrée.
 
 | Version | Contenu | Statut |
 |---|---|---|
-| 1 | `public_key` + `signature` embarquées, payload `SCONE-TX-SIG-V1`, octet de version `0x01`, `RegisterDomain` porte le nom, `RegisterTld` (0x93), famille M8a : `TransferTld` (0x47), `RevokeTld` (0x6B), `SetTldOpen` (0xB8), `AssignDomain` (0xD4), `RenewDomain` (0x3C) — formats wire normatifs, règles d'état différées à M8b | courante |
+| 1 | `public_key` + `signature` embarquées, payload `SCONE-TX-SIG-V1`, octet de version `0x01`, `RegisterDomain` porte le nom, `RegisterTld` (0x93), famille M8a : `TransferTld` (0x47), `RevokeTld` (0x6B), `SetTldOpen` (0xB8), `AssignDomain` (0xD4), `RenewDomain` (0x3C) — formats wire normatifs ; M8b : champ `network` signé en tête de chaque payload, `RegisterTld` porte le nom, règles d'état complètes, difficultés PoW par réseau | courante |

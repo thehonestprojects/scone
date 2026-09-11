@@ -59,8 +59,7 @@ pub fn validate_transaction(tx: &Transaction) -> Result<()> {
 mod tests {
     use super::*;
     use scone_core::{
-        DomainId, DomainName, Proof, RecordHash, RegisterDomain, RegisterTld, TldId, TldName,
-        UpdateDomain,
+        DomainId, DomainName, Proof, RecordHash, RegisterDomain, RegisterTld, TldName, UpdateDomain,
     };
     use scone_crypto::{Signature, SigningKey};
 
@@ -70,10 +69,6 @@ mod tests {
 
     fn name() -> DomainName {
         DomainName::new("example.uip").unwrap()
-    }
-
-    fn tld_id() -> TldId {
-        TldId::from_tld(&TldName::new("uip").unwrap())
     }
 
     fn signed_register_domain(sk: &SigningKey) -> Transaction {
@@ -96,7 +91,7 @@ mod tests {
 
     fn signed_register_tld(sk: &SigningKey) -> Transaction {
         let unsigned = Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            tld_id(),
+            TldName::new("uip").unwrap(),
             1,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -104,7 +99,7 @@ mod tests {
         ));
         let payload = signing_payload(&unsigned).unwrap();
         Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            tld_id(),
+            TldName::new("uip").unwrap(),
             1,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),

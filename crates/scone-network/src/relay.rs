@@ -98,7 +98,18 @@ impl Relay {
     pub fn new(config: Config) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         let store = RedbStore::open(config.data_dir.join("chain.redb"))?;
-        let chain = store_integration::load_chain(&store)?;
+        let chain = store_integration::load_chain(&store, config.network)?;
+        // M8b: the relay's network and the store's chain must agree —
+        // a data directory is per-network by construction (the CLI
+        // enforces it); mixing them is a local misconfiguration, not
+        // untrusted input.
+        if chain.network().network_id != config.network.network_id {
+            let found = chain.network().network_id;
+            let wanted = config.network.network_id;
+            return Err(NetworkError::Peer(format!(
+                "data directory holds a '{found}' chain but this relay runs '{wanted}' — use a per-network data directory"
+            )));
+        }
         let mempool = Mempool::new(config.mempool_capacity);
         let rpc_addr = config.rpc_addr;
 

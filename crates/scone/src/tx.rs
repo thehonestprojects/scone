@@ -115,13 +115,15 @@ fn unsigned_into_transaction(
     use scone_protocol::UnsignedTransaction as U;
     match unsigned {
         U::RegisterDomain {
+            network,
             name,
             domain_id: _,
             owner: _,
             timestamp,
             proof,
             public_key,
-        } => scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+        } => scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_on(
+            network,
             name,
             timestamp,
             proof,
@@ -129,12 +131,14 @@ fn unsigned_into_transaction(
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::UpdateDomain {
+            network,
             domain_id,
             owner: _,
             sequence,
             record_hash,
             public_key,
-        } => scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
+        } => scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_on(
+            network,
             domain_id,
             sequence,
             record_hash,
@@ -142,67 +146,80 @@ fn unsigned_into_transaction(
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::RegisterTld {
-            tld_id,
+            network,
+            name: tld_name,
+            tld_id: _,
             owner: _,
             timestamp,
             proof,
             public_key,
-        } => scone_core::Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            tld_id,
+        } => scone_core::Transaction::RegisterTld(RegisterTld::register_tld_on(
+            network,
+            tld_name,
             timestamp,
             proof,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::TransferTld {
+            network,
             tld_id,
             owner: _,
             new_owner,
             public_key,
-        } => scone_core::Transaction::TransferTld(TransferTld::transfer_tld_signed(
+        } => scone_core::Transaction::TransferTld(TransferTld::transfer_tld_on(
+            network,
             tld_id,
             new_owner,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::RevokeTld {
+            network,
             tld_id,
             owner: _,
             public_key,
-        } => scone_core::Transaction::RevokeTld(RevokeTld::revoke_tld_signed(
+        } => scone_core::Transaction::RevokeTld(RevokeTld::revoke_tld_on(
+            network,
             tld_id,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::SetTldOpen {
+            network,
             tld_id,
             owner: _,
             open,
             public_key,
-        } => scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+        } => scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_on(
+            network,
             tld_id,
             open,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::AssignDomain {
+            network,
             name,
             domain_id: _,
             owner: _,
             assignee,
             public_key,
-        } => scone_core::Transaction::AssignDomain(AssignDomain::assign_domain_signed(
+        } => scone_core::Transaction::AssignDomain(AssignDomain::assign_domain_on(
+            network,
             name,
             assignee,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
         U::RenewDomain {
+            network,
             domain_id,
             owner: _,
             valid_until,
             public_key,
-        } => scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+        } => scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_on(
+            network,
             domain_id,
             valid_until,
             public_key,
@@ -231,7 +248,10 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
             let domain = DomainName::new(&name).map_err(CliError::Domain)?;
             let proof = match proof_hex {
                 Some(hex) => Proof::from_bytes(hex_decode("proof", &hex)?),
-                None => Proof::from_bytes(Vec::new()),
+                // M8b: registrations require a PoW; without an explicit
+                // proof, mine one at the testnet difficulty (symbolic —
+                // milliseconds).
+                None => crate::pow::mine_domain_proof(scone_core::TESTNET, &name),
             };
             let tx =
                 scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
@@ -257,11 +277,12 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
             let tld_name = scone_core::TldName::new(&tld).map_err(CliError::Domain)?;
             let proof = match proof_hex {
                 Some(hex) => Proof::from_bytes(hex_decode("proof", &hex)?),
-                None => Proof::from_bytes(Vec::new()),
+                // M8b: mine at the testnet difficulty (symbolic).
+                None => crate::pow::mine_tld_proof(scone_core::TESTNET, &tld),
             };
             let tx =
                 scone_core::Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-                    scone_core::TldId::from_tld(&tld_name),
+                    tld_name.clone(),
                     timestamp,
                     proof,
                     build_key.public_key(),
@@ -299,6 +320,78 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
                 ),
             ))
         }
+        // M8b family (offline build; no PoW — none of these is a
+        // registration).
+        TxKind::SetTldOpen { tld, open } => {
+            let tld_name = scone_core::TldName::new(&tld).map_err(CliError::Domain)?;
+            let tx = scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+                scone_core::TldId::from_tld(&tld_name),
+                open,
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((tx, format!("unsigned set-tld-open: {tld} (open={open})")))
+        }
+        TxKind::AssignDomain { name, assignee } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let bytes = hex_decode("assignee", &assignee)?;
+            if bytes.len() != 32 {
+                return Err(CliError::InvalidHashLength(bytes.len() * 2));
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&bytes);
+            let tx = scone_core::Transaction::AssignDomain(AssignDomain::assign_domain_signed(
+                domain.clone(),
+                scone_core::OwnerId::from_bytes(raw),
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((
+                tx,
+                format!("unsigned assign-domain: {}", domain.canonical()),
+            ))
+        }
+        TxKind::RenewDomain { name, valid_until } => {
+            let domain = DomainName::new(&name).map_err(CliError::Domain)?;
+            let tx = scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+                DomainId::from_name(&domain),
+                valid_until,
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((
+                tx,
+                format!(
+                    "unsigned renew-domain: {} (valid_until {valid_until})",
+                    domain.canonical()
+                ),
+            ))
+        }
+        TxKind::TransferTld { tld, new_owner } => {
+            let tld_name = scone_core::TldName::new(&tld).map_err(CliError::Domain)?;
+            let bytes = hex_decode("new owner", &new_owner)?;
+            if bytes.len() != 32 {
+                return Err(CliError::InvalidHashLength(bytes.len() * 2));
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&bytes);
+            let tx = scone_core::Transaction::TransferTld(TransferTld::transfer_tld_signed(
+                scone_core::TldId::from_tld(&tld_name),
+                scone_core::OwnerId::from_bytes(raw),
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((tx, format!("unsigned transfer-tld: {tld}")))
+        }
+        TxKind::RevokeTld { tld } => {
+            let tld_name = scone_core::TldName::new(&tld).map_err(CliError::Domain)?;
+            let tx = scone_core::Transaction::RevokeTld(RevokeTld::revoke_tld_signed(
+                scone_core::TldId::from_tld(&tld_name),
+                build_key.public_key(),
+                placeholder,
+            ));
+            Ok((tx, format!("unsigned revoke-tld: {tld}")))
+        }
     }
 }
 
@@ -327,7 +420,7 @@ fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transact
         }
         scone_core::Transaction::RegisterTld(t) => {
             scone_core::Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-                t.tld_id,
+                t.name.clone(),
                 t.timestamp,
                 t.proof.clone(),
                 sk.public_key(),
@@ -442,10 +535,24 @@ pub(crate) fn signed_register_domain_tx(
     domain: &DomainName,
     timestamp: u64,
 ) -> Result<scone_core::Transaction, CliError> {
-    let unsigned = scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+    signed_register_domain_tx_on(scone_core::TESTNET, sk, domain, timestamp)
+}
+
+/// [`signed_register_domain_tx`] for an explicit network (M8b): the
+/// registration PoW is mined at THAT network's difficulty (symbolic
+/// on testnet — milliseconds; real on mainnet).
+pub(crate) fn signed_register_domain_tx_on(
+    network: scone_core::NetworkParams,
+    sk: &SigningKey,
+    domain: &DomainName,
+    timestamp: u64,
+) -> Result<scone_core::Transaction, CliError> {
+    let proof = crate::pow::mine_domain_proof(network, domain.canonical());
+    let unsigned = scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_on(
+        network.network_id,
         domain.clone(),
         timestamp,
-        scone_core::Proof::from_bytes(Vec::new()),
+        proof,
         sk.public_key(),
         Signature::from_bytes([0; 64]),
     ));

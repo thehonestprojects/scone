@@ -126,12 +126,25 @@ mod tests {
             Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
                 DomainName::new(name).unwrap(),
                 1,
-                Proof::from_bytes(Vec::new()),
+                mined_domain_proof(name),
                 sk.public_key(),
                 Signature::from_bytes([0; 64]),
             )),
             sk,
         )
+    }
+
+    /// Mines a testnet domain registration proof (M8b).
+    fn mined_domain_proof(name: &str) -> Proof {
+        let mut challenge = Vec::new();
+        challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+        challenge.extend_from_slice(name.as_bytes());
+        let checked = scone_core::pow::mine(
+            scone_core::TESTNET.network_id,
+            &challenge,
+            scone_core::TESTNET.domain_pow_difficulty,
+        );
+        Proof::from_bytes(scone_core::pow::encode_proof(&checked))
     }
 
     fn signed_update_domain(sk: &SigningKey, sequence: u64) -> Transaction {
@@ -189,12 +202,37 @@ mod tests {
 
     /// Signs a TLD claim over the canonical payload (test helper, M7c:
     /// D1 requires the namespace on-chain before any domain under it).
+    /// Mines a testnet TLD registration proof (M8b).
+    fn mined_tld_proof(tld: &str) -> Proof {
+        let mut challenge = Vec::new();
+        challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+        challenge.extend_from_slice(tld.as_bytes());
+        let checked = scone_core::pow::mine(
+            scone_core::TESTNET.network_id,
+            &challenge,
+            scone_core::TESTNET.tld_pow_difficulty,
+        );
+        Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+    }
+
+    fn signed_set_tld_open(sk: &SigningKey, tld: &str, open: bool) -> Transaction {
+        sign(
+            Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+                scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+                open,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            sk,
+        )
+    }
+
     fn signed_register_tld(sk: &SigningKey, tld: &str) -> Transaction {
         sign(
             Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-                scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+                scone_core::TldName::new(tld).unwrap(),
                 1,
-                Proof::from_bytes(Vec::new()),
+                mined_tld_proof(tld),
                 sk.public_key(),
                 Signature::from_bytes([0; 64]),
             )),
@@ -207,6 +245,9 @@ mod tests {
         let sk = SigningKey::from_bytes([1; 32]);
         let mut builder = BlockBuilder::after(0, genesis_hash()).with_timestamp(1_700_000_000);
         builder.push_tx(signed_register_tld(&sk, "uip")).unwrap();
+        builder
+            .push_tx(signed_set_tld_open(&sk, "uip", true))
+            .unwrap();
         builder
             .push_tx(signed_register_domain(&sk, "example.uip"))
             .unwrap();
@@ -234,6 +275,7 @@ mod tests {
         let b1 = {
             let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
             b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
+            b.push_tx(signed_set_tld_open(&sk, "uip", true)).unwrap();
             b.push_tx(signed_register_domain(&sk, "example.uip"))
                 .unwrap();
             b.build().unwrap()
@@ -262,6 +304,7 @@ mod tests {
                 let mut b =
                     BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
                 b.push_tx(signed_register_tld(&sk, "uip")).unwrap();
+                b.push_tx(signed_set_tld_open(&sk, "uip", true)).unwrap();
                 b.push_tx(signed_register_domain(&sk, "example.uip"))
                     .unwrap();
                 b.build().unwrap()

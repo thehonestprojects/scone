@@ -4,7 +4,9 @@
 //!
 //! Extracted verbatim from `relay.rs` (pass 2 refactor); behavior
 //! contracts preserved — see the per-item doc comments (H2 duplicate
-//! rules, F1 production resilience).
+//! rules, F1 production resilience). M8b: the precheck mirrors the
+//! full state rules, including the network check (`WrongNetwork`) and
+//! the PoW/TLD-open preconditions of registrations.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,19 +101,33 @@ impl Relay {
         Ok(id)
     }
 
-    /// Cheap state precheck (full rules run again at push time).
+    /// Cheap state precheck (full rules run again at push time; PoW
+    /// verification is skipped here — it is expensive and the block
+    /// producer re-runs everything anyway).
     pub(super) fn precheck_state(
         &self,
         tx: &Transaction,
     ) -> std::result::Result<(), scone_blockchain::BlockchainError> {
         use scone_blockchain::BlockchainError;
+        // M8b: the network id must match this relay's network — a
+        // testnet tx never enters a mainnet mempool (typed
+        // `WrongNetwork`, before any other rule).
+        if tx.network() != self.chain.network().network_id {
+            return Err(BlockchainError::WrongNetwork {
+                tx: tx.network(),
+                chain: self.chain.network().network_id,
+            });
+        }
         match tx {
             Transaction::RegisterDomain(r) => {
-                // D1 (M7c): the TLD of the carried name must be
-                // registered (checked identically at push time).
+                // D1 (M7c) + M8b: the TLD of the carried name must be
+                // registered AND open for self-registration.
                 let tld_id = scone_core::TldId::from_tld(&r.name.tld());
-                if self.chain.state().tld(&tld_id).is_none() {
+                let Some(tld) = self.chain.state().tld(&tld_id) else {
                     return Err(BlockchainError::UnknownTld);
+                };
+                if !tld.open {
+                    return Err(BlockchainError::TldClosed);
                 }
                 if self.chain.state().domain(&r.domain_id).is_some() {
                     return Err(BlockchainError::DomainAlreadyRegistered);
@@ -141,21 +157,65 @@ impl Relay {
                 }
                 Ok(())
             }
-            // M8a family: types + wire exist, state rules land in M8b —
-            // mirror the chain-layer rejection here so the mempool
-            // never pools a transaction push_block would refuse.
-            Transaction::TransferTld(_) => {
-                Err(BlockchainError::UnsupportedTransaction("TransferTld"))
+            // M8b family: owner-of-record checks against the registry.
+            Transaction::TransferTld(t) => {
+                let tld = self
+                    .chain
+                    .state()
+                    .tld(&t.tld_id)
+                    .ok_or(BlockchainError::UnknownTld)?;
+                if tld.owner != t.owner {
+                    return Err(BlockchainError::NotTldOwner);
+                }
+                Ok(())
             }
-            Transaction::RevokeTld(_) => Err(BlockchainError::UnsupportedTransaction("RevokeTld")),
-            Transaction::SetTldOpen(_) => {
-                Err(BlockchainError::UnsupportedTransaction("SetTldOpen"))
+            Transaction::RevokeTld(r) => {
+                let tld = self
+                    .chain
+                    .state()
+                    .tld(&r.tld_id)
+                    .ok_or(BlockchainError::UnknownTld)?;
+                if tld.owner != r.owner {
+                    return Err(BlockchainError::NotTldOwner);
+                }
+                Ok(())
             }
-            Transaction::AssignDomain(_) => {
-                Err(BlockchainError::UnsupportedTransaction("AssignDomain"))
+            Transaction::SetTldOpen(s) => {
+                let tld = self
+                    .chain
+                    .state()
+                    .tld(&s.tld_id)
+                    .ok_or(BlockchainError::UnknownTld)?;
+                if tld.owner != s.owner {
+                    return Err(BlockchainError::NotTldOwner);
+                }
+                Ok(())
             }
-            Transaction::RenewDomain(_) => {
-                Err(BlockchainError::UnsupportedTransaction("RenewDomain"))
+            Transaction::AssignDomain(a) => {
+                let tld_id = scone_core::TldId::from_tld(&a.name.tld());
+                let tld = self
+                    .chain
+                    .state()
+                    .tld(&tld_id)
+                    .ok_or(BlockchainError::UnknownTld)?;
+                if tld.owner != a.owner {
+                    return Err(BlockchainError::NotTldOwner);
+                }
+                if self.chain.state().domain(&a.domain_id).is_some() {
+                    return Err(BlockchainError::DomainAlreadyRegistered);
+                }
+                Ok(())
+            }
+            Transaction::RenewDomain(r) => {
+                let state = self
+                    .chain
+                    .state()
+                    .domain(&r.domain_id)
+                    .ok_or(BlockchainError::UnknownDomain)?;
+                if state.owner != r.owner {
+                    return Err(BlockchainError::NotOwner);
+                }
+                Ok(())
             }
         }
     }

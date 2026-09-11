@@ -1,12 +1,18 @@
 //! Compact storage encoding of a [`DomainState`](scone_blockchain::DomainState).
 //!
-//! 41 or 73 bytes depending on the 1-byte tag:
+//! 41/73/89 bytes depending on the 1-byte tag:
 //!
 //! ```text
-//! DomainStateBytes = tag || owner(32) || sequence(8 BE) || record_hash?
-//!   tag = 0x01, record_hash present  -> 1 + 32 + 8 + 32 = 73 bytes
-//!   tag = 0x02, record_hash absent   -> 1 + 32 + 8       = 41 bytes
+//! DomainStateBytes = tag || owner(32) || sequence(8 BE)
+//!                    || registered_at(8 BE) || valid_until(8 BE) || record_hash?
+//!   tag = 0x01, record_hash present  -> 1 + 32 + 8 + 8 + 8 + 32 = 89 bytes
+//!   tag = 0x02, record_hash absent   -> 1 + 32 + 8 + 8 + 8       = 57 bytes
 //! ```
+//!
+//! (M7-era 41/73-byte encodings are NOT readable: the M8b state
+//! carries registration expiry; old stores fail with
+//! [`StorageError::Corrupted`] — regeneration via replay is the
+//! migration path.)
 //!
 //! Fixed-width big-endian integers keep the encoding canonical and
 //! byte-comparable. Decoding is strict: wrong tag, short buffer or
@@ -17,8 +23,9 @@ use scone_core::{DomainId, OwnerId, RecordHash, TldId};
 
 use crate::error::{Result, StorageError};
 
-/// Length of a `record_hash == None` encoding (tag + owner + sequence).
-pub const DOMAIN_STATE_LEN_NONE: usize = 41;
+/// Length of a `record_hash == None` encoding
+/// (tag + owner + sequence + registered_at + valid_until).
+pub const DOMAIN_STATE_LEN_NONE: usize = 57;
 
 /// Length of a `record_hash == Some(_)` encoding.
 pub const DOMAIN_STATE_LEN_SOME: usize = DOMAIN_STATE_LEN_NONE + 32;
@@ -38,13 +45,17 @@ impl From<&DomainState> for DomainStateBytes {
                 bytes[0] = TAG_WITH_HASH;
                 bytes[1..33].copy_from_slice(state.owner.as_bytes());
                 bytes[33..41].copy_from_slice(&state.sequence.to_be_bytes());
-                bytes[41..73].copy_from_slice(hash.as_bytes());
+                bytes[41..49].copy_from_slice(&state.registered_at.to_be_bytes());
+                bytes[49..57].copy_from_slice(&state.valid_until.to_be_bytes());
+                bytes[57..89].copy_from_slice(hash.as_bytes());
             }
             None => {
                 bytes[0] = TAG_WITHOUT_HASH;
                 bytes[1..33].copy_from_slice(state.owner.as_bytes());
                 bytes[33..41].copy_from_slice(&state.sequence.to_be_bytes());
-                // bytes[41..73] stay zero; `as_encoded` truncates.
+                bytes[41..49].copy_from_slice(&state.registered_at.to_be_bytes());
+                bytes[49..57].copy_from_slice(&state.valid_until.to_be_bytes());
+                // bytes[57..89] stay zero; `as_encoded` truncates.
             }
         }
         Self(bytes)
@@ -52,7 +63,7 @@ impl From<&DomainState> for DomainStateBytes {
 }
 
 impl DomainStateBytes {
-    /// The canonical encoded bytes (41 or 73 bytes long).
+    /// The canonical encoded bytes (57 or 89 bytes long).
     #[must_use]
     pub fn as_encoded(&self) -> &[u8] {
         let len = if self.0[0] == TAG_WITH_HASH {
@@ -72,21 +83,18 @@ impl DomainStateBytes {
     /// trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<DomainState> {
         let corrupted = |what: String| StorageError::Corrupted(format!("DomainStateBytes: {what}"));
-        let (tag, hash) = match bytes.first() {
+        let hash = match bytes.first() {
             Some(&TAG_WITH_HASH) if bytes.len() == DOMAIN_STATE_LEN_SOME => {
                 let mut hash = [0u8; 32];
-                hash.copy_from_slice(&bytes[41..73]);
-                (TAG_WITH_HASH, Some(RecordHash::from_bytes(hash)))
+                hash.copy_from_slice(&bytes[57..89]);
+                Some(RecordHash::from_bytes(hash))
             }
-            Some(&TAG_WITHOUT_HASH) if bytes.len() == DOMAIN_STATE_LEN_NONE => {
-                (TAG_WITHOUT_HASH, None)
-            }
+            Some(&TAG_WITHOUT_HASH) if bytes.len() == DOMAIN_STATE_LEN_NONE => None,
             Some(&other) => {
                 return Err(corrupted(format!("unknown tag {other:#04x}")));
             }
             None => return Err(corrupted("empty".into())),
         };
-        let _ = tag;
         let mut owner = [0u8; 32];
         owner.copy_from_slice(&bytes[1..33]);
         let sequence = u64::from_be_bytes(
@@ -94,10 +102,22 @@ impl DomainStateBytes {
                 .try_into()
                 .map_err(|_| corrupted("sequence".into()))?,
         );
+        let registered_at = u64::from_be_bytes(
+            bytes[41..49]
+                .try_into()
+                .map_err(|_| corrupted("registered_at".into()))?,
+        );
+        let valid_until = u64::from_be_bytes(
+            bytes[49..57]
+                .try_into()
+                .map_err(|_| corrupted("valid_until".into()))?,
+        );
         Ok(DomainState {
             owner: OwnerId::from_bytes(owner),
             sequence,
             record_hash: hash,
+            registered_at,
+            valid_until,
         })
     }
 }
@@ -118,40 +138,43 @@ pub(crate) fn decode_domain_entry(
     Ok((DomainId::from_bytes(*key), DomainStateBytes(bytes)))
 }
 
-/// Length of a [`TldStateBytes`] encoding (tag + owner), M7d.
-pub const TLD_STATE_LEN: usize = 33;
+/// Length of a [`TldStateBytes`] encoding (tag + owner + open), M8b.
+pub const TLD_STATE_LEN: usize = 34;
 
-/// Tag of the one and only (v1) [`TldStateBytes`] layout, M7d.
-const TAG_TLD_V1: u8 = 0x01;
+/// Tag of the (v2) [`TldStateBytes`] layout, M8b (the v1 33-byte
+/// layout without the `open` flag is unreadable — see module docs).
+const TAG_TLD_V2: u8 = 0x02;
 
-/// Storage encoding of one registered TLD's on-chain state (M7d).
+/// Storage encoding of one registered TLD's on-chain state (M8b).
 ///
-/// Always exactly 33 bytes:
+/// Always exactly 34 bytes:
 ///
 /// ```text
-/// TldStateBytes = tag(0x01) || owner(32)
+/// TldStateBytes = tag(0x02) || owner(32) || open(0x00|0x01)
 /// ```
 ///
 /// A TLD state carries no sequence and no record hash (the registry
 /// is claim-only in v1), so a tag is kept purely for forward
 /// evolution of the format — a future layout bumps the tag and old
 /// readers fail with [`StorageError::Corrupted`] instead of guessing.
-/// Decoding is strict: wrong tag, short buffer or trailing bytes is
-/// [`StorageError::Corrupted`], never a panic.
+/// Decoding is strict: wrong tag, short buffer, trailing bytes or a
+/// non-canonical boolean is [`StorageError::Corrupted`], never a
+/// panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TldStateBytes(pub [u8; TLD_STATE_LEN]);
 
 impl From<&TldState> for TldStateBytes {
     fn from(state: &TldState) -> Self {
         let mut bytes = [0u8; TLD_STATE_LEN];
-        bytes[0] = TAG_TLD_V1;
+        bytes[0] = TAG_TLD_V2;
         bytes[1..33].copy_from_slice(state.owner.as_bytes());
+        bytes[33] = u8::from(state.open);
         Self(bytes)
     }
 }
 
 impl TldStateBytes {
-    /// The canonical encoded bytes (always 33 bytes).
+    /// The canonical encoded bytes (always 34 bytes).
     #[must_use]
     pub fn as_encoded(&self) -> &[u8] {
         &self.0[..TLD_STATE_LEN]
@@ -162,21 +185,27 @@ impl TldStateBytes {
     ///
     /// # Errors
     ///
-    /// [`StorageError::Corrupted`] on unknown tag, wrong length or
-    /// trailing bytes.
+    /// [`StorageError::Corrupted`] on unknown tag, wrong length,
+    /// trailing bytes or a non-canonical boolean.
     pub fn decode(bytes: &[u8]) -> Result<TldState> {
         let corrupted = |what: String| StorageError::Corrupted(format!("TldStateBytes: {what}"));
         match bytes.first() {
-            Some(&TAG_TLD_V1) if bytes.len() == TLD_STATE_LEN => {}
+            Some(&TAG_TLD_V2) if bytes.len() == TLD_STATE_LEN => {}
             Some(&other) => {
                 return Err(corrupted(format!("unknown tag {other:#04x}")));
             }
             None => return Err(corrupted("empty".into())),
         }
+        let open = match bytes[33] {
+            0x00 => false,
+            0x01 => true,
+            other => return Err(corrupted(format!("non-canonical open flag {other:#04x}"))),
+        };
         let mut owner = [0u8; 32];
         owner.copy_from_slice(&bytes[1..33]);
         Ok(TldState {
             owner: OwnerId::from_bytes(owner),
+            open,
         })
     }
 }
@@ -198,6 +227,8 @@ mod tests {
             owner: OwnerId::from_bytes([7; 32]),
             sequence: 0x0102_0304_0506_0708,
             record_hash,
+            registered_at: 1_700_000_000,
+            valid_until: 1_731_248_000,
         }
     }
 
@@ -235,6 +266,8 @@ mod tests {
             owner: OwnerId::from_bytes([0; 32]),
             sequence: 0,
             record_hash: None,
+            registered_at: 0,
+            valid_until: 0,
         };
         let encoded = DomainStateBytes::from(&original);
         assert_eq!(
@@ -249,6 +282,8 @@ mod tests {
             owner: OwnerId::from_bytes([1; 32]),
             sequence: u64::MAX,
             record_hash: Some(hash(3)),
+            registered_at: u64::MAX,
+            valid_until: u64::MAX,
         };
         let encoded = DomainStateBytes::from(&original);
         assert_eq!(
@@ -271,6 +306,20 @@ mod tests {
         encoded.0[0] = 0x03;
         assert!(matches!(
             DomainStateBytes::decode(encoded.as_encoded()),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_m7_length_is_corrupted() {
+        // A 41/73-byte M7-era encoding must not decode as an M8b
+        // state: the expiry fields would be garbage.
+        assert!(matches!(
+            DomainStateBytes::decode(&[0x02; 41]),
+            Err(StorageError::Corrupted(_))
+        ));
+        assert!(matches!(
+            DomainStateBytes::decode(&[0x01; 73]),
             Err(StorageError::Corrupted(_))
         ));
     }
@@ -310,23 +359,27 @@ mod tests {
         assert!(decode_domain_entry(&[0; 31], encoded.as_encoded()).is_err());
     }
 
-    // --- TldStateBytes (M7d) ---
+    // --- TldStateBytes (M7d + M8b open flag) ---
 
-    fn tld_state() -> TldState {
+    fn tld_state(open: bool) -> TldState {
         TldState {
             owner: OwnerId::from_bytes([0x0a; 32]),
+            open,
         }
     }
 
     #[test]
     fn tld_roundtrip() {
-        let encoded = TldStateBytes::from(&tld_state());
-        assert_eq!(encoded.as_encoded().len(), TLD_STATE_LEN);
-        assert_eq!(encoded.as_encoded()[0], 1);
-        assert_eq!(
-            TldStateBytes::decode(encoded.as_encoded()).unwrap(),
-            tld_state()
-        );
+        for open in [false, true] {
+            let original = tld_state(open);
+            let encoded = TldStateBytes::from(&original);
+            assert_eq!(encoded.as_encoded().len(), TLD_STATE_LEN);
+            assert_eq!(encoded.as_encoded()[0], 0x02);
+            assert_eq!(
+                TldStateBytes::decode(encoded.as_encoded()).unwrap(),
+                original
+            );
+        }
     }
 
     #[test]
@@ -339,8 +392,18 @@ mod tests {
 
     #[test]
     fn tld_unknown_tag_is_corrupted() {
-        let mut encoded = TldStateBytes::from(&tld_state());
-        encoded.0[0] = 0x02;
+        let mut encoded = TldStateBytes::from(&tld_state(false));
+        encoded.0[0] = 0x01;
+        assert!(matches!(
+            TldStateBytes::decode(encoded.as_encoded()),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn tld_non_canonical_open_is_corrupted() {
+        let mut encoded = TldStateBytes::from(&tld_state(false));
+        encoded.0[33] = 0x02;
         assert!(matches!(
             TldStateBytes::decode(encoded.as_encoded()),
             Err(StorageError::Corrupted(_))
@@ -349,7 +412,7 @@ mod tests {
 
     #[test]
     fn tld_trailing_bytes_are_corrupted() {
-        let encoded = TldStateBytes::from(&tld_state());
+        let encoded = TldStateBytes::from(&tld_state(false));
         let mut extended = encoded.as_encoded().to_vec();
         extended.push(0);
         assert!(matches!(
@@ -360,9 +423,9 @@ mod tests {
 
     #[test]
     fn tld_truncated_input_is_corrupted() {
-        let encoded = TldStateBytes::from(&tld_state());
+        let encoded = TldStateBytes::from(&tld_state(false));
         assert!(matches!(
-            TldStateBytes::decode(&encoded.as_encoded()[..32]),
+            TldStateBytes::decode(&encoded.as_encoded()[..33]),
             Err(StorageError::Corrupted(_))
         ));
     }
@@ -370,7 +433,7 @@ mod tests {
     #[test]
     fn decode_tld_entry_roundtrip() {
         let key = [0xcd; 32];
-        let encoded = TldStateBytes::from(&tld_state());
+        let encoded = TldStateBytes::from(&tld_state(true));
         let (tld, back) = decode_tld_entry(&key, encoded.as_encoded()).unwrap();
         assert_eq!(tld.as_bytes(), &key);
         assert_eq!(back.as_encoded(), encoded.as_encoded());
@@ -378,8 +441,8 @@ mod tests {
 
     #[test]
     fn decode_tld_entry_rejects_bad_key_and_value() {
-        let encoded = TldStateBytes::from(&tld_state());
+        let encoded = TldStateBytes::from(&tld_state(false));
         assert!(decode_tld_entry(&[0; 31], encoded.as_encoded()).is_err());
-        assert!(decode_tld_entry(&[0xcd; 32], &encoded.as_encoded()[..32]).is_err());
+        assert!(decode_tld_entry(&[0xcd; 32], &encoded.as_encoded()[..33]).is_err());
     }
 }

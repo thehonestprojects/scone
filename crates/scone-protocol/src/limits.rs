@@ -8,6 +8,9 @@
 /// Maximum encoded domain name length (matches `DomainName::MAX_TOTAL_LEN`).
 pub const MAX_NAME_LEN: usize = scone_core::DomainName::MAX_TOTAL_LEN;
 
+/// Maximum encoded TLD name length (matches `TldName::MAX_LEN`, M8b).
+pub const MAX_TLD_LEN: usize = scone_core::TldName::MAX_LEN;
+
 /// Maximum TXT string length.
 pub const MAX_TXT_LEN: usize = 4096;
 

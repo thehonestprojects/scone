@@ -54,14 +54,14 @@ mod tests {
     use scone_storage::RedbStore;
 
     fn register_domain_tx(name: &str, seed: u8) -> scone_core::Transaction {
-        use scone_core::{DomainName, Proof, RegisterDomain};
+        use scone_core::{DomainName, RegisterDomain};
         use scone_crypto::{Signature, SigningKey};
         let sk = SigningKey::from_bytes([seed; 32]);
         let unsigned =
             scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
                 DomainName::new(name).unwrap(),
                 1,
-                Proof::from_bytes(Vec::new()),
+                mined_domain_proof(name),
                 sk.public_key(),
                 Signature::from_bytes([0; 64]),
             ));
@@ -76,13 +76,13 @@ mod tests {
     }
 
     fn register_tld_tx(tld: &str, seed: u8) -> scone_core::Transaction {
-        use scone_core::{Proof, RegisterTld, TldId, TldName};
+        use scone_core::{RegisterTld, TldName};
         use scone_crypto::{Signature, SigningKey};
         let sk = SigningKey::from_bytes([seed; 32]);
         let unsigned = scone_core::Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            TldId::from_tld(&TldName::new(tld).unwrap()),
+            TldName::new(tld).unwrap(),
             1,
-            Proof::from_bytes(Vec::new()),
+            mined_tld_proof(tld),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         ));
@@ -91,6 +91,54 @@ mod tests {
             scone_core::Transaction::RegisterTld(mut t) => {
                 t.signature = sk.sign(&payload);
                 scone_core::Transaction::RegisterTld(t)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Mines a testnet TLD registration proof (M8b).
+    fn mined_tld_proof(tld: &str) -> scone_core::Proof {
+        let mut challenge = Vec::new();
+        challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+        challenge.extend_from_slice(tld.as_bytes());
+        let checked = scone_core::pow::mine(
+            scone_core::TESTNET.network_id,
+            &challenge,
+            scone_core::TESTNET.tld_pow_difficulty,
+        );
+        scone_core::Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+    }
+
+    /// Mines a testnet domain registration proof (M8b).
+    fn mined_domain_proof(name: &str) -> scone_core::Proof {
+        let mut challenge = Vec::new();
+        challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+        challenge.extend_from_slice(name.as_bytes());
+        let checked = scone_core::pow::mine(
+            scone_core::TESTNET.network_id,
+            &challenge,
+            scone_core::TESTNET.domain_pow_difficulty,
+        );
+        scone_core::Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+    }
+
+    /// Signs a SetTldOpen tx (M8b: a fresh TLD is closed; the
+    /// canonical domain fixture opens it).
+    fn set_tld_open_tx(seed: u8, tld: &str, open: bool) -> scone_core::Transaction {
+        use scone_core::SetTldOpen;
+        use scone_crypto::{Signature, SigningKey};
+        let sk = SigningKey::from_bytes([seed; 32]);
+        let unsigned = scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+            open,
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+        match unsigned {
+            scone_core::Transaction::SetTldOpen(mut t) => {
+                t.signature = sk.sign(&payload);
+                scone_core::Transaction::SetTldOpen(t)
             }
             _ => unreachable!(),
         }
@@ -105,8 +153,11 @@ mod tests {
             let mut builder =
                 BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(i + 1);
             if i == 0 {
-                // D1 (M7c): claim the namespace before any domain.
+                // D1 (M7c) + M8b: claim the namespace, open it, then
+                // the first domain (self-registration requires an
+                // open TLD).
                 builder.push_tx(register_tld_tx("uip", 1)).unwrap();
+                builder.push_tx(set_tld_open_tx(1, "uip", true)).unwrap();
             }
             builder
                 .push_tx(register_domain_tx(

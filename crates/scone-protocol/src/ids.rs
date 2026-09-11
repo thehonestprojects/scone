@@ -32,6 +32,54 @@ impl_fixed_id!(PublicKeyRef);
 impl_fixed_id!(RecordHash);
 impl_fixed_id!(scone_core::TldId);
 
+// Network ids (M8b): varint length + canonical ASCII bytes,
+// re-validated by `scone-core` on decode (no duplicated rules).
+
+impl Encode for scone_core::NetworkId {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        codec::put_bounded(
+            self.as_bytes(),
+            scone_core::network::MAX_NETWORK_ID_LEN,
+            "network id length",
+            out,
+        )
+    }
+}
+
+impl Decode for scone_core::NetworkId {
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let bytes = codec::take_bytes(
+            input,
+            scone_core::network::MAX_NETWORK_ID_LEN,
+            "network id length",
+        )?;
+        let text = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
+        scone_core::NetworkId::new(text).map_err(ProtocolError::Validation)
+    }
+}
+
+// TLD names (M8b): varint length + canonical UTF-8 bytes,
+// re-validated by `scone-core` on decode (same shape as DomainName).
+
+impl Encode for scone_core::TldName {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        codec::put_bounded(
+            self.as_str().as_bytes(),
+            limits::MAX_TLD_LEN,
+            "TLD length",
+            out,
+        )
+    }
+}
+
+impl Decode for scone_core::TldName {
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let bytes = codec::take_bytes(input, limits::MAX_TLD_LEN, "TLD length")?;
+        let name = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)?;
+        scone_core::TldName::new(name).map_err(ProtocolError::Validation)
+    }
+}
+
 // Domain names: varint length + canonical UTF-8 bytes, re-validated by
 // `scone-core` on decode (no duplicated naming rules).
 

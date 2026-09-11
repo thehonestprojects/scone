@@ -75,9 +75,49 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
 fn register_tld_tx(sk: &SigningKey, tld: &str) -> Transaction {
     sign(
         Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
-            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            scone_core::TldName::new(tld).expect("valid tld"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_tld_proof(tld),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        )),
+        sk,
+    )
+}
+
+/// Mines a testnet TLD registration proof (M8b).
+fn mined_tld_proof(tld: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+    challenge.extend_from_slice(tld.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.tld_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Mines a testnet domain registration proof (M8b).
+fn mined_domain_proof(name: &str) -> Proof {
+    let mut challenge = Vec::new();
+    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+    challenge.extend_from_slice(name.as_bytes());
+    let checked = scone_core::pow::mine(
+        scone_core::TESTNET.network_id,
+        &challenge,
+        scone_core::TESTNET.domain_pow_difficulty,
+    );
+    Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+}
+
+/// Signs a SetTldOpen tx (M8b: a fresh TLD is closed; the canonical
+/// domain-registration fixture opens it).
+fn set_tld_open_tx(sk: &SigningKey, tld: &str, open: bool) -> Transaction {
+    sign(
+        Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+            scone_core::TldId::from_tld(&scone_core::TldName::new(tld).expect("valid tld")),
+            open,
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -90,7 +130,7 @@ fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
         Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
             DomainName::new(name).expect("valid name"),
             1_700_000_000,
-            Proof::from_bytes(Vec::new()),
+            mined_domain_proof(name),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         )),
@@ -337,6 +377,29 @@ async fn three_nodes_cycle_security_regression() {
         );
     }
 
+    // M8b: open the namespace (a fresh TLD is assign-only).
+    let open_hex = hex(&encode_to_vec(&set_tld_open_tx(&sk, "uip", true)).expect("encode open"));
+    let response = nodes[0]
+        .client_ref()
+        .request(RpcRequest::SubmitTx { tx_hex: open_hex })
+        .await;
+    match response {
+        Ok(RpcResponse::Ok { data }) => {
+            assert!(
+                data["txid"].as_str().is_some_and(|t| t.len() == 64),
+                "{data}"
+            );
+        }
+        other => panic!("open tx rejected: {other:?}"),
+    }
+    for node in &nodes {
+        let status = wait_for_height(node.client_ref(), 2, deadline).await;
+        assert_eq!(
+            status["domain_count"], 0,
+            "namespace open, no domain yet: {status}"
+        );
+    }
+
     // ---- H2: one valid tx on the cycle must settle, not loop ------
     let name = "cycle.uip";
     let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
@@ -356,9 +419,9 @@ async fn three_nodes_cycle_security_regression() {
         other => panic!("valid tx rejected: {other:?}"),
     }
 
-    // A produces a block; everyone syncs to height 2.
+    // A produces a block; everyone syncs to height 3.
     for node in &nodes {
-        let status = wait_for_height(node.client_ref(), 2, deadline).await;
+        let status = wait_for_height(node.client_ref(), 3, deadline).await;
         assert_eq!(
             status["domain_count"], 1,
             "domain registered everywhere: {status}"
@@ -410,7 +473,7 @@ async fn three_nodes_cycle_security_regression() {
         "update tx accepted: {response:?}"
     );
     for node in &nodes {
-        wait_for_height(node.client_ref(), 3, deadline).await;
+        wait_for_height(node.client_ref(), 4, deadline).await;
     }
 
     let record_hex = hex(&encode_to_vec(&record).expect("encode record"));
@@ -472,6 +535,6 @@ async fn three_nodes_cycle_security_regression() {
     // Final liveness check on all three nodes.
     for node in &nodes {
         let status = status_of(node.client_ref(), deadline).await;
-        assert_eq!(status["height"], 3, "everyone at height 3: {status}");
+        assert_eq!(status["height"], 4, "everyone at height 4: {status}");
     }
 }

@@ -122,17 +122,20 @@ impl Decode for Signature {
     }
 }
 
-// RegisterDomain = name(str ≤ 253) || domain_id[32] || owner[32]
-//          || timestamp.v || proof || public_key[32] || signature[64]
+// RegisterDomain = network(str ≤ 16) || name(str ≤ 253) || domain_id[32]
+//        || owner[32] || timestamp.v || proof || public_key[32]
+//        || signature[64]
 //
 // The canonical name is carried in clear (M7b): the chain is
 // self-describing and decode re-checks domain_id == from_name(name).
+// The network id is a signed field (M8b).
 
 impl Encode for RegisterDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         // Binding owner/pk and name/id vérifié aussi à l'encodage
         // (symétrie avec UpdateDomain, docs/transactions.md — doc normative).
         self.validate()?;
+        self.network.encode(out)?;
         self.name.encode(out)?;
         self.domain_id.encode(out)?;
         self.owner.encode(out)?;
@@ -146,6 +149,7 @@ impl Encode for RegisterDomain {
 impl Decode for RegisterDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let register = Self {
+            network: scone_core::NetworkId::decode(input)?,
             name: DomainName::decode(input)?,
             domain_id: DomainId::decode(input)?,
             owner: OwnerId::decode(input)?,
@@ -159,12 +163,19 @@ impl Decode for RegisterDomain {
     }
 }
 
-// RegisterTld = tld_id[32] || owner[32] || timestamp.v || proof
-//            || public_key[32] || signature[64]
+// RegisterTld (M8b) = network(str ≤ 16) || tld(str ≤ 63)
+//        || tld_id[32] || owner[32] || timestamp.v || proof
+//        || public_key[32] || signature[64]
+//
+// The TLD name is carried in clear (M8b, mirroring RegisterDomain):
+// the registration PoW challenge is derived from the name and decode
+// re-checks tld_id == from_tld(name).
 
 impl Encode for RegisterTld {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
+        self.name.encode(out)?;
         self.tld_id.encode(out)?;
         self.owner.encode(out)?;
         varint::put_u64(self.timestamp, out);
@@ -177,6 +188,8 @@ impl Encode for RegisterTld {
 impl Decode for RegisterTld {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let register_tld = Self {
+            network: scone_core::NetworkId::decode(input)?,
+            name: scone_core::TldName::decode(input)?,
             tld_id: scone_core::TldId::decode(input)?,
             owner: OwnerId::decode(input)?,
             timestamp: u64::decode(input)?,
@@ -189,12 +202,14 @@ impl Decode for RegisterTld {
     }
 }
 
-// UpdateDomain = domain_id[32] || owner[32] || sequence.v || record_hash[32]
-//        || public_key[32] || signature[64]
+// UpdateDomain = network(str ≤ 16) || domain_id[32] || owner[32]
+//        || sequence.v || record_hash[32] || public_key[32]
+//        || signature[64]
 
 impl Encode for UpdateDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.domain_id.encode(out)?;
         self.owner.encode(out)?;
         varint::put_u64(self.sequence, out);
@@ -207,6 +222,7 @@ impl Encode for UpdateDomain {
 impl Decode for UpdateDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let update = Self {
+            network: scone_core::NetworkId::decode(input)?,
             domain_id: DomainId::decode(input)?,
             owner: OwnerId::decode(input)?,
             sequence: u64::decode(input)?,
@@ -247,6 +263,7 @@ impl Decode for bool {
 impl Encode for TransferTld {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.tld_id.encode(out)?;
         self.owner.encode(out)?;
         self.new_owner.encode(out)?;
@@ -258,6 +275,7 @@ impl Encode for TransferTld {
 impl Decode for TransferTld {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let transfer = Self {
+            network: scone_core::NetworkId::decode(input)?,
             tld_id: scone_core::TldId::decode(input)?,
             owner: OwnerId::decode(input)?,
             new_owner: OwnerId::decode(input)?,
@@ -275,6 +293,7 @@ impl Decode for TransferTld {
 impl Encode for RevokeTld {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.tld_id.encode(out)?;
         self.owner.encode(out)?;
         self.public_key.encode(out)?;
@@ -285,6 +304,7 @@ impl Encode for RevokeTld {
 impl Decode for RevokeTld {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let revoke = Self {
+            network: scone_core::NetworkId::decode(input)?,
             tld_id: scone_core::TldId::decode(input)?,
             owner: OwnerId::decode(input)?,
             public_key: PublicKey::decode(input)?,
@@ -301,6 +321,7 @@ impl Decode for RevokeTld {
 impl Encode for SetTldOpen {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.tld_id.encode(out)?;
         self.owner.encode(out)?;
         self.open.encode(out)?;
@@ -312,6 +333,7 @@ impl Encode for SetTldOpen {
 impl Decode for SetTldOpen {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let set_open = Self {
+            network: scone_core::NetworkId::decode(input)?,
             tld_id: scone_core::TldId::decode(input)?,
             owner: OwnerId::decode(input)?,
             open: bool::decode(input)?,
@@ -332,6 +354,7 @@ impl Decode for SetTldOpen {
 impl Encode for AssignDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.name.encode(out)?;
         self.domain_id.encode(out)?;
         self.owner.encode(out)?;
@@ -344,6 +367,7 @@ impl Encode for AssignDomain {
 impl Decode for AssignDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let assign = Self {
+            network: scone_core::NetworkId::decode(input)?,
             name: DomainName::decode(input)?,
             domain_id: DomainId::decode(input)?,
             owner: OwnerId::decode(input)?,
@@ -362,6 +386,7 @@ impl Decode for AssignDomain {
 impl Encode for RenewDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
         self.domain_id.encode(out)?;
         self.owner.encode(out)?;
         varint::put_u64(self.valid_until, out);
@@ -373,6 +398,7 @@ impl Encode for RenewDomain {
 impl Decode for RenewDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let renew = Self {
+            network: scone_core::NetworkId::decode(input)?,
             domain_id: DomainId::decode(input)?,
             owner: OwnerId::decode(input)?,
             valid_until: u64::decode(input)?,
@@ -463,6 +489,8 @@ impl Decode for Transaction {
 pub enum UnsignedTransaction {
     /// See [`scone_core::RegisterDomain`].
     RegisterDomain {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Claimed domain, canonical name.
         name: DomainName,
         /// Derived identity of `name`.
@@ -478,6 +506,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::UpdateDomain`].
     UpdateDomain {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Target domain.
         domain_id: DomainId,
         /// Derived owner identity.
@@ -491,6 +521,10 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::RegisterTld`].
     RegisterTld {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
+        /// Claimed TLD, canonical name (M8b).
+        name: scone_core::TldName,
         /// Claimed TLD (namespace id).
         tld_id: scone_core::TldId,
         /// Derived owner identity.
@@ -504,6 +538,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::TransferTld`] (M8a).
     TransferTld {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Transferred TLD.
         tld_id: scone_core::TldId,
         /// Derived owner identity (current owner / signer).
@@ -515,6 +551,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::RevokeTld`] (M8a).
     RevokeTld {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Relinquished TLD.
         tld_id: scone_core::TldId,
         /// Derived owner identity.
@@ -524,6 +562,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::SetTldOpen`] (M8a).
     SetTldOpen {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// TLD whose registration policy changes.
         tld_id: scone_core::TldId,
         /// Derived owner identity.
@@ -535,6 +575,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::AssignDomain`] (M8a).
     AssignDomain {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Assigned domain, canonical name.
         name: DomainName,
         /// Derived identity of `name`.
@@ -548,6 +590,8 @@ pub enum UnsignedTransaction {
     },
     /// See [`scone_core::RenewDomain`] (M8a).
     RenewDomain {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
         /// Domain whose registration is extended.
         domain_id: DomainId,
         /// Derived owner identity.
@@ -563,6 +607,7 @@ impl From<&Transaction> for UnsignedTransaction {
     fn from(tx: &Transaction) -> Self {
         match tx {
             Transaction::RegisterDomain(tx) => Self::RegisterDomain {
+                network: tx.network,
                 name: tx.name.clone(),
                 domain_id: tx.domain_id,
                 owner: tx.owner,
@@ -571,6 +616,7 @@ impl From<&Transaction> for UnsignedTransaction {
                 public_key: tx.public_key,
             },
             Transaction::UpdateDomain(tx) => Self::UpdateDomain {
+                network: tx.network,
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 sequence: tx.sequence,
@@ -578,6 +624,8 @@ impl From<&Transaction> for UnsignedTransaction {
                 public_key: tx.public_key,
             },
             Transaction::RegisterTld(tx) => Self::RegisterTld {
+                network: tx.network,
+                name: tx.name.clone(),
                 tld_id: tx.tld_id,
                 owner: tx.owner,
                 timestamp: tx.timestamp,
@@ -585,23 +633,27 @@ impl From<&Transaction> for UnsignedTransaction {
                 public_key: tx.public_key,
             },
             Transaction::TransferTld(tx) => Self::TransferTld {
+                network: tx.network,
                 tld_id: tx.tld_id,
                 owner: tx.owner,
                 new_owner: tx.new_owner,
                 public_key: tx.public_key,
             },
             Transaction::RevokeTld(tx) => Self::RevokeTld {
+                network: tx.network,
                 tld_id: tx.tld_id,
                 owner: tx.owner,
                 public_key: tx.public_key,
             },
             Transaction::SetTldOpen(tx) => Self::SetTldOpen {
+                network: tx.network,
                 tld_id: tx.tld_id,
                 owner: tx.owner,
                 open: tx.open,
                 public_key: tx.public_key,
             },
             Transaction::AssignDomain(tx) => Self::AssignDomain {
+                network: tx.network,
                 name: tx.name.clone(),
                 domain_id: tx.domain_id,
                 owner: tx.owner,
@@ -609,6 +661,7 @@ impl From<&Transaction> for UnsignedTransaction {
                 public_key: tx.public_key,
             },
             Transaction::RenewDomain(tx) => Self::RenewDomain {
+                network: tx.network,
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 valid_until: tx.valid_until,
@@ -622,6 +675,7 @@ impl Encode for UnsignedTransaction {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::RegisterDomain {
+                network,
                 name,
                 domain_id,
                 owner,
@@ -631,6 +685,7 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::REGISTER_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 name.encode(out)?;
                 domain_id.encode(out)?;
                 owner.encode(out)?;
@@ -639,6 +694,7 @@ impl Encode for UnsignedTransaction {
                 public_key.encode(out)
             }
             Self::UpdateDomain {
+                network,
                 domain_id,
                 owner,
                 sequence,
@@ -647,6 +703,7 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::UPDATE_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 domain_id.encode(out)?;
                 owner.encode(out)?;
                 varint::put_u64(*sequence, out);
@@ -654,6 +711,8 @@ impl Encode for UnsignedTransaction {
                 public_key.encode(out)
             }
             Self::RegisterTld {
+                network,
+                name,
                 tld_id,
                 owner,
                 timestamp,
@@ -662,6 +721,8 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::REGISTER_TLD);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
+                name.encode(out)?;
                 tld_id.encode(out)?;
                 owner.encode(out)?;
                 varint::put_u64(*timestamp, out);
@@ -669,6 +730,7 @@ impl Encode for UnsignedTransaction {
                 public_key.encode(out)
             }
             Self::TransferTld {
+                network,
                 tld_id,
                 owner,
                 new_owner,
@@ -676,23 +738,27 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::TRANSFER_TLD);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 tld_id.encode(out)?;
                 owner.encode(out)?;
                 new_owner.encode(out)?;
                 public_key.encode(out)
             }
             Self::RevokeTld {
+                network,
                 tld_id,
                 owner,
                 public_key,
             } => {
                 out.push(tx_type::REVOKE_TLD);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 tld_id.encode(out)?;
                 owner.encode(out)?;
                 public_key.encode(out)
             }
             Self::SetTldOpen {
+                network,
                 tld_id,
                 owner,
                 open,
@@ -700,12 +766,14 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::SET_TLD_OPEN);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 tld_id.encode(out)?;
                 owner.encode(out)?;
                 open.encode(out)?;
                 public_key.encode(out)
             }
             Self::AssignDomain {
+                network,
                 name,
                 domain_id,
                 owner,
@@ -714,6 +782,7 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::ASSIGN_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 name.encode(out)?;
                 domain_id.encode(out)?;
                 owner.encode(out)?;
@@ -721,6 +790,7 @@ impl Encode for UnsignedTransaction {
                 public_key.encode(out)
             }
             Self::RenewDomain {
+                network,
                 domain_id,
                 owner,
                 valid_until,
@@ -728,6 +798,7 @@ impl Encode for UnsignedTransaction {
             } => {
                 out.push(tx_type::RENEW_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
                 domain_id.encode(out)?;
                 owner.encode(out)?;
                 varint::put_u64(*valid_until, out);
@@ -746,6 +817,7 @@ impl Decode for UnsignedTransaction {
         }
         Ok(match disc {
             tx_type::REGISTER_DOMAIN => Self::RegisterDomain {
+                network: scone_core::NetworkId::decode(input)?,
                 name: DomainName::decode(input)?,
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
@@ -754,6 +826,7 @@ impl Decode for UnsignedTransaction {
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::UPDATE_DOMAIN => Self::UpdateDomain {
+                network: scone_core::NetworkId::decode(input)?,
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 sequence: u64::decode(input)?,
@@ -761,6 +834,8 @@ impl Decode for UnsignedTransaction {
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::REGISTER_TLD => Self::RegisterTld {
+                network: scone_core::NetworkId::decode(input)?,
+                name: scone_core::TldName::decode(input)?,
                 tld_id: scone_core::TldId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 timestamp: u64::decode(input)?,
@@ -768,23 +843,27 @@ impl Decode for UnsignedTransaction {
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::TRANSFER_TLD => Self::TransferTld {
+                network: scone_core::NetworkId::decode(input)?,
                 tld_id: scone_core::TldId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 new_owner: OwnerId::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::REVOKE_TLD => Self::RevokeTld {
+                network: scone_core::NetworkId::decode(input)?,
                 tld_id: scone_core::TldId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::SET_TLD_OPEN => Self::SetTldOpen {
+                network: scone_core::NetworkId::decode(input)?,
                 tld_id: scone_core::TldId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 open: bool::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::ASSIGN_DOMAIN => Self::AssignDomain {
+                network: scone_core::NetworkId::decode(input)?,
                 name: DomainName::decode(input)?,
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
@@ -792,6 +871,7 @@ impl Decode for UnsignedTransaction {
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::RENEW_DOMAIN => Self::RenewDomain {
+                network: scone_core::NetworkId::decode(input)?,
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 valid_until: u64::decode(input)?,
@@ -849,6 +929,10 @@ mod tests {
         TldId::from_tld(&TldName::new("uip").unwrap())
     }
 
+    fn tld_name() -> TldName {
+        TldName::new("uip").unwrap()
+    }
+
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes([seed; 32])
     }
@@ -894,7 +978,7 @@ mod tests {
     fn signed_register_tld() -> RegisterTld {
         let sk = key(1);
         let unsigned = Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            tld_id(),
+            tld_name(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -902,7 +986,7 @@ mod tests {
         ));
         let payload = signing_payload(&unsigned).unwrap();
         RegisterTld::register_tld_signed(
-            tld_id(),
+            tld_name(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -989,9 +1073,10 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::RegisterDomain(signed_register_domain())).unwrap();
         assert_eq!(bytes[0], tx_type::REGISTER_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + name (1 + 11) + domain_id + owner
-        // + timestamp (5-byte varint) + empty proof (1) + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 1 + 11 + 32 + 32 + 5 + 1 + 32 + 64);
+        // disc + version + network (1 + 14) + name (1 + 11) + domain_id
+        // + owner + timestamp (5-byte varint) + empty proof (1) + pk
+        // + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 1 + 11 + 32 + 32 + 5 + 1 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::RegisterDomain(signed_register_domain())
@@ -1003,9 +1088,9 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::UpdateDomain(signed_update_domain())).unwrap();
         assert_eq!(bytes[0], tx_type::UPDATE_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + domain_id + owner + sequence (1) + record_hash
-        // + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 1 + 32 + 32 + 64);
+        // disc + version + network (1 + 14) + domain_id + owner
+        // + sequence (1) + record_hash + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 32 + 1 + 32 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::UpdateDomain(signed_update_domain())
@@ -1017,9 +1102,10 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::RegisterTld(signed_register_tld())).unwrap();
         assert_eq!(bytes[0], tx_type::REGISTER_TLD);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + tld_id + owner + timestamp (5-byte varint)
-        // + empty proof (1) + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 5 + 1 + 32 + 64);
+        // disc + version + network (1 + 14) + tld name (1 + 4) + tld_id
+        // + owner + timestamp (5-byte varint) + empty proof (1) + pk
+        // + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 1 + 3 + 32 + 32 + 5 + 1 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::RegisterTld(signed_register_tld())
@@ -1031,8 +1117,9 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::TransferTld(signed_transfer_tld())).unwrap();
         assert_eq!(bytes[0], tx_type::TRANSFER_TLD);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + tld_id + owner + new_owner + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 32 + 32 + 64);
+        // disc + version + network (1 + 14) + tld_id + owner + new_owner
+        // + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 32 + 32 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::TransferTld(signed_transfer_tld())
@@ -1044,8 +1131,9 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::RevokeTld(signed_revoke_tld())).unwrap();
         assert_eq!(bytes[0], tx_type::REVOKE_TLD);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + tld_id + owner + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 32 + 64);
+        // disc + version + network (1 + 14) + tld_id + owner + pk
+        // + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 32 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::RevokeTld(signed_revoke_tld())
@@ -1057,10 +1145,13 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::SetTldOpen(signed_set_tld_open())).unwrap();
         assert_eq!(bytes[0], tx_type::SET_TLD_OPEN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + tld_id + owner + open(1) + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 1 + 32 + 64);
-        // Canonical boolean: strictly 0x01 here.
-        assert_eq!(bytes[66], 0x01);
+        // disc + version + network (1 + 14) + tld_id + owner + open(1)
+        // + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 32 + 1 + 32 + 64);
+        // Canonical boolean: strictly 0x01 here (offset: disc+version
+        // + network + tld_id + owner).
+        let open_off = 1 + 1 + 14 + 32 + 32;
+        assert_eq!(bytes[open_off], 0x01);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::SetTldOpen(signed_set_tld_open())
@@ -1071,7 +1162,8 @@ mod tests {
     fn set_tld_open_rejects_non_canonical_boolean() {
         // 0x02 in the open slot is a hard decode error, never coerced.
         let mut bytes = encode_to_vec(&Transaction::SetTldOpen(signed_set_tld_open())).unwrap();
-        bytes[66] = 0x02;
+        let open_off = 1 + 1 + 14 + 32 + 32;
+        bytes[open_off] = 0x02;
         assert!(matches!(
             decode_complete::<Transaction>(&bytes),
             Err(ProtocolError::NonCanonical(_))
@@ -1083,9 +1175,9 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::AssignDomain(signed_assign_domain())).unwrap();
         assert_eq!(bytes[0], tx_type::ASSIGN_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + name (1 + 11) + domain_id + owner
-        // + assignee + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 1 + 11 + 32 + 32 + 32 + 32 + 64);
+        // disc + version + network (1 + 14) + name (1 + 11) + domain_id
+        // + owner + assignee + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 1 + 11 + 32 + 32 + 32 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::AssignDomain(signed_assign_domain())
@@ -1097,9 +1189,9 @@ mod tests {
         let bytes = encode_to_vec(&Transaction::RenewDomain(signed_renew_domain())).unwrap();
         assert_eq!(bytes[0], tx_type::RENEW_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + domain_id + owner + valid_until (5-byte
-        // varint) + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 5 + 32 + 64);
+        // disc + version + network (1 + 14) + domain_id + owner
+        // + valid_until (5-byte varint) + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 32 + 5 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::RenewDomain(signed_renew_domain())
@@ -1173,11 +1265,11 @@ mod tests {
             Signature::from_bytes([0; 64]),
         ));
         let payload = signing_payload(&unsigned).unwrap();
-        // prefix + disc + version + name + domain + owner + timestamp
-        // + proof + pk; no signature bytes.
+        // prefix + disc + version + network + name + domain + owner
+        // + timestamp + proof + pk; no signature bytes.
         assert_eq!(
             payload.len(),
-            TX_SIG_PREFIX.len() + 1 + 1 + 1 + 11 + 32 + 32 + 1 + 1 + 4 + 32
+            TX_SIG_PREFIX.len() + 1 + 1 + 14 + 1 + 11 + 32 + 32 + 1 + 1 + 4 + 32
         );
         assert!(payload.starts_with(TX_SIG_PREFIX));
         // Changing the signature never changes the payload…
@@ -1241,7 +1333,7 @@ mod tests {
     fn register_tld_signing_payload_is_what_verifies() {
         let sk = key(4);
         let unsigned = Transaction::RegisterTld(RegisterTld::register_tld_signed(
-            tld_id(),
+            tld_name(),
             1,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -1330,6 +1422,7 @@ mod tests {
     fn zero_sequence_rejected_on_encode_and_decode() {
         let sk = key(1);
         let raw = UpdateDomain {
+            network: scone_core::TESTNET.network_id,
             domain_id: domain_id(),
             owner: test_support::owner_of(&sk.public_key()),
             sequence: 0,
@@ -1397,6 +1490,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.push(tx_type::REGISTER_DOMAIN);
         bytes.push(TX_FORMAT_VERSION);
+        scone_core::NetworkId::TESTNET.encode(&mut bytes).unwrap();
         name().encode(&mut bytes).unwrap();
         domain_id().encode(&mut bytes).unwrap();
         OwnerId::from_bytes([0; 32]).encode(&mut bytes).unwrap();
@@ -1459,15 +1553,19 @@ mod tests {
     #[test]
     fn register_tld_pinned_wire_prefix() {
         // Deterministic prefix of the canonical encoding of a
-        // RegisterTld("uip", ts=1, empty proof, seed-1 key): disc,
-        // version, tld_id.
+        // RegisterTld("uip", ts=1, empty proof, seed-1 key, testnet):
+        // disc, version, network, tld name, tld_id.
         let bytes = encode_to_vec(&Transaction::RegisterTld(signed_register_tld())).unwrap();
         // Arbitrary opaque discriminants (docs/technical/transactions.md).
         assert_eq!(bytes[0], 0x93);
         assert_eq!(bytes[1], 0x01);
+        // Network field: varint length 13 + "scone-testnet" (M8b).
+        assert_eq!(&bytes[2..16], b"\x0dscone-testnet");
+        // TLD name: varint length 3 + "uip" (M8b).
+        assert_eq!(&bytes[16..20], b"\x03uip");
         // TldId("uip") — pinned derivation vector (docs/general/naming.md).
         assert_eq!(
-            &bytes[2..34],
+            &bytes[20..52],
             hex("ad5a86d68643d5c22d6a959bb1a315530c77dfda241f1ac1a8107450f3fab25e")
         );
     }

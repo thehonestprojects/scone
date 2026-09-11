@@ -252,9 +252,12 @@ fn append_core(
     height: u64,
     hash: &[u8; 32],
     block_bytes: &[u8],
-    state_deltas: &[(DomainId, DomainStateBytes)],
-    tld_deltas: &[(TldId, TldStateBytes)],
+    deltas: &crate::StateDelta,
 ) -> Result<()> {
+    let state_deltas = &deltas.domains;
+    let tld_deltas = &deltas.tlds;
+    let removed_domains = &deltas.removed_domains;
+    let removed_tlds = &deltas.removed_tlds;
     // Pre-encoded value for blocks_by_height: hash || height || bytes.
     let mut indexed = Vec::with_capacity(BLOCK_INDEX_HEADER + block_bytes.len());
     indexed.extend_from_slice(hash);
@@ -311,6 +314,36 @@ fn append_core(
             meta_t.insert(META_TLD_COUNT, &(current + new_tlds).to_be_bytes()[..])?;
         }
 
+        // M8b removals: expired domains (deterministic GC) and
+        // revoked TLDs leave the store in the same ACID transaction —
+        // a restart can never resurrect them.
+        let mut removed_domain_count: u64 = 0;
+        for domain in removed_domains {
+            if domains_t.remove(&domain.as_bytes()[..])?.is_some() {
+                removed_domain_count += 1;
+            }
+        }
+        if removed_domain_count > 0 {
+            let current = meta_u64(&meta_t, META_DOMAIN_COUNT, "domain_count")?;
+            let current = current
+                .checked_sub(removed_domain_count)
+                .ok_or_else(|| StorageError::Corrupted("domain_count underflow".into()))?;
+            meta_t.insert(META_DOMAIN_COUNT, &current.to_be_bytes()[..])?;
+        }
+        let mut removed_tld_count: u64 = 0;
+        for tld in removed_tlds {
+            if tlds_t.remove(&tld.as_bytes()[..])?.is_some() {
+                removed_tld_count += 1;
+            }
+        }
+        if removed_tld_count > 0 {
+            let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+            let current = current
+                .checked_sub(removed_tld_count)
+                .ok_or_else(|| StorageError::Corrupted("tld_count underflow".into()))?;
+            meta_t.insert(META_TLD_COUNT, &current.to_be_bytes()[..])?;
+        }
+
         write_tip(&mut meta_t, height, hash)?;
     }
     Ok(())
@@ -318,7 +351,7 @@ fn append_core(
 
 impl NodeStore for RedbStore {
     fn append_block(&mut self, height: u64, hash: &[u8; 32], block_bytes: &[u8]) -> Result<()> {
-        self.append_block_with_state(height, hash, block_bytes, &[], &[])
+        self.append_block_with_state(height, hash, block_bytes, &crate::StateDelta::empty())
     }
 
     fn append_block_with_state(
@@ -326,8 +359,7 @@ impl NodeStore for RedbStore {
         height: u64,
         hash: &[u8; 32],
         block_bytes: &[u8],
-        state_deltas: &[(DomainId, DomainStateBytes)],
-        tld_deltas: &[(TldId, TldStateBytes)],
+        deltas: &crate::StateDelta,
     ) -> Result<()> {
         let (tip_height, tip_hash) = self.tip_inner()?;
         if height == tip_height && hash == &tip_hash {
@@ -347,14 +379,7 @@ impl NodeStore for RedbStore {
             });
         }
         let mut wtxn = self.db.begin_write()?;
-        append_core(
-            &mut wtxn,
-            height,
-            hash,
-            block_bytes,
-            state_deltas,
-            tld_deltas,
-        )?;
+        append_core(&mut wtxn, height, hash, block_bytes, deltas)?;
         wtxn.commit()?;
         Ok(())
     }

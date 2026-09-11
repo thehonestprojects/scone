@@ -37,7 +37,15 @@ pub(crate) enum Command {
 
     /// Run a relay node (foreground daemon; logs to stderr).
     Relay {
-        /// Data directory (chain database lives here).
+        /// Network to join: `testnet` (default while the project is
+        /// in development) or `mainnet` (must be explicit). Each
+        /// network has its own genesis, its own PoW difficulties and
+        /// its own default data directory.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Data directory (chain database lives here). Default:
+        /// `$HOME/.scone/<network>/`.
         #[arg(long)]
         data_dir: Option<PathBuf>,
 
@@ -323,6 +331,50 @@ pub(crate) enum TxKind {
         /// Hex of the record hash commitment (64 hex chars).
         #[arg(long)]
         record_hash: String,
+    },
+    /// Open or close a TLD for self-service registration (M8b).
+    SetTldOpen {
+        /// TLD whose registration policy changes.
+        #[arg(long)]
+        tld: String,
+        /// `true` = anyone may register (registration PoW still
+        /// required); `false` = assign-only.
+        #[arg(long, default_value_t = true)]
+        open: bool,
+    },
+    /// Assign a domain directly as the TLD owner (M8b).
+    AssignDomain {
+        /// Domain name to assign.
+        #[arg(long)]
+        name: String,
+        /// Hex of the assignee's OwnerId (64 hex chars).
+        #[arg(long)]
+        assignee: String,
+    },
+    /// Extend a domain registration until `valid_until` (M8b).
+    RenewDomain {
+        /// Domain name to renew.
+        #[arg(long)]
+        name: String,
+        /// New expiry (Unix seconds; must extend and stay within 3
+        /// years).
+        #[arg(long)]
+        valid_until: u64,
+    },
+    /// Transfer a TLD to a new owner (M8b).
+    TransferTld {
+        /// TLD to transfer.
+        #[arg(long)]
+        tld: String,
+        /// Hex of the recipient OwnerId (64 hex chars).
+        #[arg(long)]
+        new_owner: String,
+    },
+    /// Relinquish a TLD (M8b).
+    RevokeTld {
+        /// TLD to relinquish.
+        #[arg(long)]
+        tld: String,
     },
 }
 

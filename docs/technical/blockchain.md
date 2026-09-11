@@ -111,10 +111,24 @@ Modifier une transaction, leur ordre, la hauteur, le timestamp, le
 
 API : `block_hash(&BlockHeader) -> Result<BlockHash>`.
 
-## Genèse
+## Réseaux et genèse (M8b)
 
-La genèse est une constante de protocole, reproductible à partir des
-constantes seules (aucun aléa, aucune horloge locale, aucun réseau) :
+Scone définit deux réseaux disjoints, identifiés par un
+`network_id` canonique (1..=16 octets ASCII `[a-z0-9-]`) :
+
+| Réseau | `network_id` | difficulté TLD | difficulté domaine |
+|---|---|---|---|
+| testnet | `scone-testnet` | 8 bits (symbolique) | 4 bits (symbolique) |
+| mainnet | `scone-mainnet` | 24 bits | 20 bits |
+
+Les paramètres vivent dans `scone-core::network::NetworkParams`
+(instances nommées `TESTNET` / `MAINNET`, lookup
+`NetworkParams::by_name`). Changer une difficulté = changement de
+consensus **pour ce réseau**.
+
+La genèse est une constante de protocole **par réseau**, reproductible
+à partir des constantes seules (aucun aléa, aucune horloge locale,
+aucun réseau) :
 
 | Champ | Valeur |
 |---|---|
@@ -123,20 +137,35 @@ constantes seules (aucun aléa, aucune horloge locale, aucun réseau) :
 | `prev_hash` | 32 octets nuls (aucun bloc précédent) |
 | `tx_root` | Merkle root de la liste vide |
 | `timestamp` | `GENESIS_TIMESTAMP = 0` (puriquement structurel) |
-| `consensus` | vide |
+| `consensus` | les octets canoniques du `network_id` |
 | transactions | vide |
 
-API : `genesis() -> Block`, `genesis_hash() -> BlockHash` (identiques
-sur tous les nœuds).
+Le `network_id` dans le payload consensus rend les hashs de genèse —
+et donc toute la chaîne de blocs — **disjoints entre réseaux** : un
+bloc testnet ne peut jamais s'attacher à une chaîne mainnet
+(`UnknownParent`), aucun replay n'est possible sans tout re-signer.
+
+API : `genesis_of(&NetworkParams) -> Block`,
+`genesis_hash_of(NetworkId) -> BlockHash` ; les alias `genesis()` /
+`genesis_hash()` désignent la testnet (défaut de développement).
 
 ## État canonique
 
 ```text
-DomainState  = { owner: OwnerId, sequence: u64, record_hash: Option<RecordHash> }
-TldState     = { owner: OwnerId }
-ChainState   = DomainId -> DomainState        (accès direct, en mémoire)
+DomainState  = { owner: OwnerId, sequence: u64, record_hash: Option<RecordHash>,
+                 registered_at: u64, valid_until: u64 }
+TldState     = { owner: OwnerId, open: bool }
+ChainState   = NetworkParams                  (réseau lié, M8b)
+               + DomainId -> DomainState      (accès direct, en mémoire)
                + TldId -> TldState            (registre TLD, M7b)
+               + DomainId -> (expired_at, OwnerId)   (fenêtres de grâce, M8b)
 ```
+
+* `registered_at` / `valid_until` (M8b) : l'expiration de
+  l'enregistrement, évaluée contre le **timestamp du bloc parent**
+  (déterministe, engagé dans le header — jamais l'horloge locale) ;
+* `open` (M8b) : `false` à la claim (fermé = assign-only), `true`
+  après un `SetTldOpen` (auto-enregistrement avec PoW) ;
 
 - accès direct par `DomainId` (32 octets) : jamais de `String` comme
   clé, jamais de scan complet — condition nécessaire pour viser des
@@ -152,51 +181,108 @@ ChainState   = DomainId -> DomainState        (accès direct, en mémoire)
 `state.apply(transaction)` est déterministe et atomique (en cas
 d'erreur, l'état est inchangé) :
 
+**Toutes les transactions (M8b)** : le champ `network` de la
+transaction doit être **exactement** le `network_id` de la chaîne —
+sinon `WrongNetwork { tx, chain }`, AVANT toute autre règle (une tx
+testnet n'est jamais appliquée, jamais poolée par un nœud mainnet, et
+inversement).
+
 **REGISTER_TLD** :
 
 - le TLD doit être **libre** (absent du registre TLD) ;
-- à l'application : `{ owner }`.
+- **PoW obligatoire** : `pow::verify` sur le challenge
+  `SCONE-TLD-V1 || tld` (dérivé du nom porté par la tx) à la
+  difficulté `tld_pow_difficulty` du réseau — le digest est
+  recalculé de zéro (`SCONE-POW-V1 || network || challenge || nonce`),
+  la difficulté auto-déclarée doit égaler la constante réseau ;
+- à l'application : `{ owner, open: false }` — **fermé par défaut**
+  (assign-only) ; l'ouverture est explicite via `SetTldOpen`.
 
-**REGISTER** :
+**REGISTER (RegisterDomain)** :
 
-- **le TLD du nom porté doit être enregistré** : la chaîne dérive
-  elle-même `TldId(nom.tld())` (préfixe `SCONE-TLD-V1`, jamais une
-  valeur fournie) et exige sa présence dans le registre TLD, sinon
-  `UnknownTld` (décision D1, M7c : la chaîne est aussi l'autorité des
-  namespaces) ;
-- le domaine doit être **libre** (absent de l'état) ;
-- à l'application : `{ owner, sequence: 0, record_hash: None }` ;
-- la `proof` n'est **pas** interprétée ici : sa validation (PoW de
-  registration) est un crochet du consensus (différé).
+- **le TLD du nom porté doit être enregistré ET ouvert** : la chaîne
+  dérive elle-même `TldId(nom.tld())` (jamais une valeur fournie) ;
+  absent → `UnknownTld` (D1, M7c), présent mais fermé → `TldClosed`
+  (M8b : le chemin assign-only est exclusif) ;
+- le domaine doit être **libre** : absent de l'état ET hors de toute
+  fenêtre de grâce d'un enregistrement expiré (voir GC ci-dessous) ;
+- **PoW obligatoire** : challenge `SCONE-DOMAIN-V1 || nom` à la
+  difficulté `domain_pow_difficulty` (le TLD étant ouvert, c'est le
+  prix d'entrée auto-service) ;
+- à l'application : `{ owner, sequence: 0, record_hash: None,
+  registered_at: now, valid_until: now + 1 an }` — **l'enregistrement
+  dure 1 an** (365 jours).
 
-L'ordre intra-bloc est significatif pour D1 : `[RegisterTld, RegisterDomain]`
-dans un même bloc est valide (le namespace existe quand la claim
-s'applique), `[RegisterDomain, RegisterTld]` est rejeté en bloc entier
-(undo-log) — de même que `[REGISTER, UPDATE]` s'applique mais pas
-`[UPDATE, REGISTER]`.
+**Ordre intra-bloc** : significatif. `[RegisterTld, SetTldOpen,
+RegisterDomain]` dans un même bloc est valide ; toute permutation qui
+applique une règle avant que sa précondition existe est rejetée en
+bloc entier (undo-log).
 
-**UPDATE** :
+**UPDATE (UpdateDomain)** :
 
-- le domaine doit exister ;
+- le domaine doit exister (non expiré) ;
 - `tx.owner` doit être le propriétaire actuel ;
-- `tx.sequence` doit être **exactement** `sequence_courante + 1` (aucun
-  trou, aucun replay ; après `RegisterDomain`, le premier `UpdateDomain` valide
-  porte `sequence = 1`) ;
+- `tx.sequence` doit être **exactement** `sequence_courante + 1`
+  (aucun trou, aucun replay) ;
 - à l'application : `sequence` avance, `record_hash` est remplacé.
 
-**Famille M8a** (`TransferTld`, `RevokeTld`, `SetTldOpen`,
-`AssignDomain`, `RenewDomain`) :
+**TRANSFER_TLD (0x47)** :
 
-- les types et formats wire existent (voir
-  `/docs/technical/transactions.md`), mais leurs règles d'application
-  ne sont pas encore définies (M8b) : `state.apply` les rejette
-  explicitement avec `UnsupportedTransaction(nom)`, de façon typée et
-  atomique (état inchangé). Le mempool du relay applique le même
-  rejet au precheck — une transaction M8a n'entre jamais dans un bloc
-  tant que M8b n'est pas livré.
+- le TLD doit exister (`UnknownTld` sinon) ;
+- le signataire doit être l'owner courant (`NotTldOwner` sinon) ;
+- à l'application : `owner = new_owner` (l'identité du destinataire
+  est opaque ; le binding aux clés qui peuvent la dépenser se fait
+  par les tx suivantes). Pas de séquence : premier transfert appliqué
+  gagne (ordre de chaîne).
 
-Deux nœuds partant du même état et appliquant les mêmes blocs dans le
-même ordre produisent exactement le même état final.
+**REVOKE_TLD (0x6B)** :
+
+- le TLD doit exister, signataire = owner courant ;
+- à l'application : le TLD est retiré du registre et re-claimable par
+  un `RegisterTld` frais (PoW compris).
+
+**SET_TLD_OPEN (0xB8)** :
+
+- le TLD doit exister, signataire = owner courant ;
+- à l'application : `open = tx.open`.
+
+**ASSIGN_DOMAIN (0xD4)** :
+
+- le TLD du nom porté doit exister (ouvert ou fermé — l'owner peut
+  toujours assigner), signataire = owner du TLD (`NotTldOwner`) ;
+- le domaine doit être libre (même règle de grâce que REGISTER) ;
+- à l'application : `{ owner: assignee, sequence: 0, record_hash:
+  None, registered_at: now, valid_until: now + 1 an }`. **Pas de
+  PoW** : c'est l'owner du namespace qui se porte garant.
+
+**RENEW_DOMAIN (0x3C)** :
+
+- le domaine doit exister, signataire = owner courant ;
+- `valid_until` doit **strictement étendre** l'échéance courante
+  (`RenewalNotExtending` sinon) ;
+- `valid_until ≤ now + 3 ans` (`RenewalExceedsTerm` — borne
+  anti-thésaurisation : **1 terme de renouvellement = 1 an,
+  3 ans d'avance maximum**) ;
+- à l'application : `valid_until = tx.valid_until`.
+
+**GC déterministe (M8b)** : avant l'application des transactions
+d'un bloc, la chaîne évalue les expirations au **timestamp du bloc
+parent** : tout domaine dont `valid_until ≤ now` est retiré de l'état
+vivant et parqué dans une **fenêtre de grâce de 30 jours**
+(`valid_until + 30 j`). Pendant la grâce, seul l'ancien owner peut
+re-réclamer le nom ; après, il est libre pour tous. Le GC est
+journalisé : un bloc rejeté restaure l'état pré-GC bit à bit.
+
+**Replay** : le replay cross-réseau est impossible à trois niveaux —
+genesis disjointes (`UnknownParent`), champ `network` signé dans
+chaque payload de signature (`WrongNetwork` + signature invalide),
+PoW séparé par réseau dans le digest. Le replay intra-réseau d'une
+tx identique échoue sur les règles d'état (double claim, séquence),
+jamais sur le `TxId`.
+
+Deux nœuds du même réseau partant du même état et appliquant les
+mêmes blocs dans le même ordre produisent exactement le même état
+final.
 
 ## Ordre des transactions
 
@@ -308,15 +394,17 @@ pub trait Consensus {
 
 Volontairement non définis dans cette crate :
 
-- **PoW** : RandomX ou autre, difficulté (notamment PoW lourd pour les
-  TLD / registration coûteuse, `UPDATE` léger — à l'étude) ;
 - **fork choice** : sélection entre pointes concurrentes, reorg ;
 - **mempool** : admission, remplacement, frais ;
 - **ordering global** : autorité de tri, tie-break final ;
-- **timestamp authority / anti-replay** : les champs `timestamp`
-  existent dans le format mais aucune règle ne les contraint encore ;
-- **validation de la `proof` de `RegisterDomain`** : crochet prêt, règles à
-  venir ;
-- expiration / renouvellement des claims de domaine ;
-- stockage : l'état est en mémoire ; le backend (`scone-storage`,
-  redb puis KV distribué) viendra sans changer ces règles.
+- **timestamp authority** au-delà du GC : les expirations (M8b)
+  utilisent le timestamp du bloc parent ; d'autres règles de temps
+  (anti-replay fin) restent au consensus ;
+- stockage distribué : l'état est en mémoire ; le backend
+  (`scone-storage`, redb) applique ces règles sans les dupliquer.
+
+Livré depuis M8b (auparavant différé) : PoW de registration par
+réseau (`RegisterTld` toujours, `RegisterDomain` sur TLD ouvert),
+expirations/renouvellement 1 an + grâce 30 j + horizon 3 ans, GC
+déterministe au timestamp du bloc parent, replay cross-réseau
+impossible (genesis + champ signé + digest PoW).

@@ -189,6 +189,44 @@ fn dns_cli_end_to_end() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
+    // ---- open the namespace (M8b: a fresh TLD is assign-only) -----
+    // Offline tx surface again: build set-tld-open → sign → submit.
+    let open_payload = scone_ok(&["tx", "build", "set-tld-open", "--tld", "uip"])
+        .into_iter()
+        .find_map(|l| l.strip_prefix("signing payload: ").map(String::from))
+        .expect("signing payload line");
+    let open_signed = scone_ok(&[
+        "tx",
+        "sign",
+        &open_payload,
+        "--identity",
+        "owner",
+        "--dir",
+        keys.to_str().expect("keys"),
+        "--passphrase-env",
+        pass_var,
+    ])
+    .into_iter()
+    .find_map(|l| l.strip_prefix("transaction: ").map(String::from))
+    .expect("signed transaction line");
+    scone_ok(&[
+        "submit",
+        "tx",
+        "--hex",
+        &open_signed,
+        "--rpc",
+        &rpc.to_string(),
+    ]);
+    let open_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let lines = scone_ok(&["status", "--rpc", &rpc.to_string()]);
+        if lines.iter().any(|l| l.starts_with("height: 2")) {
+            break;
+        }
+        assert!(Instant::now() < open_deadline, "tld open never mined");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     let name = "m6.uip";
     let reg_deadline = Instant::now() + Duration::from_secs(30);
     loop {
