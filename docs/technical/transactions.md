@@ -4,8 +4,8 @@ Document de référence **normatif** du format de transaction signée v2
 (jalon M2). Il spécifie les champs, l'ordre wire exact, les tailles,
 le payload signé et les règles de validation, de manière à permettre
 une implémentation indépendante sans lire le Rust. L'implémentation de
-référence est [`scone-protocol`](../crates/scone-protocol)
-(encodage) et [`scone-blockchain`](../crates/scone-blockchain)
+référence est [`scone-protocol`](../../crates/scone-protocol)
+(encodage) et [`scone-blockchain`](../../crates/scone-blockchain)
 (validation).
 
 `PROTOCOL_VERSION` = **2** depuis ce format (la version 1 —
@@ -34,7 +34,7 @@ domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signatur
 
 | Champ | Type | Contraintes |
 |---|---|---|
-| `domain_id` | 32 octets nus | identité du nom (voir `/docs/naming.md`) |
+| `domain_id` | 32 octets nus | identité du nom (voir `/docs/general/naming.md`) |
 | `owner` | 32 octets nus | **doit** être la dérivation de `public_key` (voir ci-dessous) |
 | `timestamp` | varint | information d'ordre (Unix, secondes) |
 | `proof` | `bytes` ≤ 256 | opaque, réservé au futur PoW de registration |

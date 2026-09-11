@@ -24,7 +24,7 @@ use crate::validate::validate_transaction;
 /// application is atomic per block: if any transaction fails, the
 /// pre-push state is preserved.
 ///
-/// Fork handling (minimum, see `/docs/blockchain.md`): a block whose
+/// Fork handling (minimum, see `/docs/technical/blockchain.md`): a block whose
 /// parent was never seen is rejected with
 /// [`BlockchainError::UnknownParent`]; a block building on a known
 /// non-tip block is rejected with [`BlockchainError::ParentNotTip`]. No

@@ -28,7 +28,7 @@
 //! - provided hashes (`tx_root`, …) are never trusted: they are always
 //!   recomputed.
 //!
-//! Identity chain (see `/docs/blockchain.md`):
+//! Identity chain (see `/docs/technical/blockchain.md`):
 //!
 //! ```text
 //! DomainId -> Register/Update -> Transaction -> TxId -> MerkleRoot

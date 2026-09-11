@@ -3,7 +3,7 @@
 Document de référence de la couche blockchain : identités, hash, genèse,
 état canonique, ordre des transactions et validation des blocs.
 L'implémentation de référence est la crate
-[`scone-blockchain`](../crates/scone-blockchain), au-dessus de
+[`scone-blockchain`](../../crates/scone-blockchain), au-dessus de
 `scone-protocol` (encodage canonique), `scone-core` (règles métier) et
 `scone-crypto` (BLAKE3).
 
@@ -17,8 +17,8 @@ préfixe n'est jamais réutilisé entre deux usages :
 
 | Type | Rôle | Préfixe | Formule |
 |---|---|---|---|
-| `DomainId` | identité du nom de domaine | `SCONE-DOMAIN-V1` | voir `/docs/naming.md` |
-| `RecordHash` | identité du contenu DNS | `SCONE-RECORD-V1` | voir `/docs/protocol.md` |
+| `DomainId` | identité du nom de domaine | `SCONE-DOMAIN-V1` | voir `/docs/general/naming.md` |
+| `RecordHash` | identité du contenu DNS | `SCONE-RECORD-V1` | voir `/docs/technical/protocol.md` |
 | `TxId` | identité de la transaction | `SCONE-TX-V1` | ci-dessous |
 | `BlockHash` | identité du bloc | `SCONE-BLOCK-V1` | ci-dessous |
 
@@ -203,7 +203,7 @@ pour argent comptant :
 7. pour chaque transaction, dans l'ordre : validation
    **cryptographique** (`validate_transaction` : binding
    owner/clé recomputé + `verify_strict` sur le payload signé
-   recomputé de zéro, voir `/docs/transactions.md`), puis
+   recomputé de zéro, voir `/docs/technical/transactions.md`), puis
    application à un état de travail ;
 8. commit atomique : tout passe ⇒ bloc ajouté, état remplacé ; la
    moindre erreur ⇒ chaîne rigoureusement inchangée.

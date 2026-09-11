@@ -1,6 +1,6 @@
 //! Merkle tree over transaction ids.
 //!
-//! Spec (see `/docs/blockchain.md`):
+//! Spec (see `/docs/technical/blockchain.md`):
 //!
 //! ```text
 //! 0 tx     root = BLAKE3-256("SCONE-MERKLE-V1" || "EMPTY")

@@ -13,7 +13,7 @@ pub const DOMAIN_ID_VERSION: &[u8] = b"SCONE-DOMAIN-V1";
 /// DomainId = BLAKE3-256("SCONE-DOMAIN-V1" || canonical_domain_name)
 /// ```
 ///
-/// (via [`scone_crypto::hash256`]; see `/docs/naming.md`).
+/// (via [`scone_crypto::hash256`]; see `/docs/general/naming.md`).
 ///
 /// This is the primary internal identifier used by the future blockchain
 /// and DHT. Raw domain names must never be used as map/storage keys.

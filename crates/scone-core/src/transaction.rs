@@ -5,7 +5,7 @@
 //! signer and a 64-byte [`Signature`] over the canonical signing
 //! payload defined by `scone-protocol`
 //! (`SCONE-TX-SIG-V1` || canonical encoding of the transaction without
-//! the signature — see `/docs/transactions.md`).
+//! the signature — see `/docs/technical/transactions.md`).
 //!
 //! The `owner` field is deliberately redundant with `public_key`: it is
 //! ALWAYS recomputed from the embedded key and never trusted. A

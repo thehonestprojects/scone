@@ -82,7 +82,7 @@ impl ChainState {
     /// Applies `tx` to the state, deterministically and atomically (on
     /// error the state is left unchanged).
     ///
-    /// Rules (see `/docs/blockchain.md`):
+    /// Rules (see `/docs/technical/blockchain.md`):
     ///
     /// - **Register**: the domain must be free; it becomes
     ///   `{ owner, sequence: 0, record_hash: None }`. The proof is not

@@ -9,7 +9,7 @@
 //! in RAM; only 41/73 fixed-size bytes cross the trait boundary,
 //! depending on the presence of a `record_hash`).
 //!
-//! ## Design rules (see `/docs/development/storage.md`)
+//! ## Design rules (see `/docs/technical/storage.md`)
 //!
 //! - **No redb types in the API**: the trait speaks bytes and core types
 //!   only, so the backend can be swapped (tests use redb tmpfiles).

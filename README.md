@@ -44,8 +44,13 @@ données DNS elles-mêmes sont servies depuis une DHT par des nœuds pairs.
 | `scone-network` | Relay P2P libp2p (swarm QUIC, sync blocs, DHT Kademlia, RPC de contrôle) |
 | `scone` | Binaire / CLI (`scone relay/status/submit/lookup/record`, `scone identity …`, `scone tx build/sign/verify`) |
 
-Documentation détaillée : [`docs/architecture.md`](docs/architecture.md),
-[`docs/protocol.md`](docs/protocol.md), [`docs/naming.md`](docs/naming.md).
+Documentation : [`docs/README.md`](docs/README.md) (plan complet) — volet
+général « comment ça marche » :
+[`docs/general/architecture.md`](docs/general/architecture.md),
+[`docs/general/naming.md`](docs/general/naming.md) ; volet technique
+développeurs : [`docs/technical/protocol.md`](docs/technical/protocol.md),
+[`docs/technical/blockchain.md`](docs/technical/blockchain.md),
+[`docs/technical/transactions.md`](docs/technical/transactions.md), etc.
 
 ## Status
 
@@ -70,14 +75,14 @@ En place :
   — reste à implémenter).
 - **Keystore chiffré** (`scone-keystore`) : keyfiles `.sconekey`
   (Argon2id + XChaCha20-Poly1305), voir
-  [`docs/development/keystore.md`](docs/development/keystore.md).
+  [`docs/technical/keystore.md`](docs/technical/keystore.md).
 - **Stockage persistant** (`scone-storage`, M3) : trait `NodeStore` +
   backend redb (appends delta atomiques, états paginés), voir
-  [`docs/development/storage.md`](docs/development/storage.md).
+  [`docs/technical/storage.md`](docs/technical/storage.md).
 - **Relay réseau** (`scone-network`, M4) : nœud libp2p complet —
   QUIC, identify, ping, Kademlia (records DNS signés), sync de blocs
   bornée, mempool, production devnet, RPC de contrôle local. Voir
-  [`docs/development/relay.md`](docs/development/relay.md).
+  [`docs/technical/relay.md`](docs/technical/relay.md).
 - **Exploration riche + CLI signé** (M5) : RPC `domain_info`
   (état on-chain + records DNS vérifiés en lecture locale), commandes
   `scone domain register|update` (build → sign → submit →
@@ -123,7 +128,7 @@ commandes — fiable en script). Verbosité : `-v` (info), `-vv`
 à WARN et `scone relay` reste à INFO (un daemon doit logger son
 activité). `RUST_LOG` (syntaxe env-filter) remplace ces défauts,
 par ex. `RUST_LOG=scone_network=trace scone relay`. Détails :
-[`docs/development/cli.md`](docs/development/cli.md).
+[`docs/technical/cli.md`](docs/technical/cli.md).
 
 ## Développement
 

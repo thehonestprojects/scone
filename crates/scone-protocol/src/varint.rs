@@ -1,6 +1,6 @@
 //! Minimal LEB128 varints.
 //!
-//! The only integer encoding of the wire format (see `/docs/protocol.md`):
+//! The only integer encoding of the wire format (see `/docs/technical/protocol.md`):
 //! base-128, least-significant 7-bit group first, high bit set on every
 //! byte but the last. Encodings must be **minimal** — [`take_u64`]
 //! rejects overlong forms — so a value has exactly one valid byte

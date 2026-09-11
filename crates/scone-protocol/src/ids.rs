@@ -7,7 +7,7 @@ use crate::error::{ProtocolError, Result};
 use crate::limits;
 
 // 32-byte identifiers: raw bytes on the wire, no prefix, no length
-// (see /docs/protocol.md). Derivation stays in `scone-core`.
+// (see /docs/technical/protocol.md). Derivation stays in `scone-core`.
 
 macro_rules! impl_fixed_id {
     ($ty:ty) => {

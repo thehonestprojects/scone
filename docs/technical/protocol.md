@@ -3,7 +3,7 @@
 Document de référence du protocole Scone : format binaire, encodage
 canonique, transactions, records DNS, blocs, messages P2P, limites et
 compatibilité de version. L'implémentation de référence est la crate
-[`scone-protocol`](../crates/scone-protocol).
+[`scone-protocol`](../../crates/scone-protocol).
 
 Les éléments marqués **(provisoire)** ne sont pas figés.
 
@@ -18,7 +18,7 @@ Les éléments marqués **(provisoire)** ne sont pas figés.
   - version `0` → invalide ;
   - version **1** (transactions non signées, jalon M1) → rejet
     **explicite** pour les transactions (octet de version du format
-    tx, voir `/docs/transactions.md`) et pour les blocs
+    tx, voir `/docs/technical/transactions.md`) et pour les blocs
     (`BlockHeader.version` doit être exactement la version locale) ;
     le handshake `Hello` v1 reste accepté (un pair en retard sera
     rejeté par les règles de format) ;
@@ -87,7 +87,7 @@ pour qu'une valeur n'ait qu'une seule séquence d'octets valide
 | `DomainName` | `str` (≤ 253 octets, revalidé par `scone-core`) |
 
 Les dérivations (`BLAKE3-256` + préfixes `SCONE-DOMAIN-V1`, etc.)
-restent définies par `scone-core` (voir `/docs/naming.md`).
+restent définies par `scone-core` (voir `/docs/general/naming.md`).
 
 ## Transactions
 
@@ -104,7 +104,7 @@ L'octet `version` (valeur courante `0x02`) suit le discriminant : un
 flux v1 (sans cet octet) est rejeté explicitement
 (`UnsupportedVersion(1)`). **Toutes les transactions sont signées**
 (Ed25519) : spécification complète, payload signé et règles de
-validation dans **`/docs/transactions.md`** (normatif).
+validation dans **`/docs/technical/transactions.md`** (normatif).
 
 ### REGISTER (0x01)
 
@@ -201,7 +201,7 @@ version.v height.v prev_hash[32] tx_root[32] timestamp.v consensus(bytes ≤ 256
 - `height` : hauteur (genèse = 0) ;
 - `prev_hash` : hash du bloc précédent (zéros pour la genèse) ;
 - `tx_root` : engagement sur la liste des transactions (arbre de
-  Merkle défini par `scone-blockchain`, voir `/docs/blockchain.md`) ;
+  Merkle défini par `scone-blockchain`, voir `/docs/technical/blockchain.md`) ;
 - `timestamp` : information d'ordre (Unix, secondes) ;
 - `consensus` : payload **opaque** réservé aux règles de consensus
   futures (champs PoW, difficulté…). Le protocole ne l'interprète pas ;
@@ -220,7 +220,7 @@ préservé exactement.
 
 `BlockHash` (hash du header canonique) et `tx_root` sont calculés par
 `scone-blockchain` sur les encodages définis ici (formules exactes dans
-`/docs/blockchain.md`).
+`/docs/technical/blockchain.md`).
 
 ## Messages P2P
 
@@ -245,7 +245,7 @@ transport ne devrait pas dépasser `MAX_MESSAGE_LEN` (1 Mio).
 
 `TxId` est désormais défini par `scone-blockchain`
 (`BLAKE3-256("SCONE-TX-V1" || canonical(Transaction))`, voir
-`/docs/blockchain.md`). Différé volontairement : le message
+`/docs/technical/blockchain.md`). Différé volontairement : le message
 `GetTransaction` et le mempool — leur définition dépend des décisions de
 consensus.
 
@@ -328,7 +328,7 @@ Le décodage ne panique jamais sur des données réseau.
 - **transactions de la chaîne** (format v2) : chaque `Register` /
   `Update` embarque `public_key` (32 o) + `signature` (64 o) sur le
   payload `"SCONE-TX-SIG-V1" || canonical_encode(tx_sans_signature)` ;
-  spécification normative complète : `/docs/transactions.md` ;
+  spécification normative complète : `/docs/technical/transactions.md` ;
 - **records DHT** (`SignedDnsRecord`) : le payload signé est
   l'encodage canonique du `DnsRecord` ; la vérification croise
   `record + owner + signature` avec l'identité enregistrée dans la

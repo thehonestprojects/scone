@@ -76,7 +76,7 @@ impl fmt::Display for TldName {
 /// A full domain name: one or more labels followed by a TLD,
 /// dot-separated (`name.tld`, `shop.example.uip`).
 ///
-/// Rules (see `/docs/naming.md`):
+/// Rules (see `/docs/general/naming.md`):
 ///
 /// - LDH labels (`[a-z0-9-]`, hyphen neither first nor last byte)
 /// - each label: 1..=63 bytes

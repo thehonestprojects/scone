@@ -88,7 +88,7 @@ transactions, records DNS, blocs (`Block`/`BlockHeader` au champ
 consensus opaque) et messages P2P, avec limites de taille vérifiées
 avant allocation, rejet des formes non canoniques et versionnement
 (`PROTOCOL_VERSION`). Aucune logique de consensus, de réseau ou de
-stockage. Référence du format : `/docs/protocol.md`.
+stockage. Référence du format : `/docs/technical/protocol.md`.
 
 **scone-blockchain** — logique blockchain et état canonique :
 identification des transactions (`TxId`), arbre de Merkle ordonné,
@@ -98,7 +98,7 @@ accès direct par `DomainId`), détection minimale de forks et
 abstraction du consensus (`trait Consensus`, impl permissive par
 défaut). Interdits dans ce crate : réseau, DHT, stockage (redb),
 serveur DNS, consensus concret (PoW/difficulté/fork choice). Référence :
-`/docs/blockchain.md`.
+`/docs/technical/blockchain.md`.
 
 **scone-storage** — abstraction de stockage local. Le backend concret sera
 `redb`, caché derrière un trait minimal afin que blockchain/DHT/DNS ne

@@ -3,7 +3,7 @@
 //! Full DNS records never enter the blockchain: they are exchanged over
 //! the DHT (`GetRecord`/`Record` messages) and committed on-chain through
 //! their [`RecordHash`](scone_core::RecordHash) only (see
-//! `/docs/protocol.md`).
+//! `/docs/technical/protocol.md`).
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

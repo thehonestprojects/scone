@@ -20,7 +20,7 @@ pub enum SconeError {
     #[error("invalid TLD: {0}")]
     InvalidTld(String),
 
-    /// The domain name violates the naming rules (see `/docs/naming.md`).
+    /// The domain name violates the naming rules (see `/docs/general/naming.md`).
     #[error("invalid domain: {0}")]
     InvalidDomain(String),
 

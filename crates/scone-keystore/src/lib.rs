@@ -4,7 +4,7 @@
 //! files).
 //!
 //! This crate owns the filesystem so `scone-crypto` can stay pure. It
-//! does no networking and no async. See `/docs/development/keystore.md`
+//! does no networking and no async. See `/docs/technical/keystore.md`
 //! for the normative keyfile specification.
 //!
 //! ## Format (v1)

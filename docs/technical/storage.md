@@ -239,4 +239,4 @@ Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
 - base corrompue : fichier tronqué / garbage → erreur typée, aucune
   panic (`catch_unwind`).
 
-[`ChainState`]: ../../crates/scone-blockchain/src/state.rs
+[`ChainState`]: ../../../crates/scone-blockchain/src/state.rs

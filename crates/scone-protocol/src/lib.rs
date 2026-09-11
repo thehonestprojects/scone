@@ -3,7 +3,7 @@
 //! Binary wire and blockchain format of the Scone protocol: how the
 //! objects of [`scone-core`] are represented and exchanged as bytes
 //! (transactions, DNS records, blocks, P2P messages). Reference format
-//! documentation: `/docs/protocol.md`.
+//! documentation: `/docs/technical/protocol.md`.
 //!
 //! This crate contains **no** consensus, chain-selection, storage,
 //! Kademlia, transport or DNS logic — only formats, limits and encoding
@@ -57,7 +57,7 @@ pub use transaction::{TX_FORMAT_VERSION, TX_SIG_PREFIX, UnsignedTransaction, sig
 
 /// Protocol version. Bumped on any breaking wire-format change.
 ///
-/// Compatibility rules (see `/docs/protocol.md`):
+/// Compatibility rules (see `/docs/technical/protocol.md`):
 ///
 /// - a version received that is **greater** than the local one (or zero)
 ///   is rejected with [`ProtocolError::UnsupportedVersion`];

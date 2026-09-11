@@ -19,7 +19,7 @@
 //!
 //! The signed payload is [`signing_payload`]: the `SCONE-TX-SIG-V1`
 //! prefix followed by the canonical encoding of the transaction
-//! **without** the signature. See `/docs/transactions.md` (normative).
+//! **without** the signature. See `/docs/technical/transactions.md` (normative).
 
 use scone_core::{DomainId, OwnerId, Proof, RecordHash, Register, Transaction, Update};
 use scone_crypto::{PublicKey, Signature};
