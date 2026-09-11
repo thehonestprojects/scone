@@ -28,10 +28,10 @@ pub use checkpoint::{
     CHECKPOINT_TAG, COMMITTEE_TAG, Checkpoint, CheckpointData, GENESIS_CHECKPOINT_HASH, Hash,
     RECOVERY_TAG, SEED_TAG,
 };
+pub use consensus_params::{ConsensusParams, MIN_FINALITY_COMMITTEE_SIZE, quorum_for};
 pub use error::{Result, SconeError};
 pub use id::{DomainId, TldId};
 pub use name::{DomainName, TldName};
-pub use consensus_params::{ConsensusParams, MIN_FINALITY_COMMITTEE_SIZE, quorum_for};
 pub use network::{MAINNET, NetworkId, NetworkParams, TESTNET};
 pub use owner::{OwnerId, PublicKeyRef};
 pub use pow::{CheckedPow, check, encode_proof, leading_zero_bits, mine, verify};

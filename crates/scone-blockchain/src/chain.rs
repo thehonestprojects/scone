@@ -55,6 +55,12 @@ pub struct Blockchain<C: Consensus = PermissiveConsensus> {
     network: NetworkParams,
     state: ChainState,
     consensus: C,
+    /// Finalized checkpoints (chained, windowed — M3 of the .bak
+    /// port). The last one is the PoS base.
+    pub(crate) checkpoints: Vec<scone_core::checkpoint::Checkpoint>,
+    /// Frozen PoS base (last finalized checkpoint + eligibility
+    /// pool). None: bootstrap.
+    pub(crate) finalized: Option<crate::finality::FinalizedBase>,
 }
 
 /// What `push_block` actually changed (M8b): the accepted block's
@@ -133,6 +139,8 @@ impl Blockchain<PermissiveConsensus> {
             network,
             state,
             consensus: PermissiveConsensus,
+            checkpoints: Vec::new(),
+            finalized: None,
         }
     }
 }
@@ -158,6 +166,8 @@ impl<C: Consensus> Blockchain<C> {
             network,
             state: ChainState::for_network(network),
             consensus,
+            checkpoints: Vec::new(),
+            finalized: None,
         }
     }
 

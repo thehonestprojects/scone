@@ -84,8 +84,15 @@ impl TldState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
     network: NetworkParams,
-    domains: HashMap<DomainId, DomainState>,
-    tlds: HashMap<TldId, TldState>,
+    pub(crate) domains: HashMap<DomainId, DomainState>,
+    pub(crate) tlds: HashMap<TldId, TldState>,
+    /// OwnerId → signer public key (M3 of the .bak port): the PoS
+    /// eligibility pool needs self-contained keys. Filled by apply
+    /// (RegisterDomain carries the key of its owner; AssignDomain
+    /// does NOT — the assignee's key becomes known at its first
+    /// self-signed tx), replayed deterministically, never engaged in
+    /// the state root (the owner-pool root hashes OwnerIds).
+    pub(crate) owner_keys: HashMap<OwnerId, scone_crypto::PublicKey>,
     /// Names whose registration lapsed less than `DOMAIN_GRACE_SECS`
     /// ago: a re-register by anyone other than the previous owner is
     /// refused until grace elapses (keyed by the deterministic
@@ -138,6 +145,9 @@ enum UndoEntry {
         domain: DomainId,
         prior: DomainState,
     },
+    /// A self-signed tx taught the state an owner's public key
+    /// (M3 of the .bak port): rolling back forgets it.
+    LearnOwnerKey(OwnerId),
 }
 
 /// Revert journal of a block application (see
@@ -167,6 +177,7 @@ impl ChainState {
             network,
             domains: HashMap::new(),
             tlds: HashMap::new(),
+            owner_keys: HashMap::new(),
             grace: HashMap::new(),
         }
     }
@@ -344,6 +355,18 @@ impl ChainState {
                     self.network.domain_pow_difficulty,
                 )?;
                 let valid_until = now + DOMAIN_TERM_SECS;
+                // M3 (.bak port): learn the owner's self-contained
+                // key (PoS pool resolution). RegisterDomain is
+                // self-signed — first appearance wins, replay-safe.
+                // Journaled: a rolled-back block un-learns it.
+                if let std::collections::hash_map::Entry::Vacant(v) =
+                    self.owner_keys.entry(register.owner)
+                {
+                    v.insert(register.public_key);
+                    journal
+                        .entries
+                        .push(UndoEntry::LearnOwnerKey(register.owner));
+                }
                 // A lapsed registration being re-registered within
                 // grace (previous owner only — checked by
                 // `ensure_domain_free`): the grace entry is consumed.
@@ -368,6 +391,15 @@ impl ChainState {
                     .ok_or(BlockchainError::UnknownDomain)?;
                 if state.owner != update.owner {
                     return Err(BlockchainError::NotOwner);
+                }
+                // M3 (.bak port): learn the owner's key — self-signed
+                // tx, first appearance wins, replay-safe. AFTER the
+                // owner check: a rejected tx must not mutate anything.
+                if let std::collections::hash_map::Entry::Vacant(v) =
+                    self.owner_keys.entry(update.owner)
+                {
+                    v.insert(update.public_key);
+                    journal.entries.push(UndoEntry::LearnOwnerKey(update.owner));
                 }
                 let expected =
                     state
@@ -595,6 +627,9 @@ impl ChainState {
                 UndoEntry::ExpireDomain { domain, prior } => {
                     self.grace.remove(&domain);
                     self.domains.insert(domain, prior);
+                }
+                UndoEntry::LearnOwnerKey(owner) => {
+                    self.owner_keys.remove(&owner);
                 }
             }
         }
