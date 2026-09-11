@@ -111,9 +111,10 @@ pub fn check(challenge: &[u8], nonce: u64, difficulty: u32) -> Result<CheckedPow
 /// Serialises a verified [`CheckedPow`] into the opaque `proof`
 /// payload of a registration transaction.
 ///
-/// Layout (fixed, 13 bytes): `nonce_le[8] || difficulty_le[4]`. The
-/// difficulty travels with the proof so the verifier re-checks it
-/// against the protocol constant rather than trusting the producer.
+/// Layout (fixed, 12 bytes): `nonce_le[8] || difficulty_le[4]`. The
+/// difficulty travels with the proof so the verifier can re-check it
+/// against the protocol constant rather than trusting the producer
+/// (see [`verify`]).
 #[must_use]
 pub fn encode_proof(checked: &CheckedPow) -> Vec<u8> {
     let mut out = Vec::with_capacity(12);
@@ -123,15 +124,23 @@ pub fn encode_proof(checked: &CheckedPow) -> Vec<u8> {
 }
 
 /// Parses and re-verifies a `proof` payload produced by
-/// [`encode_proof`].
+/// [`encode_proof`], against the protocol difficulty `expected`.
+///
+/// The payload carries a self-declared difficulty; it is **never
+/// trusted**: `verify` rejects the proof unless that difficulty
+/// equals `expected` — the protocol constant for the registration
+/// kind being verified ([`TLD_POW_DIFFICULTY`] for `RegisterTld`,
+/// [`DOMAIN_POW_DIFFICULTY`] for `RegisterDomain` under an open
+/// TLD). A producer can neither lower the bar nor raise it.
 ///
 /// # Errors
 ///
 /// Returns [`SconeError::InvalidProof`] when the payload is not the
-/// exact 12-byte layout, its difficulty exceeds 256 bits, **or** the
-/// nonce does not solve the challenge at that difficulty (the digest
-/// is recomputed from scratch — never trusted).
-pub fn verify(challenge: &[u8], proof: &[u8]) -> Result<CheckedPow> {
+/// exact 12-byte layout, its self-declared difficulty differs from
+/// `expected`, or the nonce does not solve the challenge at
+/// `expected` difficulty (the digest is recomputed from scratch —
+/// never trusted).
+pub fn verify(challenge: &[u8], proof: &[u8], expected: u32) -> Result<CheckedPow> {
     if proof.len() != 12 {
         return Err(SconeError::InvalidProof(format!(
             "proof payload must be exactly 12 bytes, got {}",
@@ -144,9 +153,18 @@ pub fn verify(challenge: &[u8], proof: &[u8]) -> Result<CheckedPow> {
     difficulty_bytes.copy_from_slice(&proof[8..]);
     let nonce = u64::from_le_bytes(nonce_bytes);
     let difficulty = u32::from_le_bytes(difficulty_bytes);
+    // The difficulty field is producer-controlled: only an exact
+    // match with the protocol constant for this registration kind is
+    // acceptable. Anything else — lower (cheapened work) or higher —
+    // is a consensus violation.
+    if difficulty != expected {
+        return Err(SconeError::InvalidProof(format!(
+            "self-declared difficulty {difficulty} does not match the protocol constant {expected}"
+        )));
+    }
     // Full re-verification: a well-formed payload with a non-solving
     // nonce is still a failure.
-    check(challenge, nonce, difficulty)
+    check(challenge, nonce, expected)
 }
 
 #[cfg(test)]
@@ -237,23 +255,29 @@ mod tests {
     #[test]
     fn proof_roundtrip_reverifies_from_scratch() {
         let c = domain_challenge();
-        let nonce = mine(&c, 12);
-        let checked = check(&c, nonce, 12).unwrap();
+        let nonce = mine(&c, DOMAIN_POW_DIFFICULTY);
+        let checked = check(&c, nonce, DOMAIN_POW_DIFFICULTY).unwrap();
         let payload = encode_proof(&checked);
         assert_eq!(payload.len(), 12);
-        assert_eq!(verify(&c, &payload).unwrap(), checked);
+        assert_eq!(
+            verify(&c, &payload, DOMAIN_POW_DIFFICULTY).unwrap(),
+            checked
+        );
     }
 
     #[test]
     fn verify_rejects_wrong_length() {
         let c = domain_challenge();
-        assert!(matches!(verify(&c, &[]), Err(SconeError::InvalidProof(_))));
         assert!(matches!(
-            verify(&c, &[0; 11]),
+            verify(&c, &[], DOMAIN_POW_DIFFICULTY),
             Err(SconeError::InvalidProof(_))
         ));
         assert!(matches!(
-            verify(&c, &[0; 13]),
+            verify(&c, &[0; 11], DOMAIN_POW_DIFFICULTY),
+            Err(SconeError::InvalidProof(_))
+        ));
+        assert!(matches!(
+            verify(&c, &[0; 13], DOMAIN_POW_DIFFICULTY),
             Err(SconeError::InvalidProof(_))
         ));
     }
@@ -265,10 +289,55 @@ mod tests {
         // digest re-check, not the layout check.
         let payload = encode_proof(&CheckedPow {
             nonce: 0,
-            difficulty: 32,
+            difficulty: TLD_POW_DIFFICULTY,
         });
         assert!(matches!(
-            verify(&c, &payload),
+            verify(&c, &payload, TLD_POW_DIFFICULTY),
+            Err(SconeError::InvalidProof(_))
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_self_declared_difficulty_not_matching_protocol_constant() {
+        // Reviewer repro: the producer declares its own difficulty.
+        // Lowered bar: any nonce "solves" difficulty 0, so a payload
+        // with a self-declared low difficulty must NOT verify against
+        // the protocol constant for that registration kind.
+        let c = domain_challenge();
+        let payload = encode_proof(&CheckedPow {
+            nonce: 0,
+            difficulty: 0,
+        });
+        assert!(matches!(
+            verify(&c, &payload, DOMAIN_POW_DIFFICULTY),
+            Err(SconeError::InvalidProof(_))
+        ));
+
+        // Raised bar is equally rejected: a payload declaring a HIGHER
+        // difficulty than the constant fails verification on the
+        // constant check alone (rejection precedes any digest work).
+        let nonce = mine(&c, DOMAIN_POW_DIFFICULTY);
+        let payload = encode_proof(&CheckedPow {
+            nonce,
+            difficulty: DOMAIN_POW_DIFFICULTY + 4,
+        });
+        assert!(matches!(
+            verify(&c, &payload, DOMAIN_POW_DIFFICULTY),
+            Err(SconeError::InvalidProof(_))
+        ));
+
+        // Cross-kind confusion: a payload declaring the TLD difficulty
+        // must not verify as a domain proof — the constants differ, so
+        // the constant check alone rejects it (rejection precedes any
+        // digest work; no mining needed). The honest-accept path at a
+        // real protocol constant is pinned by `proof_roundtrip_…`.
+        let tld_c = tld_challenge();
+        let tld_payload = encode_proof(&CheckedPow {
+            nonce: 0,
+            difficulty: TLD_POW_DIFFICULTY,
+        });
+        assert!(matches!(
+            verify(&tld_c, &tld_payload, DOMAIN_POW_DIFFICULTY),
             Err(SconeError::InvalidProof(_))
         ));
     }
@@ -279,7 +348,7 @@ mod tests {
         let mut payload = vec![0u8; 12];
         payload[8..].copy_from_slice(&257u32.to_le_bytes());
         assert!(matches!(
-            verify(&c, &payload),
+            verify(&c, &payload, TLD_POW_DIFFICULTY),
             Err(SconeError::InvalidProof(_))
         ));
     }

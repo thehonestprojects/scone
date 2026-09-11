@@ -60,7 +60,7 @@ name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) publi
 | `domain_id` | 32 octets nus | **doit** valoir `DomainId(name)` (recomputé, jamais cru) |
 | `owner` | 32 octets nus | **doit** être la dérivation de `public_key` (voir ci-dessous) |
 | `timestamp` | varint | information d'ordre (Unix, secondes) |
-| `proof` | `bytes` ≤ 256 | opaque, réservé au futur PoW de registration |
+| `proof` | `bytes` ≤ 256 | charge utile du PoW de registration (voir [ci-dessous](#preuve-de-travail-pow-de-registration)) |
 | `public_key` | 32 octets nus | clé publique Ed25519 du signataire (RFC 8032) |
 | `signature` | **exactement 64 octets** | signature Ed25519 du payload signé |
 
@@ -88,7 +88,7 @@ tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[6
 | `tld_id` | 32 octets nus | identité du TLD : `BLAKE3-256("SCONE-TLD-V1" || tld)` |
 | `owner` | 32 octets nus | dérivation de `public_key` |
 | `timestamp` | varint | information d'ordre (Unix, secondes) |
-| `proof` | `bytes` ≤ 256 | opaque, réservé au futur PoW |
+| `proof` | `bytes` ≤ 256 | charge utile du PoW de registration (voir [ci-dessous](#preuve-de-travail-pow-de-registration)) |
 | `public_key` | 32 octets nus | clé Ed25519 du signataire |
 | `signature` | **exactement 64 octets** | signature Ed25519 du payload signé |
 
@@ -262,6 +262,57 @@ Propriétés :
 - tous les champs sauf `signature` sont couverts — **y compris le
   nom porté par un `RegisterDomain`** : modifier n'importe lequel
   invalide la signature.
+
+## Preuve de travail (PoW) de registration
+
+Le champ `proof` de `RegisterDomain` et `RegisterTld` porte la preuve
+de travail de registration (module `scone-core::pow`).
+
+### Digest
+
+```text
+digest = BLAKE3-256("SCONE-POW-V1" || challenge || nonce_le64)
+```
+
+`challenge` est l'entrée de dérivation de l'objet claimé —
+`"SCONE-TLD-V1" || tld` pour un TLD, `"SCONE-DOMAIN-V1" || nom` pour
+un domaine : exactement les octets hashés pour `TldId` / `DomainId`,
+si bien qu'une preuve n'est jamais rejouable entre namespaces ni
+entre kinds d'objets. `nonce_le64` est l'encodage little-endian sur
+8 octets du nonce.
+
+La preuve est valide quand `digest` a au moins `difficulty` bits de
+zéro en tête.
+
+### Charge utile wire (12 octets fixes)
+
+```text
+nonce_le64 || difficulty_le32
+```
+
+La difficulté voyage avec la preuve, mais elle est
+**producteur-déclarée et donc jamais crue** : le vérificateur la
+compare à la **constante protocole** du kind de registration, et un
+payload dont la difficulté déclarée diffère de la constante (plus
+basse *ou* plus haute) est rejeté (`InvalidProof`). Le nonce est
+ensuite re-vérifié à la difficulté constante, digest recomputé de
+zéro.
+
+### Constantes de difficulté (paramètres protocole)
+
+| Kind | Constante | Difficulté |
+|---|---|---|
+| `RegisterTld` | `TLD_POW_DIFFICULTY` | 24 bits |
+| `RegisterDomain` (TLD ouvert) | `DOMAIN_POW_DIFFICULTY` | 20 bits |
+
+Claimer un namespace entier coûte ~16× le claim d'un nom à
+l'intérieur. Changer une constante = changement de consensus (les
+deux bornes divergent selon le fork).
+
+Note d'étape : la vérification (`pow::verify`) est en place et
+normative ; le branchement à l'application d'état (quand la preuve
+est exigée — TLD ouvert — vs interdite — chemin assign-only) est la
+règle d'état M8b.
 
 ## Règles de validation
 
