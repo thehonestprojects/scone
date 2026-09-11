@@ -1,7 +1,10 @@
 //! `scone tx …` (offline build/sign/verify) and the shared
 //! transaction build/sign helpers used by `scone domain …`.
 
-use scone_core::{DomainId, DomainName, RegisterDomain, UpdateDomain};
+use scone_core::{
+    AssignDomain, DomainId, DomainName, RegisterDomain, RenewDomain, RevokeTld, SetTldOpen,
+    TransferTld, UpdateDomain,
+};
 use scone_crypto::{Signature, SigningKey};
 
 use crate::cli::{TxCommand, TxKind};
@@ -67,6 +70,11 @@ pub(crate) fn run_tx(command: TxCommand) -> Result<Vec<String>, CliError> {
                 }
                 scone_core::Transaction::UpdateDomain(_) => "update",
                 scone_core::Transaction::RegisterTld(_) => "register-tld",
+                scone_core::Transaction::TransferTld(_) => "transfer-tld",
+                scone_core::Transaction::RevokeTld(_) => "revoke-tld",
+                scone_core::Transaction::SetTldOpen(_) => "set-tld-open",
+                scone_core::Transaction::AssignDomain(_) => "assign-domain",
+                scone_core::Transaction::RenewDomain(_) => "renew-domain",
             };
             Ok(vec![
                 format!("kind: {kind}"),
@@ -143,6 +151,60 @@ fn unsigned_into_transaction(
             tld_id,
             timestamp,
             proof,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::TransferTld {
+            tld_id,
+            owner: _,
+            new_owner,
+            public_key,
+        } => scone_core::Transaction::TransferTld(TransferTld::transfer_tld_signed(
+            tld_id,
+            new_owner,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::RevokeTld {
+            tld_id,
+            owner: _,
+            public_key,
+        } => scone_core::Transaction::RevokeTld(RevokeTld::revoke_tld_signed(
+            tld_id,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::SetTldOpen {
+            tld_id,
+            owner: _,
+            open,
+            public_key,
+        } => scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+            tld_id,
+            open,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::AssignDomain {
+            name,
+            domain_id: _,
+            owner: _,
+            assignee,
+            public_key,
+        } => scone_core::Transaction::AssignDomain(AssignDomain::assign_domain_signed(
+            name,
+            assignee,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::RenewDomain {
+            domain_id,
+            owner: _,
+            valid_until,
+            public_key,
+        } => scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+            domain_id,
+            valid_until,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
@@ -272,6 +334,43 @@ fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transact
                 Signature::from_bytes([0; 64]),
             ))
         }
+        // M8a family: rebind keeps every carried field, only the
+        // signer identity is recomputed.
+        scone_core::Transaction::TransferTld(t) => {
+            scone_core::Transaction::TransferTld(TransferTld::transfer_tld_signed(
+                t.tld_id,
+                t.new_owner,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+        scone_core::Transaction::RevokeTld(t) => scone_core::Transaction::RevokeTld(
+            RevokeTld::revoke_tld_signed(t.tld_id, sk.public_key(), Signature::from_bytes([0; 64])),
+        ),
+        scone_core::Transaction::SetTldOpen(t) => {
+            scone_core::Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+                t.tld_id,
+                t.open,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+        scone_core::Transaction::AssignDomain(a) => {
+            scone_core::Transaction::AssignDomain(AssignDomain::assign_domain_signed(
+                a.name.clone(),
+                a.assignee,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+        scone_core::Transaction::RenewDomain(r) => {
+            scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+                r.domain_id,
+                r.valid_until,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
     }
 }
 
@@ -292,6 +391,26 @@ fn attach_signature(
         scone_core::Transaction::RegisterTld(mut t) => {
             t.signature = signature;
             scone_core::Transaction::RegisterTld(t)
+        }
+        scone_core::Transaction::TransferTld(mut t) => {
+            t.signature = signature;
+            scone_core::Transaction::TransferTld(t)
+        }
+        scone_core::Transaction::RevokeTld(mut t) => {
+            t.signature = signature;
+            scone_core::Transaction::RevokeTld(t)
+        }
+        scone_core::Transaction::SetTldOpen(mut t) => {
+            t.signature = signature;
+            scone_core::Transaction::SetTldOpen(t)
+        }
+        scone_core::Transaction::AssignDomain(mut a) => {
+            a.signature = signature;
+            scone_core::Transaction::AssignDomain(a)
+        }
+        scone_core::Transaction::RenewDomain(mut r) => {
+            r.signature = signature;
+            scone_core::Transaction::RenewDomain(r)
         }
     }
 }

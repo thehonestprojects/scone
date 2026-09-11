@@ -56,6 +56,6 @@ pub use consensus::{Consensus, PermissiveConsensus};
 pub use error::{BlockchainError, Result};
 pub use genesis::{GENESIS_TIMESTAMP, genesis, genesis_hash};
 pub use merkle::{MERKLE_VERSION, merkle_root, tx_root};
-pub use state::{ChainState, DomainState};
+pub use state::{ChainState, DomainState, TldState};
 pub use txid::{TX_ID_VERSION, TxId, transaction_id};
 pub use validate::{owner_from_public_key, validate_transaction};

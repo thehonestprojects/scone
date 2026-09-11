@@ -25,16 +25,43 @@
 //! store_block(&mut store, &chain, &block, hash)?; // atomic delta persist
 //! ```
 
-use scone_blockchain::{Blockchain, DomainState, block_hash};
-use scone_core::{DomainId, Transaction};
+use scone_blockchain::{Blockchain, DomainState, TldState, block_hash};
+use scone_core::{DomainId, TldId, Transaction};
 use scone_protocol::{Block, BlockHash, decode_complete, encode_to_vec};
 
-use crate::DomainStateBytes;
 use crate::NodeStore;
 use crate::error::{Result, StorageError};
+use crate::{DomainStateBytes, TldStateBytes};
 
 /// Batch size of domain-state pagination.
 pub const DOMAIN_PAGE: usize = 100;
+
+/// Batch size of TLD-state pagination (M7d).
+pub const TLD_PAGE: usize = 100;
+
+/// TLDs whose state a block's transactions claim, in block order,
+/// deduplicated (M7d).
+///
+/// Same contract as [`touched_domains`]: references only, final values
+/// read from the (already updated) chain state.
+#[must_use]
+pub fn touched_tlds(block: &Block) -> Vec<&TldId> {
+    let mut seen = std::collections::HashSet::new();
+    block
+        .transactions
+        .iter()
+        .filter_map(|tx| match tx {
+            Transaction::RegisterTld(r) => {
+                if seen.insert(r.tld_id) {
+                    Some(&r.tld_id)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// Domains whose state a block's transactions modify, in block order,
 /// deduplicated (last write wins).
@@ -53,12 +80,25 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
         .filter(|tx| match tx {
             Transaction::RegisterDomain(r) => seen.insert(r.domain_id),
             Transaction::UpdateDomain(u) => seen.insert(u.domain_id),
-            Transaction::RegisterTld(_) => false,
+            // A RegisterTld never touches a domain state (separate
+            // registry, M7b); the M8a family has no state rules yet
+            // (M8b) and cannot appear in an applied block.
+            Transaction::RegisterTld(_)
+            | Transaction::TransferTld(_)
+            | Transaction::RevokeTld(_)
+            | Transaction::SetTldOpen(_)
+            | Transaction::AssignDomain(_)
+            | Transaction::RenewDomain(_) => false,
         })
         .filter_map(|tx| match tx {
             Transaction::RegisterDomain(r) => Some(&r.domain_id),
             Transaction::UpdateDomain(u) => Some(&u.domain_id),
-            Transaction::RegisterTld(_) => None,
+            Transaction::RegisterTld(_)
+            | Transaction::TransferTld(_)
+            | Transaction::RevokeTld(_)
+            | Transaction::SetTldOpen(_)
+            | Transaction::AssignDomain(_)
+            | Transaction::RenewDomain(_) => None,
         })
         .collect()
 }
@@ -66,8 +106,9 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
 /// Atomic delta persistence of an accepted block.
 ///
 /// Encodes `block` canonically, reads the final state of each touched
-/// domain from the chain's RAM state (the consensus authority), and
-/// writes block + tip + domain deltas in ONE store transaction.
+/// domain AND each claimed TLD from the chain's RAM state (the
+/// consensus authority), and writes block + tip + domain deltas + TLD
+/// deltas in ONE store transaction.
 ///
 /// `hash` MUST be the recomputed block hash (`Blockchain::push_block`
 /// return value). The store does not re-validate blocks.
@@ -92,7 +133,22 @@ pub fn store_block(
                 .map(|state| (*id, DomainStateBytes::from(state)))
         })
         .collect();
-    store.append_block_with_state(block.header.height, hash.as_bytes(), &bytes, &deltas)
+    let tld_deltas: Vec<(TldId, TldStateBytes)> = touched_tlds(block)
+        .into_iter()
+        .filter_map(|id| {
+            chain
+                .state()
+                .tld(id)
+                .map(|state| (*id, TldStateBytes::from(state)))
+        })
+        .collect();
+    store.append_block_with_state(
+        block.header.height,
+        hash.as_bytes(),
+        &bytes,
+        &deltas,
+        &tld_deltas,
+    )
 }
 
 /// Loads the chain from `store` **without replay**: reads the tip
@@ -153,6 +209,25 @@ pub fn load_chain(store: &impl NodeStore) -> Result<Blockchain> {
         }
         cursor = next;
         if page_len < DOMAIN_PAGE {
+            break;
+        }
+    }
+    // M7d — restart window closure: restore the TLD registry too.
+    // Without it, a restarted node forgot every claimed TLD and any
+    // RegisterDomain under them failed `UnknownTld` at precheck even
+    // though the chain state it served was authoritative.
+    let mut tld_cursor: Option<TldId> = None;
+    loop {
+        let (page, next) = store.iterate_tlds(tld_cursor, TLD_PAGE)?;
+        let page_len = page.len();
+        for (tld, encoded) in page {
+            let tld_state: TldState = TldStateBytes::decode(encoded.as_encoded())?;
+            state
+                .restore_tld(tld, tld_state)
+                .map_err(|e| StorageError::Corrupted(e.to_string()))?;
+        }
+        tld_cursor = next;
+        if page_len < TLD_PAGE {
             break;
         }
     }
@@ -230,6 +305,26 @@ mod tests {
             Transaction::RegisterTld(mut t) => {
                 t.signature = sk.sign(&payload);
                 Transaction::RegisterTld(t)
+            }
+            Transaction::TransferTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::TransferTld(t)
+            }
+            Transaction::RevokeTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RevokeTld(t)
+            }
+            Transaction::SetTldOpen(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::SetTldOpen(t)
+            }
+            Transaction::AssignDomain(mut a) => {
+                a.signature = sk.sign(&payload);
+                Transaction::AssignDomain(a)
+            }
+            Transaction::RenewDomain(mut r) => {
+                r.signature = sk.sign(&payload);
+                Transaction::RenewDomain(r)
             }
         }
     }

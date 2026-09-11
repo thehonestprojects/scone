@@ -44,4 +44,8 @@ pub enum SconeError {
     /// Generic malformed data (decoding, encoding, framing).
     #[error("invalid format: {0}")]
     InvalidFormat(String),
+
+    /// A proof of work does not solve its challenge (see `pow`).
+    #[error("invalid proof of work: {0}")]
+    InvalidProof(String),
 }

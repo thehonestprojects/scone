@@ -32,6 +32,9 @@ reste du code (blockchain, futur relay M4) :
   **maintenu** (`meta["domain_count"]`), jamais de `COUNT(*)` ;
 - `iterate_domains(after, max) -> DomainPage` — pagination par curseur
   (lots de 100 par défaut), ordre croissant des octets du `DomainId` ;
+- `put_tld_state` / `tld_state` / `tld_count` / `iterate_tlds` —
+  mêmes contrats pour le registre TLD (`tld_count` maintenu,
+  curseur borné) (M7d) ;
 - `put_dht_cache` / `dht_cache` — octets `SignedDnsRecord` opaques ;
 - `meta_get` / `meta_set`.
 
@@ -53,6 +56,7 @@ Règles :
 | `blocks_by_height` | `u64` height (b-tree ordonné) | `hash(32) ‖ height(8 BE) ‖ block canonique` |
 | `blocks_by_hash` | hash de bloc (32 o) | encodage canonique du bloc |
 | `domains` | `DomainId` (32 o, ordre octet) | `DomainStateBytes` (ci-dessous) |
+| `tlds` | `TldId` (32 o, ordre octet) | `TldStateBytes` (ci-dessous, M7d) |
 | `dht_cache` | `DomainId` (32 o) | octets `SignedDnsRecord` (opaques) |
 | `meta` | `&[u8]` | `&[u8]` |
 
@@ -64,6 +68,7 @@ Clés de `meta` :
 | `tip` | hash (32 o) du bloc tip |
 | `tip_height` | `u64 BE` (rend `tip()` O(1)) |
 | `domain_count` | `u64 BE` (compteur maintenu) |
+| `tld_count` | `u64 BE` (compteur maintenu, M7d) |
 
 L'en-tête `hash ‖ height` de `blocks_by_height` rend chaque index
 auto-porteur (vérifiable sans lire le bloc) ; les deux index sont mis
@@ -99,6 +104,21 @@ Décodage **strict** (`DomainStateBytes::decode`) : tag inconnu,
 longueur erronée ou octets en excès → `StorageError::Corrupted`,
 jamais de panic.
 
+## Format d'encodage `TldStateBytes` (M7d)
+
+Toujours exactement 33 octets (le registre TLD v1 est claim-only :
+un owner, ni séquence ni record hash) :
+
+```text
+TldStateBytes = tag(0x01) ‖ owner(32)
+```
+
+Le tag n'existe que pour l'évolution du format : un futur layout
+bump le tag et les vieux lecteurs échouent en `Corrupted` au lieu de
+deviner. Décodage **strict** (`TldStateBytes::decode`) : tag inconnu,
+longueur erronée ou octets en excès → `StorageError::Corrupted`,
+jamais de panic.
+
 ## Garanties d'atomicité
 
 `append_block_with_state` écrit dans **une seule** `WriteTransaction`
@@ -112,7 +132,11 @@ redb :
 4. le compteur `domain_count` (incrémenté du nombre de domaines
    **nouveaux** seulement ; un `UpdateDomain` d'un domaine existant ne
    l'incrémente pas) ;
-5. `tip` et `tip_height`.
+5. chaque delta du registre TLD (`tlds`, M7d) — **dans la même
+   transaction** : un bloc écrit sans ses claims TLD est
+   structurellement impossible ;
+6. le compteur `tld_count` (nouveaux TLDs seulement) ;
+7. `tip` et `tip_height`.
 
 redb commite en style WAL : un crash en pleine écriture laisse l'état
 cohérent **précédent**. **Un bloc écrit sans son état est donc
@@ -144,17 +168,25 @@ store = persistance. Stratégie choisie (la plus simple, documentée) :
 complet reste possible et sert de contrôle/repair.
 
 - `store_block(store, chain, block, hash)` : encode le bloc
-  canoniquement, lit l'état final des domaines touchés dans l'état
-  RAM (déjà mis à jour par `push_block`), append atomique.
+  canoniquement, lit l'état final des domaines touchés ET des TLDs
+  claimés dans l'état RAM (déjà mis à jour par `push_block`), append
+  atomique.
 - `load_chain(store)` : **sans rejeu** — lit tip + bloc tip (O(1)
   lectures bloc), restaure l'état domaines par pages de 100
-  (`DOMAIN_PAGE`). La chaîne RAM ne retient que genèse + tip ; les
-  blocs historiques restent dans le store et sont servis depuis lui.
+  (`DOMAIN_PAGE`) **et le registre TLD par pages de 100**
+  (`TLD_PAGE`, M7d — fermeture de la fenêtre de redémarrage : sans
+  elle, un nœud redémarré oubliait tout TLD claimé et rejetait tout
+  `RegisterDomain` sous ce TLD en `UnknownTld`, alors même que son
+  disque détenait l'état complet). La chaîne RAM ne retient que
+  genèse + tip ; les blocs historiques restent dans le store et sont
+  servis depuis lui.
 - `load_chain_replay(store)` : rejoue tous les blocs stockés un par un
   (jamais tous en RAM) avec la validation complète ; le tip obtenu
   doit égaler le tip stocké, sinon `Corrupted`.
 - `touched_domains(block)` : ids des domaines modifiés par les
   transactions du bloc, dédupliqués, ordre du bloc.
+- `touched_tlds(block)` : ids des TLDs claimés par les
+  `RegisterTld` du bloc, dédupliqués, ordre du bloc (M7d).
 
 Le relay (M4) utilisera : `load_chain` au démarrage, puis pour chaque
 bloc accepté `push_block` (RAM) puis `store_block` (disque).
@@ -164,9 +196,10 @@ bloc accepté `push_block` (RAM) puis `store_block` (disque).
 - **Curseurs partout** : `iterate_domains` borne la page à `max`
   entrées (100 par défaut) via le `range` lazy de redb ; le tableau
   entier des domaines n'est jamais matérialisé. Les listes
-  volumineuses (TLD, domaines) passent obligatoirement par ce curseur.
+  volumineuses (TLD, domaines) passent obligatoirement par ce curseur
+  (`iterate_tlds`, même contrat, M7d).
 - **Delta-only** : `append_block_with_state` n'écrit que les domaines
-  modifiés par le bloc — jamais l'état complet ;
+  et TLDs modifiés par le bloc — jamais l'état complet ;
 - **Pas de duplication synchrone** : l'état RAM n'est pas re-persisté
   en bloc ; l'état disque n'est pas rechargé par bloc ;
 - **Lectures ponctuelles** : chaque lecture ouvre une read
@@ -187,10 +220,11 @@ faire allouer :
 - **`MAX_DOMAIN_PAGE` (10 000)** : `iterate_domains` borne
   *internement* la page demandée à `min(max, 10_000)` — un `max`
   démesuré ne matérialise jamais plus de 10 000 états en RAM ;
+  `iterate_tlds` a la même borne (`MAX_TLD_PAGE`, M7d) ;
 - **Clés `meta` réservées** : `meta_set` rejette `tip`,
-  `tip_height`, `format_version` et `domain_count` avec
-  `StorageError::ReservedKey` — écraser la comptabilité interne du
-  store reviendrait à le corrompre silencieusement.
+  `tip_height`, `format_version`, `domain_count` et `tld_count`
+  avec `StorageError::ReservedKey` — écraser la comptabilité
+  interne du store reviendrait à le corrompre silencieusement.
 
 ## Modèle de confiance
 
@@ -229,6 +263,11 @@ fichier peut être ré-ouvert.
 Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
 
 - roundtrip blocs genèse→N, restart, relecture, rejeu ;
+- M7d : registre TLD persisté par delta atomique, restauré au
+  redémarrage (un `RegisterDomain` sous un TLD claimé avant le
+  restart reste admissible — fermeture de la fenêtre), compteurs
+  exacts à la réouverture, curseur `tlds` croissant, append échoué
+  ne laisse aucun TLD, clé réservée `tld_count` rejetée ;
 - atomicité : append échoué ne laisse rien (tip, domaines, index
   intacts) ; deltas dupliqués comptés une fois ;
 - curseurs domains : pagination 100/7, ordre croissant `DomainId`,

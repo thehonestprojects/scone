@@ -141,6 +141,22 @@ impl Relay {
                 }
                 Ok(())
             }
+            // M8a family: types + wire exist, state rules land in M8b —
+            // mirror the chain-layer rejection here so the mempool
+            // never pools a transaction push_block would refuse.
+            Transaction::TransferTld(_) => {
+                Err(BlockchainError::UnsupportedTransaction("TransferTld"))
+            }
+            Transaction::RevokeTld(_) => Err(BlockchainError::UnsupportedTransaction("RevokeTld")),
+            Transaction::SetTldOpen(_) => {
+                Err(BlockchainError::UnsupportedTransaction("SetTldOpen"))
+            }
+            Transaction::AssignDomain(_) => {
+                Err(BlockchainError::UnsupportedTransaction("AssignDomain"))
+            }
+            Transaction::RenewDomain(_) => {
+                Err(BlockchainError::UnsupportedTransaction("RenewDomain"))
+            }
         }
     }
 

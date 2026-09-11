@@ -63,6 +63,13 @@ pub enum BlockchainError {
         /// Sequence the transaction carries.
         got: u64,
     },
+    /// A transaction of the M8a family (`TransferTld`, `RevokeTld`,
+    /// `SetTldOpen`, `AssignDomain`, `RenewDomain`): the types and the
+    /// wire format exist, but their state-transition rules are not
+    /// implemented yet (M8b). Rejected explicitly instead of being
+    /// silently accepted.
+    #[error("transaction type not yet applicable: {0}")]
+    UnsupportedTransaction(&'static str),
     /// A consensus hook rejected data (reason defined by the consensus
     /// implementation).
     #[error("consensus rejection: {0}")]

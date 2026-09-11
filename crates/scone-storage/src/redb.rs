@@ -7,16 +7,18 @@
 //! | `blocks_by_height` | `u64` height (ordered) | block hash `32` + height `8 BE` + canonical block bytes |
 //! | `blocks_by_hash` | block hash (`32`) | canonical block bytes |
 //! | `domains` | `DomainId` (`32`, ordered) | [`DomainStateBytes`] |
+//! | `tlds` | `TldId` (`32`, ordered) | [`TldStateBytes`] (M7d) |
 //! | `dht_cache` | `DomainId` (`32`) | encoded `SignedDnsRecord` |
-//! | `meta` | `&[u8]` | `&[u8]` (tip, tip height, format version, domain counter) |
+//! | `meta` | `&[u8]` | `&[u8]` (tip, tip height, format version, domain counter, TLD counter) |
 //!
 //! ## Guarantees
 //!
 //! - **ACID appends**: [`RedbStore::append_block_with_state`] writes
-//!   the block in both indexes, the tip, the domain deltas and the
-//!   domain counter in a single `WriteTransaction` — a crash mid-write
-//!   leaves the previous consistent state (WAL-style commit). A block
-//!   stored without its state updates is impossible by construction.
+//!   the block in both indexes, the tip, the domain deltas, the TLD
+//!   deltas and both counters in a single `WriteTransaction` — a crash
+//!   mid-write leaves the previous consistent state (WAL-style
+//!   commit). A block stored without its state updates (domains OR
+//!   TLD registry) is impossible by construction.
 //! - **Snapshot reads**: each read opens a short redb read transaction;
 //!   readers never block the writer.
 //! - **Lazy cursors**: `iterate_domains` walks a `range` cursor and
@@ -34,11 +36,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
-use scone_core::DomainId;
+use scone_core::{DomainId, TldId};
 
 use crate::error::{Result, StorageError};
-use crate::state_bytes::decode_domain_entry;
-use crate::{DomainStateBytes, META_FORMAT_VERSION, META_TIP, NodeStore, STORAGE_FORMAT_VERSION};
+use crate::state_bytes::{decode_domain_entry, decode_tld_entry};
+use crate::{
+    DomainStateBytes, META_FORMAT_VERSION, META_TIP, NodeStore, STORAGE_FORMAT_VERSION,
+    TldStateBytes,
+};
 
 /// `height -> hash(32) || height(8 BE) || block bytes`.
 type BlocksByHeight = TableDefinition<'static, u64, &'static [u8]>;
@@ -46,6 +51,8 @@ type BlocksByHeight = TableDefinition<'static, u64, &'static [u8]>;
 type BlocksByHash = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `DomainId(32) -> DomainStateBytes`.
 type Domains = TableDefinition<'static, &'static [u8], &'static [u8]>;
+/// `TldId(32) -> TldStateBytes` (M7d).
+type Tlds = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `DomainId(32) -> encoded SignedDnsRecord`.
 type DhtCache = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `meta key -> meta value`.
@@ -55,6 +62,8 @@ type Meta = TableDefinition<'static, &'static [u8], &'static [u8]>;
 const META_TIP_HEIGHT: &[u8] = b"tip_height";
 /// `meta` key of the maintained domain-state counter (never `COUNT(*)`).
 const META_DOMAIN_COUNT: &[u8] = b"domain_count";
+/// `meta` key of the maintained TLD-state counter (never `COUNT(*)`) (M7d).
+const META_TLD_COUNT: &[u8] = b"tld_count";
 
 /// Maximum size of one cached DHT record (DoS guard): a hostile peer
 /// must not be able to make the node persist unbounded blobs.
@@ -65,6 +74,9 @@ pub const MAX_DHT_CACHE_ENTRY: usize = 64 * 1024;
 /// still yields a memory-bounded page.
 pub const MAX_DOMAIN_PAGE: usize = 10_000;
 
+/// Same DoS guard as [`MAX_DOMAIN_PAGE`], for `iterate_tlds` (M7d).
+pub const MAX_TLD_PAGE: usize = 10_000;
+
 /// Rejects `meta` keys reserved for the store's internal
 /// bookkeeping — clobbering them would silently corrupt the store.
 fn ensure_not_reserved(key: &[u8]) -> Result<()> {
@@ -72,6 +84,7 @@ fn ensure_not_reserved(key: &[u8]) -> Result<()> {
         || key == META_TIP_HEIGHT
         || key == META_FORMAT_VERSION
         || key == META_DOMAIN_COUNT
+        || key == META_TLD_COUNT
     {
         return Err(StorageError::ReservedKey(
             String::from_utf8_lossy(key).into_owned(),
@@ -86,6 +99,7 @@ const BLOCK_INDEX_HEADER: usize = 32 + 8;
 const BLOCKS_BY_HEIGHT: BlocksByHeight = TableDefinition::new("blocks_by_height");
 const BLOCKS_BY_HASH: BlocksByHash = TableDefinition::new("blocks_by_hash");
 const DOMAINS: Domains = TableDefinition::new("domains");
+const TLDS: Tlds = TableDefinition::new("tlds");
 const DHT_CACHE: DhtCache = TableDefinition::new("dht_cache");
 const META: Meta = TableDefinition::new("meta");
 
@@ -167,6 +181,7 @@ impl RedbStore {
             let _ = wtxn.open_table(BLOCKS_BY_HEIGHT)?;
             let _ = wtxn.open_table(BLOCKS_BY_HASH)?;
             let _ = wtxn.open_table(DOMAINS)?;
+            let _ = wtxn.open_table(TLDS)?;
             let _ = wtxn.open_table(DHT_CACHE)?;
             let mut meta_t = wtxn.open_table(META)?;
             if meta_t.get(META_FORMAT_VERSION)?.is_none() {
@@ -176,6 +191,7 @@ impl RedbStore {
                 )?;
                 write_tip(&mut meta_t, 0, &genesis_hash_bytes())?;
                 meta_t.insert(META_DOMAIN_COUNT, &0u64.to_be_bytes()[..])?;
+                meta_t.insert(META_TLD_COUNT, &0u64.to_be_bytes()[..])?;
             }
         }
         wtxn.commit()?;
@@ -220,6 +236,13 @@ impl RedbStore {
         let table = rtxn.open_table(META)?;
         meta_u64(&table, META_DOMAIN_COUNT, "domain_count")
     }
+
+    /// Maintained TLD-state counter (never a table scan) (M7d).
+    fn tld_count_inner(&self) -> Result<u64> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(META)?;
+        meta_u64(&table, META_TLD_COUNT, "tld_count")
+    }
 }
 
 /// Shared core of both append entry points: everything below runs in
@@ -230,6 +253,7 @@ fn append_core(
     hash: &[u8; 32],
     block_bytes: &[u8],
     state_deltas: &[(DomainId, DomainStateBytes)],
+    tld_deltas: &[(TldId, TldStateBytes)],
 ) -> Result<()> {
     // Pre-encoded value for blocks_by_height: hash || height || bytes.
     let mut indexed = Vec::with_capacity(BLOCK_INDEX_HEADER + block_bytes.len());
@@ -241,6 +265,7 @@ fn append_core(
         let mut by_height = wtxn.open_table(BLOCKS_BY_HEIGHT)?;
         let mut by_hash = wtxn.open_table(BLOCKS_BY_HASH)?;
         let mut domains_t = wtxn.open_table(DOMAINS)?;
+        let mut tlds_t = wtxn.open_table(TLDS)?;
         let mut meta_t = wtxn.open_table(META)?;
 
         if let Some(previous) = by_height.get(height)? {
@@ -272,6 +297,20 @@ fn append_core(
             )?;
         }
 
+        // TLD deltas land in the SAME transaction (M7d): a block can
+        // never be stored without its TLD-registry changes.
+        let mut new_tlds: u64 = 0;
+        for (tld, state) in tld_deltas {
+            let existed = tlds_t.insert(&tld.as_bytes()[..], state.as_encoded())?;
+            if existed.is_none() {
+                new_tlds += 1;
+            }
+        }
+        if new_tlds > 0 {
+            let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+            meta_t.insert(META_TLD_COUNT, &(current + new_tlds).to_be_bytes()[..])?;
+        }
+
         write_tip(&mut meta_t, height, hash)?;
     }
     Ok(())
@@ -279,7 +318,7 @@ fn append_core(
 
 impl NodeStore for RedbStore {
     fn append_block(&mut self, height: u64, hash: &[u8; 32], block_bytes: &[u8]) -> Result<()> {
-        self.append_block_with_state(height, hash, block_bytes, &[])
+        self.append_block_with_state(height, hash, block_bytes, &[], &[])
     }
 
     fn append_block_with_state(
@@ -288,6 +327,7 @@ impl NodeStore for RedbStore {
         hash: &[u8; 32],
         block_bytes: &[u8],
         state_deltas: &[(DomainId, DomainStateBytes)],
+        tld_deltas: &[(TldId, TldStateBytes)],
     ) -> Result<()> {
         let (tip_height, tip_hash) = self.tip_inner()?;
         if height == tip_height && hash == &tip_hash {
@@ -307,7 +347,14 @@ impl NodeStore for RedbStore {
             });
         }
         let mut wtxn = self.db.begin_write()?;
-        append_core(&mut wtxn, height, hash, block_bytes, state_deltas)?;
+        append_core(
+            &mut wtxn,
+            height,
+            hash,
+            block_bytes,
+            state_deltas,
+            tld_deltas,
+        )?;
         wtxn.commit()?;
         Ok(())
     }
@@ -401,6 +448,73 @@ impl NodeStore for RedbStore {
             let (domain, state) = decode_domain_entry(key, value.value())?;
             out.push((domain, state));
             cursor = Some(domain);
+            if out.len() == max {
+                break;
+            }
+        }
+        Ok((out, cursor))
+    }
+
+    fn put_tld_state(&mut self, tld: TldId, state: TldStateBytes) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut tlds_t = wtxn.open_table(TLDS)?;
+            let existed = tlds_t.insert(&tld.as_bytes()[..], state.as_encoded())?;
+            if existed.is_none() {
+                let mut meta_t = wtxn.open_table(META)?;
+                let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+                meta_t.insert(META_TLD_COUNT, &(current + 1).to_be_bytes()[..])?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn tld_state(&self, tld: &TldId) -> Result<Option<TldStateBytes>> {
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(TLDS)?;
+        match table.get(tld.as_bytes().as_slice())? {
+            None => Ok(None),
+            Some(guard) => {
+                let (_, state) = decode_tld_entry(tld.as_bytes(), guard.value())?;
+                Ok(Some(state))
+            }
+        }
+    }
+
+    fn tld_count(&self) -> Result<u64> {
+        self.tld_count_inner()
+    }
+
+    fn iterate_tlds(&self, after: Option<TldId>, max: usize) -> Result<crate::TldPage> {
+        // DoS guard: clamp the requested page to the internal cap.
+        let max = max.min(MAX_TLD_PAGE);
+        if max == 0 {
+            return Ok((Vec::new(), after));
+        }
+        let rtxn = self.db.begin_read()?;
+        let table = rtxn.open_table(TLDS)?;
+        // Same strictly-exclusive-cursor trick as `iterate_domains`.
+        let range = match after {
+            None => table.range::<&[u8]>(..),
+            Some(id) => {
+                let start: &[u8] = id.as_bytes();
+                table.range(start..)
+            }
+        }?;
+        let mut out = Vec::new();
+        let mut cursor = after;
+        for entry in range {
+            let (key, value) = entry?;
+            let key = key.value();
+            if let Some(previous) = after
+                && key == previous.as_bytes()
+            {
+                continue;
+            }
+            let (tld, state) = decode_tld_entry(key, value.value())?;
+            out.push((tld, state));
+            cursor = Some(tld);
             if out.len() == max {
                 break;
             }

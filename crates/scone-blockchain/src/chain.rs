@@ -296,6 +296,26 @@ mod tests {
                 t.signature = sk.sign(&payload);
                 Transaction::RegisterTld(t)
             }
+            Transaction::TransferTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::TransferTld(t)
+            }
+            Transaction::RevokeTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RevokeTld(t)
+            }
+            Transaction::SetTldOpen(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::SetTldOpen(t)
+            }
+            Transaction::AssignDomain(mut a) => {
+                a.signature = sk.sign(&payload);
+                Transaction::AssignDomain(a)
+            }
+            Transaction::RenewDomain(mut r) => {
+                r.signature = sk.sign(&payload);
+                Transaction::RenewDomain(r)
+            }
         }
     }
 

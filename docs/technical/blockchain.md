@@ -184,6 +184,17 @@ s'applique), `[RegisterDomain, RegisterTld]` est rejeté en bloc entier
   porte `sequence = 1`) ;
 - à l'application : `sequence` avance, `record_hash` est remplacé.
 
+**Famille M8a** (`TransferTld`, `RevokeTld`, `SetTldOpen`,
+`AssignDomain`, `RenewDomain`) :
+
+- les types et formats wire existent (voir
+  `/docs/technical/transactions.md`), mais leurs règles d'application
+  ne sont pas encore définies (M8b) : `state.apply` les rejette
+  explicitement avec `UnsupportedTransaction(nom)`, de façon typée et
+  atomique (état inchangé). Le mempool du relay applique le même
+  rejet au precheck — une transaction M8a n'entre jamais dans un bloc
+  tant que M8b n'est pas livré.
+
 Deux nœuds partant du même état et appliquant les mêmes blocs dans le
 même ordre produisent exactement le même état final.
 

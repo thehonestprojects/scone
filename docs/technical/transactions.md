@@ -30,15 +30,19 @@ Chaque discriminant est une **constante opaque, fixe et arbitraire** :
 les valeurs sont choisies distinctes exprès, pour que le wire ne
 suggère **jamais** d'ordre logique entre les types (aucune suite
 0x01/0x02/0x03…). `0x00` n'est **jamais** un type valide (octet de
-corruption typique). Les futurs types (`TransferTld`, `RevokeTld`,
-`AssignDomain`, `RenewDomain`, …) prendront toute valeur libre non
-utilisée, documentée une fois pour toutes dans cette table.
+corruption typique). Les types futurs prendront toute valeur libre
+non utilisée, documentée une fois pour toutes dans cette table.
 
 | Discriminant | Type | Rôle |
 |---|---|---|
 | `0x21` | `RegisterDomain` | claim d'un domaine |
 | `0x52` | `UpdateDomain` | nouvelle version des données DNS d'un domaine |
 | `0x93` | `RegisterTld` | claim d'un top-level domain (M7) |
+| `0x47` | `TransferTld` | transfert d'un TLD à un nouvel owner (M8a) |
+| `0x6B` | `RevokeTld` | abandon d'un TLD (M8a) |
+| `0xB8` | `SetTldOpen` | ouverture/fermeture d'un TLD à l'auto-enregistrement (M8a) |
+| `0xD4` | `AssignDomain` | assignation directe d'un domaine par l'owner du TLD (M8a) |
+| `0x3C` | `RenewDomain` | prolongation de l'enregistrement d'un domaine (M8a) |
 
 Tout octet de version autre que `0x01` est rejeté explicitement
 (`UnsupportedVersion(valeur reçue)`) : un format inconnu ou obsolète
@@ -94,6 +98,82 @@ enregistrer le TLD `uip` (claim sur le namespace `*.uip`) ne peut
 jamais squatter l'identité d'un domaine, ni l'inverse. Règle d'état à
 l'application : le TLD doit être libre (registre séparé de celui des
 domaines).
+
+## Famille M8a — formats wire
+
+Cinq types complètent le registre TLD et le cycle de vie des
+domaines. Leurs **types et formats wire sont normatifs dès M8a** ;
+leurs **règles d'état** (conditions d'application dans un bloc)
+arrivent en M8b : jusqu'alors la chaîne les rejette explicitement
+avec `UnsupportedTransaction(nom)` — jamais de silence, jamais de
+panic.
+
+### TRANSFER_TLD (0x47)
+
+```text
+tld_id[32] owner[32] new_owner[32] public_key[32] signature[64]
+```
+
+| Champ | Type | Contraintes |
+|---|---|---|
+| `tld_id` | 32 octets nus | TLD transféré |
+| `owner` | 32 octets nus | dérivation de `public_key` (owner courant / signataire) |
+| `new_owner` | 32 octets nus | identité du destinataire (opaque : toute valeur est syntaxiquement valide ; le binding aux clés qui peuvent le dépenser est une règle d'état M8b) |
+| `public_key` | 32 octets nus | clé Ed25519 du signataire |
+| `signature` | **exactement 64 octets** | signature Ed25519 du payload signé |
+
+Pas de timestamp ni de séquence : un TLD a exactement un owner à la
+fois, le premier transfert appliqué gagne (ordre de chaîne seul).
+
+### REVOKE_TLD (0x6B)
+
+```text
+tld_id[32] owner[32] public_key[32] signature[64]
+```
+
+Abandon volontaire d'un TLD (re-claimable ensuite par un
+`RegisterTld` frais). Signé par l'owner courant ; volontairement sans
+timestamp ni séquence — un revoke est one-shot contre l'état courant.
+
+### SET_TLD_OPEN (0xB8)
+
+```text
+tld_id[32] owner[32] open u8 public_key[32] signature[64]
+```
+
+| Champ | Type | Contraintes |
+|---|---|---|
+| `open` | 1 octet | **strictement `0x00` ou `0x01`** (forme canonique ; toute autre valeur → erreur de décodage, jamais de coercion) |
+
+TLD **fermé** = assign-only (domaines créés exclusivement par l'owner
+du TLD via `AssignDomain`) ; TLD **ouvert** = quiconque peut faire le
+PoW de registration et claimer un domaine libre (`RegisterDomain`).
+
+### ASSIGN_DOMAIN (0xD4)
+
+```text
+name(str ≤ 253) domain_id[32] owner[32] assignee[32] public_key[32] signature[64]
+```
+
+Miroir de `RegisterDomain` : le nom canonique est porté en clair et
+`domain_id` doit valoir `DomainId(name)` (recomputé au décodage,
+encodage et validation). Signé par l'**owner du TLD** du nom
+(vérifié à l'application, M8b) ; `assignee` devient le premier owner
+du domaine (opaque, comme `new_owner`).
+
+### RENEW_DOMAIN (0x3C)
+
+```text
+domain_id[32] owner[32] valid_until.v public_key[32] signature[64]
+```
+
+| Champ | Type | Contraintes |
+|---|---|---|
+| `valid_until` | varint | nouvelle échéance d'enregistrement (Unix, secondes) |
+
+Signé par l'owner courant du domaine ; le fait que `valid_until`
+prolonge réellement l'échéance (et d'au plus un terme de
+renouvellement) est une règle d'état (M8b).
 
 ## UPDATE_DOMAIN (0x52)
 
@@ -161,6 +241,16 @@ REGISTER_TLD_sans_sig    = disc(0x93) version(0x01) tld_id[32] owner[32]
                             timestamp.v proof public_key[32]
 UPDATE_DOMAIN_sans_sig   = disc(0x52) version(0x01) domain_id[32] owner[32]
                             sequence.v record_hash[32] public_key[32]
+TRANSFER_TLD_sans_sig    = disc(0x47) version(0x01) tld_id[32] owner[32]
+                            new_owner[32] public_key[32]
+REVOKE_TLD_sans_sig      = disc(0x6B) version(0x01) tld_id[32] owner[32]
+                            public_key[32]
+SET_TLD_OPEN_sans_sig    = disc(0xB8) version(0x01) tld_id[32] owner[32]
+                            open(0x00|0x01) public_key[32]
+ASSIGN_DOMAIN_sans_sig   = disc(0xD4) version(0x01) name domain_id[32] owner[32]
+                            assignee[32] public_key[32]
+RENEW_DOMAIN_sans_sig    = disc(0x3C) version(0x01) domain_id[32] owner[32]
+                            valid_until.v public_key[32]
 ```
 
 Propriétés :
@@ -191,7 +281,11 @@ Une transaction est valide si et seulement si :
    RegisterDomain → TLD du nom **enregistré** (`UnknownTld` sinon — D1)
    puis domaine libre ; RegisterTld → TLD libre ;
    UpdateDomain → domaine existant, `owner` courant,
-   `sequence == current + 1`.
+   `sequence == current + 1` ;
+   famille M8a (TransferTld, RevokeTld, SetTldOpen, AssignDomain,
+   RenewDomain) → **rejet explicite** `UnsupportedTransaction(nom)`
+   jusqu'à M8b (les règles d'état correspondantes ne sont pas encore
+   définies ; le rejet est typé et atomique, l'état reste inchangé).
 
 La vérification utilise `verify_strict` (rejet des signatures
 malléables et des clés faibles/non canoniques), comme exigé pour des
@@ -277,4 +371,4 @@ depuis l'identité du keystore, jamais repris de l'entrée.
 
 | Version | Contenu | Statut |
 |---|---|---|
-| 1 | `public_key` + `signature` embarquées, payload `SCONE-TX-SIG-V1`, octet de version `0x01`, `RegisterDomain` porte le nom, `RegisterTld` (0x93) | courante |
+| 1 | `public_key` + `signature` embarquées, payload `SCONE-TX-SIG-V1`, octet de version `0x01`, `RegisterDomain` porte le nom, `RegisterTld` (0x93), famille M8a : `TransferTld` (0x47), `RevokeTld` (0x6B), `SetTldOpen` (0xB8), `AssignDomain` (0xD4), `RenewDomain` (0x3C) — formats wire normatifs, règles d'état différées à M8b | courante |

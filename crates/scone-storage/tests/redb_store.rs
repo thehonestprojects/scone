@@ -62,6 +62,26 @@ fn build_block(
                 t.signature = sk.sign(&payload);
                 Transaction::RegisterTld(t)
             }
+            Transaction::TransferTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::TransferTld(t)
+            }
+            Transaction::RevokeTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RevokeTld(t)
+            }
+            Transaction::SetTldOpen(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::SetTldOpen(t)
+            }
+            Transaction::AssignDomain(mut a) => {
+                a.signature = sk.sign(&payload);
+                Transaction::AssignDomain(a)
+            }
+            Transaction::RenewDomain(mut r) => {
+                r.signature = sk.sign(&payload);
+                Transaction::RenewDomain(r)
+            }
         }
     };
     let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
@@ -277,6 +297,26 @@ fn stored_domain_states_match_replayed_state() {
                     t.signature = sk.sign(&payload);
                     Transaction::RegisterTld(t)
                 }
+                Transaction::TransferTld(mut t) => {
+                    t.signature = sk.sign(&payload);
+                    Transaction::TransferTld(t)
+                }
+                Transaction::RevokeTld(mut t) => {
+                    t.signature = sk.sign(&payload);
+                    Transaction::RevokeTld(t)
+                }
+                Transaction::SetTldOpen(mut t) => {
+                    t.signature = sk.sign(&payload);
+                    Transaction::SetTldOpen(t)
+                }
+                Transaction::AssignDomain(mut a) => {
+                    a.signature = sk.sign(&payload);
+                    Transaction::AssignDomain(a)
+                }
+                Transaction::RenewDomain(mut r) => {
+                    r.signature = sk.sign(&payload);
+                    Transaction::RenewDomain(r)
+                }
             }
         };
         let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash());
@@ -315,7 +355,13 @@ fn failed_append_leaves_nothing_partial() {
     let before_count = store.domain_count().unwrap();
     assert!(
         store
-            .append_block_with_state(9, &[2; 32], b"bad", &[(domain_id("x.uip"), state_bytes(1))])
+            .append_block_with_state(
+                9,
+                &[2; 32],
+                b"bad",
+                &[(domain_id("x.uip"), state_bytes(1))],
+                &[]
+            )
             .is_err()
     );
     assert_eq!(store.tip().unwrap(), before_tip);
@@ -337,7 +383,7 @@ fn block_and_state_are_written_together_or_not_at_all() {
     let d = domain_id("dup.uip");
     let deltas = vec![(d, state_bytes(1)), (d, state_bytes(2))];
     store
-        .append_block_with_state(1, &[3; 32], b"b1", &deltas)
+        .append_block_with_state(1, &[3; 32], b"b1", &deltas, &[])
         .unwrap();
     // Duplicate delta counts ONE domain (last write wins).
     assert_eq!(store.domain_count().unwrap(), 1);
@@ -683,4 +729,177 @@ fn garbage_database_file_yields_typed_error() {
             StorageError::Database(_) | StorageError::Corrupted(_)
         ));
     }
+}
+
+// ------------------------------------------------------ TLDs (M7d)
+
+fn tld_id(tld: &str) -> scone_core::TldId {
+    scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap())
+}
+
+fn tld_bytes(seed: u8) -> scone_storage::TldStateBytes {
+    scone_storage::TldStateBytes::from(&scone_blockchain::TldState {
+        owner: scone_core::OwnerId::from_bytes([seed; 32]),
+    })
+}
+
+#[test]
+fn fresh_store_has_no_tlds() {
+    let (_dir, store) = tmp_store();
+    assert_eq!(store.tld_count().unwrap(), 0);
+    assert_eq!(store.tld_state(&tld_id("uip")).unwrap(), None);
+    let (page, cursor) = store.iterate_tlds(None, 100).unwrap();
+    assert!(page.is_empty());
+    assert_eq!(cursor, None);
+}
+
+#[test]
+fn put_tld_state_roundtrip_and_counter() {
+    let (_dir, mut store) = tmp_store();
+    let uip = tld_id("uip");
+    store.put_tld_state(uip, tld_bytes(7)).unwrap();
+    assert_eq!(store.tld_count().unwrap(), 1);
+    assert_eq!(
+        store.tld_state(&uip).unwrap().unwrap().as_encoded(),
+        tld_bytes(7).as_encoded()
+    );
+    // Re-put does not inflate the counter.
+    store.put_tld_state(uip, tld_bytes(9)).unwrap();
+    assert_eq!(store.tld_count().unwrap(), 1);
+    assert_eq!(
+        store.tld_state(&uip).unwrap().unwrap().as_encoded(),
+        tld_bytes(9).as_encoded()
+    );
+    let eth = tld_id("eth");
+    store.put_tld_state(eth, tld_bytes(1)).unwrap();
+    assert_eq!(store.tld_count().unwrap(), 2);
+}
+
+#[test]
+fn tld_count_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    {
+        let mut store = RedbStore::open(&path).unwrap();
+        store.put_tld_state(tld_id("uip"), tld_bytes(1)).unwrap();
+        store.put_tld_state(tld_id("eth"), tld_bytes(2)).unwrap();
+    }
+    let store = RedbStore::open(&path).unwrap();
+    assert_eq!(store.tld_count().unwrap(), 2, "counter survives restart");
+    assert!(store.tld_state(&tld_id("uip")).unwrap().is_some());
+}
+
+#[test]
+fn tld_cursor_pages_in_ascending_id_order() {
+    let (_dir, store) = tmp_store();
+    let mut writable = store.clone();
+    let mut ids: Vec<scone_core::TldId> = ["aaa", "bbb", "ccc", "ddd", "eee"]
+        .iter()
+        .map(|t| tld_id(t))
+        .collect();
+    for (i, id) in ids.iter().enumerate() {
+        writable.put_tld_state(*id, tld_bytes(i as u8)).unwrap();
+    }
+    ids.sort_by_key(|a| a.as_bytes().to_vec());
+    // Page of 2 from the start.
+    let (page, next) = store.iterate_tlds(None, 2).unwrap();
+    assert_eq!(
+        page.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        &ids[..2]
+    );
+    assert_eq!(next, Some(ids[1]));
+    // Continue strictly after the cursor to the end.
+    let (rest, _) = store.iterate_tlds(next, 100).unwrap();
+    assert_eq!(
+        rest.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        &ids[2..]
+    );
+    // max = 0: empty page, cursor unchanged.
+    let (empty, same) = store.iterate_tlds(Some(ids[0]), 0).unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(same, Some(ids[0]));
+}
+
+#[test]
+fn block_with_tld_delta_persists_registry_atomically() {
+    let (_dir, mut store) = tmp_store();
+    let uip = tld_id("uip");
+    store
+        .append_block_with_state(
+            1,
+            &[4; 32],
+            b"block-1",
+            &[(domain_id("a.uip"), state_bytes(1))],
+            &[(uip, tld_bytes(3))],
+        )
+        .unwrap();
+    // Block, domain delta, TLD delta, counters and tip all landed.
+    assert_eq!(store.tip().unwrap().0, 1);
+    assert_eq!(store.domain_count().unwrap(), 1);
+    assert_eq!(store.tld_count().unwrap(), 1);
+    assert!(store.tld_state(&uip).unwrap().is_some());
+    assert!(store.domain_state(&domain_id("a.uip")).unwrap().is_some());
+    assert!(store.block_at_height(1).unwrap().is_some());
+}
+
+#[test]
+fn failed_append_leaves_no_tld_behind() {
+    let (_dir, mut store) = tmp_store();
+    // Non-monotonic height: nothing at all is written.
+    assert!(
+        store
+            .append_block_with_state(9, &[5; 32], b"bad", &[], &[(tld_id("uip"), tld_bytes(1))])
+            .is_err()
+    );
+    assert_eq!(store.tld_count().unwrap(), 0);
+    assert_eq!(store.tld_state(&tld_id("uip")).unwrap(), None);
+}
+
+#[test]
+fn reserved_meta_key_tld_count_is_rejected() {
+    let (_dir, mut store) = tmp_store();
+    let err = store.meta_set(b"tld_count", b"hacked").unwrap_err();
+    assert_eq!(err, StorageError::ReservedKey("tld_count".into()));
+    // A similar-but-distinct key remains legal.
+    store.meta_set(b"tld_counts", b"ok").unwrap();
+}
+
+/// THE M7d test: store a chain whose first block claims the `uip`
+/// TLD, restart, and verify the restored state still knows the TLD —
+/// a RegisterDomain under it must be admissible (the precheck the
+/// relay runs). Before M7d the restored state forgot the registry
+/// and this exact path failed `UnknownTld`.
+#[test]
+fn restart_restores_tld_registry_and_admits_new_domains() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    {
+        let mut store = RedbStore::open(&path).unwrap();
+        let mut chain = scone_blockchain::Blockchain::new();
+        let sk = scone_crypto::SigningKey::from_bytes([8; 32]);
+        let (block, hash) = build_block(&mut chain, &sk, "first.uip");
+        store_block(&mut store, &chain, &block, hash).unwrap();
+        assert_eq!(store.tld_count().unwrap(), 1);
+    }
+    // Restart: fast load must restore the TLD registry.
+    let mut store = RedbStore::open(&path).unwrap();
+    let mut chain = load_chain(&store).unwrap();
+    let uip = tld_id("uip");
+    assert!(
+        chain.state().tld(&uip).is_some(),
+        "TLD registry restored after restart"
+    );
+    // Window closure, end to end: a NEW RegisterDomain under the
+    // restored TLD must be admissible (this is exactly the precheck
+    // the relay runs; it failed with UnknownTld before M7d).
+    let sk = scone_crypto::SigningKey::from_bytes([8; 32]);
+    let (block, hash) = build_block(&mut chain, &sk, "second.uip");
+    store_block(&mut store, &chain, &block, hash).unwrap();
+    assert_eq!(store.tld_count().unwrap(), 1, "no duplicate TLD claim");
+    assert_eq!(store.domain_count().unwrap(), 2);
+
+    // Replay path agrees with the persisted registry.
+    let replayed = load_chain_replay(&store).unwrap();
+    assert_eq!(replayed.state().tld_len(), 1);
+    assert!(replayed.state().tld(&uip).is_some());
 }

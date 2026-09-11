@@ -12,8 +12,8 @@
 //! byte-comparable. Decoding is strict: wrong tag, short buffer or
 //! trailing bytes is [`StorageError::Corrupted`], never a panic.
 
-use scone_blockchain::DomainState;
-use scone_core::{DomainId, OwnerId, RecordHash};
+use scone_blockchain::{DomainState, TldState};
+use scone_core::{DomainId, OwnerId, RecordHash, TldId};
 
 use crate::error::{Result, StorageError};
 
@@ -116,6 +116,77 @@ pub(crate) fn decode_domain_entry(
     }
     bytes[..n].copy_from_slice(value);
     Ok((DomainId::from_bytes(*key), DomainStateBytes(bytes)))
+}
+
+/// Length of a [`TldStateBytes`] encoding (tag + owner), M7d.
+pub const TLD_STATE_LEN: usize = 33;
+
+/// Tag of the one and only (v1) [`TldStateBytes`] layout, M7d.
+const TAG_TLD_V1: u8 = 0x01;
+
+/// Storage encoding of one registered TLD's on-chain state (M7d).
+///
+/// Always exactly 33 bytes:
+///
+/// ```text
+/// TldStateBytes = tag(0x01) || owner(32)
+/// ```
+///
+/// A TLD state carries no sequence and no record hash (the registry
+/// is claim-only in v1), so a tag is kept purely for forward
+/// evolution of the format — a future layout bumps the tag and old
+/// readers fail with [`StorageError::Corrupted`] instead of guessing.
+/// Decoding is strict: wrong tag, short buffer or trailing bytes is
+/// [`StorageError::Corrupted`], never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TldStateBytes(pub [u8; TLD_STATE_LEN]);
+
+impl From<&TldState> for TldStateBytes {
+    fn from(state: &TldState) -> Self {
+        let mut bytes = [0u8; TLD_STATE_LEN];
+        bytes[0] = TAG_TLD_V1;
+        bytes[1..33].copy_from_slice(state.owner.as_bytes());
+        Self(bytes)
+    }
+}
+
+impl TldStateBytes {
+    /// The canonical encoded bytes (always 33 bytes).
+    #[must_use]
+    pub fn as_encoded(&self) -> &[u8] {
+        &self.0[..TLD_STATE_LEN]
+    }
+
+    /// Strictly decodes canonical bytes into the RAM-side
+    /// [`TldState`].
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] on unknown tag, wrong length or
+    /// trailing bytes.
+    pub fn decode(bytes: &[u8]) -> Result<TldState> {
+        let corrupted = |what: String| StorageError::Corrupted(format!("TldStateBytes: {what}"));
+        match bytes.first() {
+            Some(&TAG_TLD_V1) if bytes.len() == TLD_STATE_LEN => {}
+            Some(&other) => {
+                return Err(corrupted(format!("unknown tag {other:#04x}")));
+            }
+            None => return Err(corrupted("empty".into())),
+        }
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&bytes[1..33]);
+        Ok(TldState {
+            owner: OwnerId::from_bytes(owner),
+        })
+    }
+}
+
+/// Reads a stored `(TldId -> TldStateBytes)` entry, strictly.
+pub(crate) fn decode_tld_entry(key: &[u8], value: &[u8]) -> Result<(TldId, TldStateBytes)> {
+    let corrupted = || StorageError::Corrupted("tlds entry".into());
+    let key: &[u8; 32] = key.try_into().map_err(|_| corrupted())?;
+    let bytes: &[u8; TLD_STATE_LEN] = value.try_into().map_err(|_| corrupted())?;
+    Ok((TldId::from_bytes(*key), TldStateBytes(*bytes)))
 }
 
 #[cfg(test)]
@@ -237,5 +308,78 @@ mod tests {
     fn decode_domain_entry_rejects_bad_key() {
         let encoded = DomainStateBytes::from(&state(None));
         assert!(decode_domain_entry(&[0; 31], encoded.as_encoded()).is_err());
+    }
+
+    // --- TldStateBytes (M7d) ---
+
+    fn tld_state() -> TldState {
+        TldState {
+            owner: OwnerId::from_bytes([0x0a; 32]),
+        }
+    }
+
+    #[test]
+    fn tld_roundtrip() {
+        let encoded = TldStateBytes::from(&tld_state());
+        assert_eq!(encoded.as_encoded().len(), TLD_STATE_LEN);
+        assert_eq!(encoded.as_encoded()[0], 1);
+        assert_eq!(
+            TldStateBytes::decode(encoded.as_encoded()).unwrap(),
+            tld_state()
+        );
+    }
+
+    #[test]
+    fn tld_empty_input_is_corrupted() {
+        assert!(matches!(
+            TldStateBytes::decode(&[]),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn tld_unknown_tag_is_corrupted() {
+        let mut encoded = TldStateBytes::from(&tld_state());
+        encoded.0[0] = 0x02;
+        assert!(matches!(
+            TldStateBytes::decode(encoded.as_encoded()),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn tld_trailing_bytes_are_corrupted() {
+        let encoded = TldStateBytes::from(&tld_state());
+        let mut extended = encoded.as_encoded().to_vec();
+        extended.push(0);
+        assert!(matches!(
+            TldStateBytes::decode(&extended),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn tld_truncated_input_is_corrupted() {
+        let encoded = TldStateBytes::from(&tld_state());
+        assert!(matches!(
+            TldStateBytes::decode(&encoded.as_encoded()[..32]),
+            Err(StorageError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn decode_tld_entry_roundtrip() {
+        let key = [0xcd; 32];
+        let encoded = TldStateBytes::from(&tld_state());
+        let (tld, back) = decode_tld_entry(&key, encoded.as_encoded()).unwrap();
+        assert_eq!(tld.as_bytes(), &key);
+        assert_eq!(back.as_encoded(), encoded.as_encoded());
+    }
+
+    #[test]
+    fn decode_tld_entry_rejects_bad_key_and_value() {
+        let encoded = TldStateBytes::from(&tld_state());
+        assert!(decode_tld_entry(&[0; 31], encoded.as_encoded()).is_err());
+        assert!(decode_tld_entry(&[0xcd; 32], &encoded.as_encoded()[..32]).is_err());
     }
 }

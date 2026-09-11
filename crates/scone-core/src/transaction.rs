@@ -287,6 +287,282 @@ impl RegisterTld {
     }
 }
 
+/// Transfers ownership of a registered TLD to another identity (M8a).
+///
+/// Signed by the **current** owner (the `owner`/`public_key` binding
+/// rule applies as everywhere): the recipient only appears as
+/// [`new_owner`](Self::new_owner), an opaque [`OwnerId`] that the
+/// state layer (M8b) will match against the new claimant of any
+/// subsequent transaction on this TLD. Ordering between conflicting
+/// transfers is resolved by chain order alone (no sequence number:
+/// a TLD has exactly one owner at a time, the first applied transfer
+/// wins) — see `/docs/technical/transactions.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TransferTld {
+    /// The TLD being transferred.
+    pub tld_id: TldId,
+    /// Current owner (recomputed from `public_key`, never trusted).
+    pub owner: OwnerId,
+    /// The recipient identity (opaque: any `OwnerId` is syntactically
+    /// valid; the state layer binds it to the keys that can spend it).
+    pub new_owner: OwnerId,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl TransferTld {
+    /// Builds a signed-shaped `TransferTld`, recomputing `owner` from
+    /// `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn transfer_tld_signed(
+        tld_id: TldId,
+        new_owner: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            tld_id,
+            owner: owner_of(&public_key),
+            new_owner,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
+/// Relinquishes a registered TLD (M8a): the namespace becomes free
+/// again and can be re-claimed with a fresh [`RegisterTld`].
+///
+/// Signed by the current owner. Deliberately carries no timestamp and
+/// no sequence: a revoke is one-shot against the current state (TLD
+/// exists and is owned by the signer — enforced at application time,
+/// M8b), so chain order is the only ordering it needs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RevokeTld {
+    /// The TLD being relinquished.
+    pub tld_id: TldId,
+    /// Current owner (recomputed from `public_key`, never trusted).
+    pub owner: OwnerId,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl RevokeTld {
+    /// Builds a signed-shaped `RevokeTld`, recomputing `owner` from
+    /// `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn revoke_tld_signed(tld_id: TldId, public_key: PublicKey, signature: Signature) -> Self {
+        Self {
+            tld_id,
+            owner: owner_of(&public_key),
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
+/// Opens or closes a TLD namespace for self-service domain
+/// registration (M8a).
+///
+/// A **closed** TLD is assign-only: domains under it can be created
+/// exclusively by the TLD owner with [`AssignDomain`]. An **open**
+/// TLD lets anyone run the registration PoW and claim a free domain
+/// with [`RegisterDomain`]. The flag is pure chain state material —
+/// its effect on `RegisterDomain` application rules arrives with the
+/// state layer (M8b).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SetTldOpen {
+    /// The TLD whose registration policy changes.
+    pub tld_id: TldId,
+    /// Current owner (recomputed from `public_key`, never trusted).
+    pub owner: OwnerId,
+    /// `true` = anyone may register free domains under this TLD
+    /// (registration PoW still required); `false` = assign-only.
+    pub open: bool,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl SetTldOpen {
+    /// Builds a signed-shaped `SetTldOpen`, recomputing `owner` from
+    /// `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn set_tld_open_signed(
+        tld_id: TldId,
+        open: bool,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            tld_id,
+            owner: owner_of(&public_key),
+            open,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
+/// Assigns a domain directly, signed by the **TLD owner** (M8a).
+///
+/// The assign-only path of a closed namespace: the signer must own
+/// the TLD of `name` (checked at application time, M8b — pure types
+/// cannot see the registry), and `assignee` becomes the first owner
+/// of the domain. Mirrors [`RegisterDomain`]: the canonical name is
+/// carried in clear and `domain_id` must be its derivation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AssignDomain {
+    /// The assigned domain, by canonical name (wire-visible).
+    pub name: DomainName,
+    /// Derived identity of `name` (recomputed, never trusted).
+    pub domain_id: DomainId,
+    /// The TLD owner / signer (recomputed from `public_key`).
+    pub owner: OwnerId,
+    /// The identity that becomes the domain owner (opaque, like
+    /// [`TransferTld::new_owner`]).
+    pub assignee: OwnerId,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl AssignDomain {
+    /// Builds a signed-shaped `AssignDomain`, deriving `domain_id`
+    /// from `name` and recomputing `owner` from `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn assign_domain_signed(
+        name: DomainName,
+        assignee: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            domain_id: DomainId::from_name(&name),
+            owner: owner_of(&public_key),
+            name,
+            assignee,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// - [`SconeError::InvalidOwner`] when `owner` is not the identity
+    ///   derived from `public_key`;
+    /// - [`SconeError::InvalidDomain`] when `domain_id` is not the
+    ///   derivation of `name`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)?;
+        if self.domain_id != DomainId::from_name(&self.name) {
+            return Err(SconeError::InvalidDomain(format!(
+                "domain_id is not the derivation of the carried name {:?}",
+                self.name.canonical()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Extends the registration of a domain until `valid_until` (M8a).
+///
+/// Signed by the current domain owner. `valid_until` is a Unix
+/// timestamp in seconds; the pure layer only checks the owner/key
+/// binding — whether it actually extends the current expiry (and by
+/// at most one renewal term) is a state rule (M8b).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RenewDomain {
+    /// The domain whose registration is extended.
+    pub domain_id: DomainId,
+    /// Current owner (recomputed from `public_key`, never trusted).
+    pub owner: OwnerId,
+    /// New registration expiry (Unix seconds).
+    pub valid_until: u64,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl RenewDomain {
+    /// Builds a signed-shaped `RenewDomain`, recomputing `owner` from
+    /// `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn renew_domain_signed(
+        domain_id: DomainId,
+        valid_until: u64,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            domain_id,
+            owner: owner_of(&public_key),
+            valid_until,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
 /// A signed blockchain transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Transaction {
@@ -296,6 +572,16 @@ pub enum Transaction {
     UpdateDomain(UpdateDomain),
     /// See [`RegisterTld`] (TLD registry, M7).
     RegisterTld(RegisterTld),
+    /// See [`TransferTld`] (TLD registry, M8a).
+    TransferTld(TransferTld),
+    /// See [`RevokeTld`] (TLD registry, M8a).
+    RevokeTld(RevokeTld),
+    /// See [`SetTldOpen`] (TLD registry, M8a).
+    SetTldOpen(SetTldOpen),
+    /// See [`AssignDomain`] (TLD registry, M8a).
+    AssignDomain(AssignDomain),
+    /// See [`RenewDomain`] (domain registry, M8a).
+    RenewDomain(RenewDomain),
 }
 
 impl Transaction {
@@ -306,6 +592,11 @@ impl Transaction {
             Self::RegisterDomain(tx) => tx.owner,
             Self::UpdateDomain(tx) => tx.owner,
             Self::RegisterTld(tx) => tx.owner,
+            Self::TransferTld(tx) => tx.owner,
+            Self::RevokeTld(tx) => tx.owner,
+            Self::SetTldOpen(tx) => tx.owner,
+            Self::AssignDomain(tx) => tx.owner,
+            Self::RenewDomain(tx) => tx.owner,
         }
     }
 
@@ -315,6 +606,11 @@ impl Transaction {
             Self::RegisterDomain(tx) => &tx.public_key,
             Self::UpdateDomain(tx) => &tx.public_key,
             Self::RegisterTld(tx) => &tx.public_key,
+            Self::TransferTld(tx) => &tx.public_key,
+            Self::RevokeTld(tx) => &tx.public_key,
+            Self::SetTldOpen(tx) => &tx.public_key,
+            Self::AssignDomain(tx) => &tx.public_key,
+            Self::RenewDomain(tx) => &tx.public_key,
         }
     }
 
@@ -324,6 +620,11 @@ impl Transaction {
             Self::RegisterDomain(tx) => &tx.signature,
             Self::UpdateDomain(tx) => &tx.signature,
             Self::RegisterTld(tx) => &tx.signature,
+            Self::TransferTld(tx) => &tx.signature,
+            Self::RevokeTld(tx) => &tx.signature,
+            Self::SetTldOpen(tx) => &tx.signature,
+            Self::AssignDomain(tx) => &tx.signature,
+            Self::RenewDomain(tx) => &tx.signature,
         }
     }
 
@@ -345,6 +646,11 @@ impl Transaction {
             Self::RegisterDomain(tx) => tx.validate(),
             Self::UpdateDomain(tx) => tx.validate(),
             Self::RegisterTld(tx) => tx.validate(),
+            Self::TransferTld(tx) => tx.validate(),
+            Self::RevokeTld(tx) => tx.validate(),
+            Self::SetTldOpen(tx) => tx.validate(),
+            Self::AssignDomain(tx) => tx.validate(),
+            Self::RenewDomain(tx) => tx.validate(),
         }
     }
 }
@@ -559,5 +865,157 @@ mod tests {
         assert_eq!(tx.tld_id, tld_id());
         // …and is disjoint from any domain derivation.
         assert_ne!(tx.tld_id.as_bytes(), domain_id().as_bytes());
+    }
+
+    // --- M8a: TransferTld / RevokeTld / SetTldOpen / AssignDomain
+    // / RenewDomain ---
+
+    fn assignee() -> OwnerId {
+        owner_of(&key(2).public_key())
+    }
+
+    #[test]
+    fn m8a_constructors_recompute_owner_and_derive_ids() {
+        let sk = key(5);
+        let transfer = TransferTld::transfer_tld_signed(
+            tld_id(),
+            assignee(),
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(transfer.owner, owner_of(&sk.public_key()));
+        assert_eq!(transfer.new_owner, assignee());
+        assert!(transfer.validate().is_ok());
+
+        let revoke =
+            RevokeTld::revoke_tld_signed(tld_id(), sk.public_key(), placeholder_signature());
+        assert_eq!(revoke.owner, owner_of(&sk.public_key()));
+        assert!(revoke.validate().is_ok());
+
+        let set_open = SetTldOpen::set_tld_open_signed(
+            tld_id(),
+            true,
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(set_open.owner, owner_of(&sk.public_key()));
+        assert!(set_open.validate().is_ok());
+
+        let assign = AssignDomain::assign_domain_signed(
+            name(),
+            assignee(),
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(assign.owner, owner_of(&sk.public_key()));
+        assert_eq!(assign.domain_id, domain_id());
+        assert!(assign.validate().is_ok());
+
+        let renew = RenewDomain::renew_domain_signed(
+            domain_id(),
+            1_800_000_000,
+            sk.public_key(),
+            placeholder_signature(),
+        );
+        assert_eq!(renew.owner, owner_of(&sk.public_key()));
+        assert!(renew.validate().is_ok());
+    }
+
+    #[test]
+    fn m8a_owner_key_mismatch_is_invalid_everywhere() {
+        let sk_a = key(1);
+        let sk_b = key(2);
+        let forged = owner_of(&sk_b.public_key());
+
+        let mut transfer = TransferTld::transfer_tld_signed(
+            tld_id(),
+            assignee(),
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
+        transfer.owner = forged;
+        assert!(matches!(
+            transfer.validate(),
+            Err(SconeError::InvalidOwner(_))
+        ));
+
+        let mut revoke =
+            RevokeTld::revoke_tld_signed(tld_id(), sk_a.public_key(), placeholder_signature());
+        revoke.owner = forged;
+        assert!(matches!(
+            revoke.validate(),
+            Err(SconeError::InvalidOwner(_))
+        ));
+
+        let mut set_open = SetTldOpen::set_tld_open_signed(
+            tld_id(),
+            false,
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
+        set_open.owner = forged;
+        assert!(matches!(
+            set_open.validate(),
+            Err(SconeError::InvalidOwner(_))
+        ));
+
+        let mut assign = AssignDomain::assign_domain_signed(
+            name(),
+            assignee(),
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
+        assign.owner = forged;
+        assert!(matches!(
+            assign.validate(),
+            Err(SconeError::InvalidOwner(_))
+        ));
+
+        let mut renew = RenewDomain::renew_domain_signed(
+            domain_id(),
+            1,
+            sk_a.public_key(),
+            placeholder_signature(),
+        );
+        renew.owner = forged;
+        assert!(matches!(renew.validate(), Err(SconeError::InvalidOwner(_))));
+    }
+
+    #[test]
+    fn assign_domain_name_id_mismatch_is_invalid() {
+        let mut assign = AssignDomain::assign_domain_signed(
+            name(),
+            assignee(),
+            key(1).public_key(),
+            placeholder_signature(),
+        );
+        assign.domain_id = DomainId::from_name(&DomainName::new("other.uip").unwrap());
+        assert!(matches!(
+            assign.validate(),
+            Err(SconeError::InvalidDomain(_))
+        ));
+    }
+
+    #[test]
+    fn m8a_transaction_accessors_cover_the_new_variants() {
+        let renew = Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+            domain_id(),
+            1,
+            key(3).public_key(),
+            placeholder_signature(),
+        ));
+        assert_eq!(renew.owner(), owner_of(&key(3).public_key()));
+        assert_eq!(renew.public_key(), &key(3).public_key());
+        assert_eq!(renew.signature(), &placeholder_signature());
+        assert!(renew.validate().is_ok());
+
+        let transfer = Transaction::TransferTld(TransferTld::transfer_tld_signed(
+            tld_id(),
+            assignee(),
+            key(3).public_key(),
+            placeholder_signature(),
+        ));
+        assert_eq!(transfer.owner(), renew.owner());
+        assert!(transfer.validate().is_ok());
     }
 }

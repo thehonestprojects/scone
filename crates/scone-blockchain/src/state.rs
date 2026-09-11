@@ -274,6 +274,24 @@ impl ChainState {
                     .entries
                     .push(UndoEntry::RegisterTld(register_tld.tld_id));
             }
+            // M8a family: types + wire exist, state rules land in M8b.
+            // Rejected explicitly and typed — never a silent accept,
+            // never a panic on untrusted data.
+            Transaction::TransferTld(_) => {
+                return Err(BlockchainError::UnsupportedTransaction("TransferTld"));
+            }
+            Transaction::RevokeTld(_) => {
+                return Err(BlockchainError::UnsupportedTransaction("RevokeTld"));
+            }
+            Transaction::SetTldOpen(_) => {
+                return Err(BlockchainError::UnsupportedTransaction("SetTldOpen"));
+            }
+            Transaction::AssignDomain(_) => {
+                return Err(BlockchainError::UnsupportedTransaction("AssignDomain"));
+            }
+            Transaction::RenewDomain(_) => {
+                return Err(BlockchainError::UnsupportedTransaction("RenewDomain"));
+            }
         }
         Ok(())
     }
@@ -301,7 +319,8 @@ impl ChainState {
 mod tests {
     use super::*;
     use scone_core::{
-        DomainName, Proof, RegisterDomain, RegisterTld, TldId, TldName, UpdateDomain,
+        AssignDomain, DomainName, Proof, RegisterDomain, RegisterTld, RenewDomain, RevokeTld,
+        SetTldOpen, TldId, TldName, TransferTld, UpdateDomain,
     };
     use scone_crypto::{Signature, SigningKey};
 
@@ -632,5 +651,66 @@ mod tests {
             state.apply(&register("example.uip", 1)),
             Err(BlockchainError::UnknownTld)
         );
+    }
+
+    #[test]
+    fn m8a_family_is_rejected_explicitly_and_atomically() {
+        // Types + wire exist (M8a), state rules land in M8b: until
+        // then apply() rejects each variant with the typed
+        // UnsupportedTransaction error and leaves the state intact.
+        let mut state = ChainState::new();
+        seed_uip(&mut state);
+        state.apply(&register("example.uip", 1)).unwrap();
+        let before = state.clone();
+        let uip = TldId::from_tld(&TldName::new("uip").unwrap());
+        let placeholder = Signature::from_bytes([0; 64]);
+        let family = [
+            Transaction::TransferTld(TransferTld::transfer_tld_signed(
+                uip,
+                owner(9),
+                key(1).public_key(),
+                placeholder,
+            )),
+            Transaction::RevokeTld(RevokeTld::revoke_tld_signed(
+                uip,
+                key(1).public_key(),
+                placeholder,
+            )),
+            Transaction::SetTldOpen(SetTldOpen::set_tld_open_signed(
+                uip,
+                true,
+                key(1).public_key(),
+                placeholder,
+            )),
+            Transaction::AssignDomain(AssignDomain::assign_domain_signed(
+                DomainName::new("assigned.uip").unwrap(),
+                owner(9),
+                key(1).public_key(),
+                placeholder,
+            )),
+            Transaction::RenewDomain(RenewDomain::renew_domain_signed(
+                domain_id("example.uip"),
+                1_800_000_000,
+                key(1).public_key(),
+                placeholder,
+            )),
+        ];
+        let names = [
+            "TransferTld",
+            "RevokeTld",
+            "SetTldOpen",
+            "AssignDomain",
+            "RenewDomain",
+        ];
+        for (tx, name) in family.iter().zip(names) {
+            assert_eq!(
+                state.apply(tx),
+                Err(BlockchainError::UnsupportedTransaction(name)),
+                "{name}"
+            );
+        }
+        // Atomicity: nothing leaked into the state.
+        assert_eq!(state.domains, before.domains);
+        assert_eq!(state.tlds, before.tlds);
     }
 }

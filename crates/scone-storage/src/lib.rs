@@ -4,10 +4,11 @@
 //!
 //! This crate defines the [`NodeStore`] trait — the only storage surface
 //! the blockchain and the future relay (M4) depend on — plus
-//! [`DomainStateBytes`], the storage-level encoding of a
-//! [`scone_blockchain::DomainState`] (the [`scone-blockchain`] types stay
-//! in RAM; only 41/73 fixed-size bytes cross the trait boundary,
-//! depending on the presence of a `record_hash`).
+//! [`DomainStateBytes`] and [`TldStateBytes`], the storage-level
+//! encodings of a [`scone_blockchain::DomainState`] and of a
+//! [`scone_blockchain::TldState`] (the [`scone-blockchain`] types stay
+//! in RAM; only fixed-size bytes cross the trait boundary — 41/73 for
+//! domains depending on the presence of a `record_hash`, 33 for TLDs).
 //!
 //! ## Design rules (see `/docs/technical/storage.md`)
 //!
@@ -21,7 +22,7 @@
 //!   batch). Nothing in this crate ever loads a whole table into RAM.
 //! - **Delta-only writes**: [`NodeStore::append_block_with_state`]
 //!   persists only the block bytes, the tip, and the *modified*
-//!   domains' states, all in ONE redb transaction.
+//!   domain and TLD states, all in ONE redb transaction.
 //! - **Never panics on corrupted data**: every stored byte is decoded
 //!   strictly into typed [`StorageError`]s.
 
@@ -31,10 +32,10 @@ pub mod redb;
 pub mod state_bytes;
 
 pub use error::{Result, StorageError};
-pub use redb::{MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, RedbStore};
-pub use state_bytes::DomainStateBytes;
+pub use redb::{MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, MAX_TLD_PAGE, RedbStore};
+pub use state_bytes::{DomainStateBytes, TldStateBytes};
 
-use scone_core::DomainId;
+use scone_core::{DomainId, TldId};
 
 /// Storage format version written to the `meta` table at creation
 /// (`meta["format_version"]`). Bump and migrate when the on-disk layout
@@ -55,6 +56,10 @@ pub const META_FORMAT_VERSION: &[u8] = b"format_version";
 /// from the beginning; after the final page the cursor equals the last
 /// returned id.
 pub type DomainPage = (Vec<(DomainId, DomainStateBytes)>, Option<DomainId>);
+
+/// One page of TLD states returned by [`NodeStore::iterate_tlds`]:
+/// same cursor contract as [`DomainPage`], over `TldId`s (M7d).
+pub type TldPage = (Vec<(TldId, TldStateBytes)>, Option<TldId>);
 
 /// Persistent node storage front-end (blocks, domain states, DHT cache,
 /// metadata).
@@ -84,12 +89,12 @@ pub trait NodeStore {
     fn append_block(&mut self, height: u64, hash: &[u8; 32], block_bytes: &[u8]) -> Result<()>;
 
     /// Atomic **delta** append: encoded block + tip + the modified
-    /// domain states, in ONE transaction.
+    /// domain and TLD states, in ONE transaction.
     ///
-    /// Only the domains listed in `state_deltas` are rewritten (the
-    /// chain state in RAM stays the consensus authority; the store
-    /// never re-persists unmodified domains). `height` MUST be
-    /// `tip height + 1`.
+    /// Only the domains listed in `state_deltas` and the TLDs listed
+    /// in `tld_deltas` are rewritten (the chain state in RAM stays
+    /// the consensus authority; the store never re-persists
+    /// unmodified entries). `height` MUST be `tip height + 1`.
     ///
     /// # Errors
     ///
@@ -100,6 +105,7 @@ pub trait NodeStore {
         hash: &[u8; 32],
         block_bytes: &[u8],
         state_deltas: &[(DomainId, DomainStateBytes)],
+        tld_deltas: &[(TldId, TldStateBytes)],
     ) -> Result<()>;
 
     /// Encoded canonical block at `height`, if stored.
@@ -164,6 +170,42 @@ pub trait NodeStore {
     ///
     /// [`StorageError::Corrupted`] if any entry fails strict decoding.
     fn iterate_domains(&self, after: Option<DomainId>, max: usize) -> Result<DomainPage>;
+
+    /// Persists the state of one TLD (repair tools; the block path
+    /// goes through [`NodeStore::append_block_with_state`]'s
+    /// `tld_deltas`) (M7d).
+    ///
+    /// # Errors
+    ///
+    /// On I/O errors.
+    fn put_tld_state(&mut self, tld: TldId, state: TldStateBytes) -> Result<()>;
+
+    /// Stored state of `tld`, if any (M7d).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if the stored bytes are not a valid
+    /// `TldStateBytes`.
+    fn tld_state(&self, tld: &TldId) -> Result<Option<TldStateBytes>>;
+
+    /// Number of stored TLD states, from a maintained counter (never
+    /// a full-table scan) (M7d).
+    ///
+    /// # Errors
+    ///
+    /// On I/O errors or corrupted metadata.
+    fn tld_count(&self) -> Result<u64>;
+
+    /// Reads up to `max` TLD states with id strictly greater than
+    /// `after`, in ascending `TldId` byte order, returning the last
+    /// id of the batch — same cursor contract as
+    /// [`NodeStore::iterate_domains`], bounded by
+    /// [`MAX_TLD_PAGE`] (M7d).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if any entry fails strict decoding.
+    fn iterate_tlds(&self, after: Option<TldId>, max: usize) -> Result<TldPage>;
 
     /// Caches the encoded `SignedDnsRecord` of `domain` (DHT
     /// availability layer — untrusted until verified against the
