@@ -20,7 +20,7 @@ use crate::error::Result;
 ///
 /// A future implementation checks here, among others: proof-of-work
 /// validity, difficulty, registration proofs (the `proof` field of
-/// `Register`), fees/anti-spam, timestamp rules.
+/// `RegisterDomain`), fees/anti-spam, timestamp rules.
 pub trait Consensus {
     /// Validates the consensus fields of a block header.
     ///
@@ -31,7 +31,7 @@ pub trait Consensus {
     fn validate_header(&self, header: &BlockHeader) -> Result<()>;
 
     /// Validates the consensus aspects of a transaction (e.g. a
-    /// `Register` proof of work).
+    /// `RegisterDomain` proof of work).
     ///
     /// # Errors
     ///
@@ -75,13 +75,15 @@ mod tests {
         assert!(PermissiveConsensus.validate_header(&header).is_ok());
 
         let sk = scone_crypto::SigningKey::from_bytes([2u8; 32]);
-        let tx = scone_core::Transaction::Register(scone_core::Register::register_signed(
-            scone_core::DomainId::from_bytes([1; 32]),
-            0,
-            scone_core::Proof::from_bytes(Vec::new()),
-            sk.public_key(),
-            sk.sign(b"t"),
-        ));
+        let tx = scone_core::Transaction::RegisterDomain(
+            scone_core::RegisterDomain::register_domain_signed(
+                scone_core::DomainName::new("example.uip").unwrap(),
+                0,
+                scone_core::Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                sk.sign(b"t"),
+            ),
+        );
         assert!(PermissiveConsensus.validate_tx(&tx).is_ok());
     }
 }

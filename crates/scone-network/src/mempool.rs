@@ -100,25 +100,26 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scone_core::{DomainId, DomainName, Proof, Register};
+    use scone_core::{DomainName, Proof, RegisterDomain};
     use scone_crypto::{Signature, SigningKey};
 
     fn tx(name: &str, seed: u8) -> (TxId, scone_core::Transaction) {
         let sk = SigningKey::from_bytes([seed; 32]);
-        let unsigned = scone_core::Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).unwrap()),
-            1,
-            Proof::from_bytes(Vec::new()),
-            sk.public_key(),
-            Signature::from_bytes([0; 64]),
-        ));
+        let unsigned =
+            scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
+                1,
+                Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         let signed = match unsigned {
-            scone_core::Transaction::Register(mut r) => {
+            scone_core::Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                scone_core::Transaction::Register(r)
+                scone_core::Transaction::RegisterDomain(r)
             }
-            scone_core::Transaction::Update(_) => unreachable!(),
+            _ => unreachable!(),
         };
         let id = scone_blockchain::transaction_id(&signed).unwrap();
         (id, signed)

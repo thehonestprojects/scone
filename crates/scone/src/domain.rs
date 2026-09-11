@@ -10,7 +10,7 @@ use crate::cli::{DomainCommand, RecordCommand};
 use crate::error::CliError;
 use crate::identity::{open_identity, owner_id_of};
 use crate::rpc::{rpc_call, rpc_client, rpc_json};
-use crate::tx::{signed_register_tx, signed_update_tx, tx_hex};
+use crate::tx::{signed_register_domain_tx, signed_update_domain_tx, tx_hex};
 use crate::util::{hex_lower, unix_now};
 
 /// How long `domain register|update` waits for devnet confirmation.
@@ -202,7 +202,7 @@ pub(crate) fn run_domain(command: DomainCommand) -> Result<Vec<String>, CliError
                 )));
             }
             let sk = open_identity(&identity, dir.as_deref(), passphrase_env.as_deref())?;
-            let tx = signed_register_tx(&sk, &domain, unix_now())?;
+            let tx = signed_register_domain_tx(&sk, &domain, unix_now())?;
             let hex_string = tx_hex(&tx)?;
             let submitted = rpc_json(
                 &client,
@@ -288,7 +288,7 @@ pub(crate) fn run_domain(command: DomainCommand) -> Result<Vec<String>, CliError
             };
             let record_hash = scone_protocol::record_hash(&dns);
 
-            let tx = signed_update_tx(&sk, &domain, next, record_hash)?;
+            let tx = signed_update_domain_tx(&sk, &domain, next, record_hash)?;
             let hex_string = tx_hex(&tx)?;
             let submitted = rpc_json(
                 &client,

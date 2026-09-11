@@ -1,7 +1,7 @@
 //! `scone tx …` (offline build/sign/verify) and the shared
 //! transaction build/sign helpers used by `scone domain …`.
 
-use scone_core::{DomainId, DomainName, Register, Update};
+use scone_core::{DomainId, DomainName, RegisterDomain, UpdateDomain};
 use scone_crypto::{Signature, SigningKey};
 
 use crate::cli::{TxCommand, TxKind};
@@ -56,15 +56,21 @@ pub(crate) fn run_tx(command: TxCommand) -> Result<Vec<String>, CliError> {
                 .map_err(CliError::MalformedTransaction)?;
             scone_blockchain::validate_transaction(&decoded)
                 .map_err(CliError::InvalidTransaction)?;
-            let kind = match decoded {
-                scone_core::Transaction::Register(_) => "register",
-                scone_core::Transaction::Update(_) => "update",
+            let kind = match &decoded {
+                scone_core::Transaction::RegisterDomain(r) => {
+                    return Ok(vec![
+                        "kind: register".to_string(),
+                        format!("domain: {}", r.name.canonical()),
+                        format!("owner: {}", hex_lower(decoded.owner().as_bytes())),
+                        "signature: valid".to_string(),
+                    ]);
+                }
+                scone_core::Transaction::UpdateDomain(_) => "update",
+                scone_core::Transaction::RegisterTld(_) => "register-tld",
             };
-            let owner = decoded.owner();
             Ok(vec![
                 format!("kind: {kind}"),
-                format!("domain: {}", decoded.domain_id()),
-                format!("owner: {}", hex_lower(owner.as_bytes())),
+                format!("owner: {}", hex_lower(decoded.owner().as_bytes())),
                 "signature: valid".to_string(),
             ])
         }
@@ -97,32 +103,46 @@ fn decode_tx_or_payload(bytes: &[u8]) -> Result<scone_core::Transaction, CliErro
 fn unsigned_into_transaction(
     unsigned: scone_protocol::UnsignedTransaction,
 ) -> scone_core::Transaction {
-    use scone_core::{Register, Update};
+    use scone_core::{RegisterDomain, RegisterTld, UpdateDomain};
     use scone_protocol::UnsignedTransaction as U;
     match unsigned {
-        U::Register {
-            domain_id,
+        U::RegisterDomain {
+            name,
+            domain_id: _,
             owner: _,
             timestamp,
             proof,
             public_key,
-        } => scone_core::Transaction::Register(Register::register_signed(
-            domain_id,
+        } => scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            name,
             timestamp,
             proof,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
-        U::Update {
+        U::UpdateDomain {
             domain_id,
             owner: _,
             sequence,
             record_hash,
             public_key,
-        } => scone_core::Transaction::Update(Update::update_signed(
+        } => scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             domain_id,
             sequence,
             record_hash,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::RegisterTld {
+            tld_id,
+            owner: _,
+            timestamp,
+            proof,
+            public_key,
+        } => scone_core::Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            tld_id,
+            timestamp,
+            proof,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
@@ -132,7 +152,7 @@ fn unsigned_into_transaction(
 /// Builds an unsigned (placeholder-signature) transaction from CLI
 /// args; returns it with a human description line.
 fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), CliError> {
-    use scone_core::{Proof, RecordHash, Register, Update};
+    use scone_core::{Proof, RecordHash, RegisterDomain, UpdateDomain};
     use scone_crypto::Signature;
     let placeholder = Signature::from_bytes([0; 64]);
     // Any valid key works here: the payload to sign does not include
@@ -141,7 +161,7 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
     // derived-from-seed key and `sign` rebinds to the real identity.
     let build_key = SigningKey::from_bytes([0x42; 32]);
     match kind {
-        TxKind::Register {
+        TxKind::RegisterDomain {
             name,
             timestamp,
             proof_hex,
@@ -151,13 +171,14 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
                 Some(hex) => Proof::from_bytes(hex_decode("proof", &hex)?),
                 None => Proof::from_bytes(Vec::new()),
             };
-            let tx = scone_core::Transaction::Register(Register::register_signed(
-                DomainId::from_name(&domain),
-                timestamp,
-                proof,
-                build_key.public_key(),
-                placeholder,
-            ));
+            let tx =
+                scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                    domain.clone(),
+                    timestamp,
+                    proof,
+                    build_key.public_key(),
+                    placeholder,
+                ));
             Ok((
                 tx,
                 format!(
@@ -166,7 +187,30 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
                 ),
             ))
         }
-        TxKind::Update {
+        TxKind::RegisterTld {
+            tld,
+            timestamp,
+            proof_hex,
+        } => {
+            let tld_name = scone_core::TldName::new(&tld).map_err(CliError::Domain)?;
+            let proof = match proof_hex {
+                Some(hex) => Proof::from_bytes(hex_decode("proof", &hex)?),
+                None => Proof::from_bytes(Vec::new()),
+            };
+            let tx =
+                scone_core::Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+                    scone_core::TldId::from_tld(&tld_name),
+                    timestamp,
+                    proof,
+                    build_key.public_key(),
+                    placeholder,
+                ));
+            Ok((
+                tx,
+                format!("unsigned register-tld: {tld} (timestamp {timestamp})"),
+            ))
+        }
+        TxKind::UpdateDomain {
             name,
             sequence,
             record_hash,
@@ -178,7 +222,7 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
             }
             let mut raw = [0u8; 32];
             raw.copy_from_slice(&hash_bytes);
-            let tx = scone_core::Transaction::Update(Update::update_signed(
+            let tx = scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
                 DomainId::from_name(&domain),
                 sequence,
                 RecordHash::from_bytes(raw),
@@ -201,20 +245,29 @@ fn build_unsigned(kind: TxKind) -> Result<(scone_core::Transaction, String), Cli
 /// trusted.
 fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transaction {
     match tx {
-        scone_core::Transaction::Register(r) => {
-            scone_core::Transaction::Register(Register::register_signed(
-                r.domain_id,
+        scone_core::Transaction::RegisterDomain(r) => {
+            scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                r.name.clone(),
                 r.timestamp,
                 r.proof.clone(),
                 sk.public_key(),
                 Signature::from_bytes([0; 64]),
             ))
         }
-        scone_core::Transaction::Update(u) => {
-            scone_core::Transaction::Update(Update::update_signed(
+        scone_core::Transaction::UpdateDomain(u) => {
+            scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
                 u.domain_id,
                 u.sequence,
                 u.record_hash,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
+        scone_core::Transaction::RegisterTld(t) => {
+            scone_core::Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+                t.tld_id,
+                t.timestamp,
+                t.proof.clone(),
                 sk.public_key(),
                 Signature::from_bytes([0; 64]),
             ))
@@ -228,13 +281,17 @@ fn attach_signature(
     signature: scone_crypto::Signature,
 ) -> scone_core::Transaction {
     match tx {
-        scone_core::Transaction::Register(mut r) => {
+        scone_core::Transaction::RegisterDomain(mut r) => {
             r.signature = signature;
-            scone_core::Transaction::Register(r)
+            scone_core::Transaction::RegisterDomain(r)
         }
-        scone_core::Transaction::Update(mut u) => {
+        scone_core::Transaction::UpdateDomain(mut u) => {
             u.signature = signature;
-            scone_core::Transaction::Update(u)
+            scone_core::Transaction::UpdateDomain(u)
+        }
+        scone_core::Transaction::RegisterTld(mut t) => {
+            t.signature = signature;
+            scone_core::Transaction::RegisterTld(t)
         }
     }
 }
@@ -260,14 +317,14 @@ pub(crate) fn tx_hex(tx: &scone_core::Transaction) -> Result<String, CliError> {
     ))
 }
 
-/// Builds and signs a `Register` for `domain` with `sk`.
-pub(crate) fn signed_register_tx(
+/// Builds and signs a `RegisterDomain` for `domain` with `sk`.
+pub(crate) fn signed_register_domain_tx(
     sk: &SigningKey,
     domain: &DomainName,
     timestamp: u64,
 ) -> Result<scone_core::Transaction, CliError> {
-    let unsigned = scone_core::Transaction::Register(Register::register_signed(
-        DomainId::from_name(domain),
+    let unsigned = scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+        domain.clone(),
         timestamp,
         scone_core::Proof::from_bytes(Vec::new()),
         sk.public_key(),
@@ -276,15 +333,15 @@ pub(crate) fn signed_register_tx(
     sign_tx_with(unsigned, sk)
 }
 
-/// Builds and signs an `Update` committing `record_hash` at
+/// Builds and signs an `UpdateDomain` committing `record_hash` at
 /// `sequence` for `domain` with `sk`.
-pub(crate) fn signed_update_tx(
+pub(crate) fn signed_update_domain_tx(
     sk: &SigningKey,
     domain: &DomainName,
     sequence: u64,
     record_hash: scone_core::RecordHash,
 ) -> Result<scone_core::Transaction, CliError> {
-    let unsigned = scone_core::Transaction::Update(Update::update_signed(
+    let unsigned = scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
         DomainId::from_name(domain),
         sequence,
         record_hash,

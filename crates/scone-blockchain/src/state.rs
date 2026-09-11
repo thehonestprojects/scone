@@ -2,24 +2,31 @@
 
 use std::collections::HashMap;
 
-use scone_core::{DomainId, OwnerId, RecordHash, Transaction};
+use scone_core::{DomainId, OwnerId, RecordHash, TldId, Transaction};
 
 use crate::error::{BlockchainError, Result};
 
 /// On-chain state of one registered domain.
 ///
-/// Right after a `Register`: `sequence == 0` and `record_hash == None`
-/// (a registration claims the name; the first `Update` publishes
+/// Right after a `RegisterDomain`: `sequence == 0` and `record_hash == None`
+/// (a registration claims the name; the first `UpdateDomain` publishes
 /// records and sets `sequence` to 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DomainState {
     /// Current owner.
     pub owner: OwnerId,
-    /// Latest applied `Update` sequence (0 right after registration).
+    /// Latest applied `UpdateDomain` sequence (0 right after registration).
     pub sequence: u64,
     /// Current on-chain commitment to the DNS record set, once an
-    /// `Update` has been applied.
+    /// `UpdateDomain` has been applied.
     pub record_hash: Option<RecordHash>,
+}
+
+/// On-chain state of one registered TLD (M7b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TldState {
+    /// Current owner of the namespace.
+    pub owner: OwnerId,
 }
 
 /// Authoritative in-memory state of a chain.
@@ -27,13 +34,15 @@ pub struct DomainState {
 /// Direct `DomainId -> DomainState` access, no full scan (ready for
 /// billions of domains; a storage backend will replace the map later,
 /// the rules stay here). Domain names are never used as keys: the
-/// 32-byte [`DomainId`] only.
+/// 32-byte [`DomainId`] only. The TLD registry is a parallel
+/// `TldId -> TldState` map (M7b), disjoint by id derivation.
 ///
 /// Two nodes starting from the same state and applying exactly the same
 /// blocks reach exactly equal [`ChainState`]s.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChainState {
     domains: HashMap<DomainId, DomainState>,
+    tlds: HashMap<TldId, TldState>,
 }
 
 /// One reversible state change, as recorded by [`ChainState`]'s
@@ -44,13 +53,15 @@ pub struct ChainState {
 /// updates the same domain.
 #[derive(Debug, Clone, Copy)]
 enum UndoEntry {
-    /// A `Register` created the domain: rolling back removes it.
-    Register(DomainId),
-    /// An `Update` mutated the domain: rolling back restores `prior`.
-    Update {
+    /// A `RegisterDomain` created the domain: rolling back removes it.
+    RegisterDomain(DomainId),
+    /// An `UpdateDomain` mutated the domain: rolling back restores `prior`.
+    UpdateDomain {
         domain: DomainId,
         prior: DomainState,
     },
+    /// A `RegisterTld` claimed the TLD: rolling back removes it.
+    RegisterTld(TldId),
 }
 
 /// Revert journal of a block application (see
@@ -91,6 +102,24 @@ impl ChainState {
         self.domains.get(domain)
     }
 
+    /// Current state of `tld`, if registered (M7b TLD registry).
+    #[must_use]
+    pub fn tld(&self, tld: &TldId) -> Option<&TldState> {
+        self.tlds.get(tld)
+    }
+
+    /// Number of registered TLDs.
+    #[must_use]
+    pub fn tld_len(&self) -> usize {
+        self.tlds.len()
+    }
+
+    /// Whether no TLD is registered.
+    #[must_use]
+    pub fn tld_is_empty(&self) -> bool {
+        self.tlds.is_empty()
+    }
+
     /// Restores the persisted state of one domain (storage
     /// integration, see `scone-storage`). No rule is applied: the
     /// bytes were validated when the block was accepted; the decoded
@@ -112,18 +141,35 @@ impl ChainState {
         Ok(())
     }
 
+    /// Restores the persisted state of one TLD (storage
+    /// integration). Same contract as [`ChainState::restore_domain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockchainError::TldAlreadyRegistered`] if the TLD is
+    /// already restored (duplicate).
+    pub fn restore_tld(&mut self, tld: TldId, state: TldState) -> Result<()> {
+        if self.tlds.contains_key(&tld) {
+            return Err(BlockchainError::TldAlreadyRegistered);
+        }
+        self.tlds.insert(tld, state);
+        Ok(())
+    }
+
     /// Applies `tx` to the state, deterministically and atomically (on
     /// error the state is left unchanged).
     ///
     /// Rules (see `/docs/technical/blockchain.md`):
     ///
-    /// - **Register**: the domain must be free; it becomes
+    /// - **RegisterDomain**: the domain must be free; it becomes
     ///   `{ owner, sequence: 0, record_hash: None }`. The proof is not
     ///   interpreted here — that is a consensus concern
     ///   (see [`crate::Consensus`]).
-    /// - **Update**: the domain must exist, `tx.owner` must be the
+    /// - **UpdateDomain**: the domain must exist, `tx.owner` must be the
     ///   current owner, and `tx.sequence` must be exactly
     ///   `current + 1`; `record_hash` becomes the current commitment.
+    /// - **RegisterTld**: the TLD must be free; it becomes
+    ///   `{ owner }` (M7b).
     ///
     /// # Errors
     ///
@@ -159,7 +205,7 @@ impl ChainState {
     ) -> Result<()> {
         tx.validate()?;
         match tx {
-            Transaction::Register(register) => {
+            Transaction::RegisterDomain(register) => {
                 if self.domains.contains_key(&register.domain_id) {
                     return Err(BlockchainError::DomainAlreadyRegistered);
                 }
@@ -171,9 +217,9 @@ impl ChainState {
                 self.domains.insert(register.domain_id, new_state);
                 journal
                     .entries
-                    .push(UndoEntry::Register(register.domain_id));
+                    .push(UndoEntry::RegisterDomain(register.domain_id));
             }
-            Transaction::Update(update) => {
+            Transaction::UpdateDomain(update) => {
                 let state = self
                     .domains
                     .get_mut(&update.domain_id)
@@ -195,12 +241,26 @@ impl ChainState {
                         got: update.sequence,
                     });
                 }
-                journal.entries.push(UndoEntry::Update {
+                journal.entries.push(UndoEntry::UpdateDomain {
                     domain: update.domain_id,
                     prior: *state,
                 });
                 state.sequence = expected;
                 state.record_hash = Some(update.record_hash);
+            }
+            Transaction::RegisterTld(register_tld) => {
+                if self.tlds.contains_key(&register_tld.tld_id) {
+                    return Err(BlockchainError::TldAlreadyRegistered);
+                }
+                self.tlds.insert(
+                    register_tld.tld_id,
+                    TldState {
+                        owner: register_tld.owner,
+                    },
+                );
+                journal
+                    .entries
+                    .push(UndoEntry::RegisterTld(register_tld.tld_id));
             }
         }
         Ok(())
@@ -211,11 +271,14 @@ impl ChainState {
     pub(crate) fn rollback(&mut self, journal: UndoLog) {
         for entry in journal.entries.into_iter().rev() {
             match entry {
-                UndoEntry::Register(domain) => {
+                UndoEntry::RegisterDomain(domain) => {
                     self.domains.remove(&domain);
                 }
-                UndoEntry::Update { domain, prior } => {
+                UndoEntry::UpdateDomain { domain, prior } => {
                     self.domains.insert(domain, prior);
+                }
+                UndoEntry::RegisterTld(tld) => {
+                    self.tlds.remove(&tld);
                 }
             }
         }
@@ -225,7 +288,9 @@ impl ChainState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scone_core::{DomainName, Proof, Register, Update};
+    use scone_core::{
+        DomainName, Proof, RegisterDomain, RegisterTld, TldId, TldName, UpdateDomain,
+    };
     use scone_crypto::{Signature, SigningKey};
 
     fn domain_id(name: &str) -> DomainId {
@@ -240,8 +305,18 @@ mod tests {
     /// checks state rules and the owner/key binding, not the crypto
     /// (that is `validate_transaction`, exercised in `validate.rs`).
     fn register(name: &str, seed: u8) -> Transaction {
-        Transaction::Register(Register::register_signed(
-            domain_id(name),
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).unwrap(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            key(seed).public_key(),
+            Signature::from_bytes([0; 64]),
+        ))
+    }
+
+    fn register_tld(tld: &str, seed: u8) -> Transaction {
+        Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            TldId::from_tld(&TldName::new(tld).unwrap()),
             1,
             Proof::from_bytes(Vec::new()),
             key(seed).public_key(),
@@ -250,7 +325,7 @@ mod tests {
     }
 
     fn update(name: &str, seed: u8, sequence: u64) -> Transaction {
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             domain_id(name),
             sequence,
             RecordHash::from_bytes([sequence as u8; 32]),
@@ -411,5 +486,58 @@ mod tests {
         assert_eq!((a.owner, a.sequence, a.record_hash), (owner(1), 0, None));
         let b = state.domain(&domain_id("b.uip")).unwrap();
         assert_eq!(b.sequence, 1);
+    }
+
+    // --- RegisterTld (M7b) ---
+
+    fn tld_id(tld: &str) -> TldId {
+        TldId::from_tld(&TldName::new(tld).unwrap())
+    }
+
+    #[test]
+    fn register_tld_creates_initial_tld_state() {
+        let mut state = ChainState::new();
+        assert!(state.tld_is_empty());
+        state.apply(&register_tld("uip", 1)).unwrap();
+        let tld = state.tld(&tld_id("uip")).unwrap();
+        assert_eq!(tld.owner, owner(1));
+        assert_eq!(state.tld_len(), 1);
+    }
+
+    #[test]
+    fn double_register_tld_is_rejected() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        assert_eq!(
+            state.apply(&register_tld("uip", 2)),
+            Err(BlockchainError::TldAlreadyRegistered)
+        );
+        // Even by the same owner: the TLD is taken.
+        assert_eq!(
+            state.apply(&register_tld("uip", 1)),
+            Err(BlockchainError::TldAlreadyRegistered)
+        );
+        assert_eq!(state.tld_len(), 1);
+    }
+
+    #[test]
+    fn distinct_tlds_do_not_interfere() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&register_tld("com", 2)).unwrap();
+        assert_eq!(state.tld_len(), 2);
+        assert_eq!(state.tld(&tld_id("uip")).unwrap().owner, owner(1));
+        assert_eq!(state.tld(&tld_id("com")).unwrap().owner, owner(2));
+    }
+
+    #[test]
+    fn tld_registry_is_disjoint_from_domains() {
+        // Registering the TLD "uip" never registers any domain, and
+        // vice versa.
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&register("example.uip", 1)).unwrap();
+        assert_eq!(state.len(), 1);
+        assert_eq!(state.tld_len(), 1);
     }
 }

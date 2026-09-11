@@ -106,13 +106,13 @@ impl Relay {
     ) -> std::result::Result<(), scone_blockchain::BlockchainError> {
         use scone_blockchain::BlockchainError;
         match tx {
-            Transaction::Register(r) => {
+            Transaction::RegisterDomain(r) => {
                 if self.chain.state().domain(&r.domain_id).is_some() {
                     return Err(BlockchainError::DomainAlreadyRegistered);
                 }
                 Ok(())
             }
-            Transaction::Update(u) => {
+            Transaction::UpdateDomain(u) => {
                 let state = self
                     .chain
                     .state()
@@ -126,6 +126,12 @@ impl Relay {
                 }
                 if state.owner != u.owner {
                     return Err(BlockchainError::NotOwner);
+                }
+                Ok(())
+            }
+            Transaction::RegisterTld(t) => {
+                if self.chain.state().tld(&t.tld_id).is_some() {
+                    return Err(BlockchainError::TldAlreadyRegistered);
                 }
                 Ok(())
             }
@@ -144,7 +150,7 @@ impl Relay {
     /// propagating that error killed the relay. Instead:
     ///
     /// 1. transactions gone stale w.r.t. the CURRENT state are
-    ///    evicted (a stale Register/Update can never become valid
+    ///    evicted (a stale RegisterDomain/UpdateDomain can never become valid
     ///    again — the state only moves forward);
     /// 2. the candidate list shrinks from the end while the chain
     ///    rejects the block (intra-block conflict), the conflicting

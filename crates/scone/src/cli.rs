@@ -123,7 +123,7 @@ pub(crate) enum Command {
     },
 
     /// Offline transaction tools (build, sign, verify) — testing and
-    /// debugging helpers for the signed transaction format v2.
+    /// debugging helpers for the signed transaction format.
     Tx {
         #[command(subcommand)]
         command: TxCommand,
@@ -289,7 +289,7 @@ pub(crate) enum TxCommand {
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum TxKind {
     /// Claim a domain.
-    Register {
+    RegisterDomain {
         /// Domain name to register.
         #[arg(long)]
         name: String,
@@ -300,8 +300,20 @@ pub(crate) enum TxKind {
         #[arg(long)]
         proof_hex: Option<String>,
     },
+    /// Claim a top-level domain (M7b).
+    RegisterTld {
+        /// TLD to register (e.g. `uip`).
+        #[arg(long)]
+        tld: String,
+        /// Unix timestamp (seconds).
+        #[arg(long, default_value_t = 0)]
+        timestamp: u64,
+        /// Hex of the registration proof (default: empty).
+        #[arg(long)]
+        proof_hex: Option<String>,
+    },
     /// Publish a new version of a domain's DNS data.
-    Update {
+    UpdateDomain {
         /// Domain name to update.
         #[arg(long)]
         name: String,

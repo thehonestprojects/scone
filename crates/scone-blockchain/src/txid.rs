@@ -24,7 +24,7 @@ pub const TX_ID_VERSION: &[u8] = b"SCONE-TX-V1";
 ///
 /// Identical-content replays are not rejected here: they are naturally
 /// impossible to apply twice (see [`crate::ChainState`]: double
-/// `Register` or sequence replay fail the state rules).
+/// `RegisterDomain` or sequence replay fail the state rules).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TxId([u8; 32]);
 
@@ -62,7 +62,9 @@ pub fn transaction_id(tx: &Transaction) -> Result<TxId> {
 mod tests {
     use super::*;
     use crate::error::BlockchainError;
-    use scone_core::{DomainId, DomainName, OwnerId, Proof, RecordHash, Register, Update};
+    use scone_core::{
+        DomainId, DomainName, OwnerId, Proof, RecordHash, RegisterDomain, UpdateDomain,
+    };
     use scone_crypto::{Signature, SigningKey};
 
     fn domain_id(name: &str) -> DomainId {
@@ -73,10 +75,10 @@ mod tests {
         SigningKey::from_bytes([seed; 32])
     }
 
-    fn register() -> Register {
+    fn register() -> RegisterDomain {
         let sk = key(1);
-        Register::register_signed(
-            domain_id("example.uip"),
+        RegisterDomain::register_domain_signed(
+            DomainName::new("example.uip").unwrap(),
             1_700_000_000,
             Proof::from_bytes(vec![0xaa; 4]),
             sk.public_key(),
@@ -84,9 +86,9 @@ mod tests {
         )
     }
 
-    fn update() -> Update {
+    fn update() -> UpdateDomain {
         let sk = key(1);
-        Update::update_signed(
+        UpdateDomain::update_domain_signed(
             domain_id("example.uip"),
             1,
             RecordHash::from_bytes([9; 32]),
@@ -98,8 +100,8 @@ mod tests {
     #[test]
     fn deterministic() {
         for tx in [
-            Transaction::Register(register()),
-            Transaction::Update(update()),
+            Transaction::RegisterDomain(register()),
+            Transaction::UpdateDomain(update()),
         ] {
             assert_eq!(transaction_id(&tx).unwrap(), transaction_id(&tx).unwrap());
         }
@@ -108,8 +110,8 @@ mod tests {
     #[test]
     fn matches_documented_formula() {
         for tx in [
-            Transaction::Register(register()),
-            Transaction::Update(update()),
+            Transaction::RegisterDomain(register()),
+            Transaction::UpdateDomain(update()),
         ] {
             let encoded = encode_to_vec(&tx).unwrap();
             let expected = scone_crypto::hash256(&[TX_ID_VERSION, &encoded]);
@@ -120,24 +122,25 @@ mod tests {
     #[test]
     fn register_and_update_differ() {
         assert_ne!(
-            transaction_id(&Transaction::Register(register())).unwrap(),
-            transaction_id(&Transaction::Update(update())).unwrap()
+            transaction_id(&Transaction::RegisterDomain(register())).unwrap(),
+            transaction_id(&Transaction::UpdateDomain(update())).unwrap()
         );
     }
 
     #[test]
     fn distinct_domains_differ() {
         let mut tx = register();
+        tx.name = DomainName::new("other.uip").unwrap();
         tx.domain_id = domain_id("other.uip");
         assert_ne!(
-            transaction_id(&Transaction::Register(tx)).unwrap(),
-            transaction_id(&Transaction::Register(register())).unwrap()
+            transaction_id(&Transaction::RegisterDomain(tx)).unwrap(),
+            transaction_id(&Transaction::RegisterDomain(register())).unwrap()
         );
     }
 
     #[test]
     fn register_field_sensitivity() {
-        let base = transaction_id(&Transaction::Register(register())).unwrap();
+        let base = transaction_id(&Transaction::RegisterDomain(register())).unwrap();
 
         let mut other_owner = register();
         other_owner.owner = OwnerId::from_bytes([2; 32]);
@@ -145,25 +148,38 @@ mod tests {
         // Owner-forged Registers cannot be encoded anymore (Encode
         // validates the owner/pk binding — docs/transactions.md) ; TxId
         // sensitivity to `owner` is asserted at the wire level instead.
-        let raw = scone_protocol::encode_to_vec(&Transaction::Register(register())).unwrap();
+        // Layout: disc(1) version(1) name(str) domain_id(32) owner(32)…
+        let raw = scone_protocol::encode_to_vec(&Transaction::RegisterDomain(register())).unwrap();
+        let name_len = raw[2] as usize;
+        let owner_off = 2 + 1 + name_len + 32;
         let mut forged = raw.clone();
-        forged[2 + 32..2 + 64].copy_from_slice(OwnerId::from_bytes([2; 32]).as_bytes());
+        forged[owner_off..owner_off + 32].copy_from_slice(OwnerId::from_bytes([2; 32]).as_bytes());
         assert!(
             scone_protocol::decode_complete::<Transaction>(&forged).is_err(),
-            "owner-forged Register must be rejected on decode"
+            "owner-forged RegisterDomain must be rejected on decode"
+        );
+
+        // A RegisterDomain whose name is changed after signing gets a
+        // different id (the name is carried and signed).
+        let mut other_name = register();
+        other_name.name = DomainName::new("other.uip").unwrap();
+        other_name.domain_id = domain_id("other.uip");
+        assert_ne!(
+            transaction_id(&Transaction::RegisterDomain(other_name)).unwrap(),
+            base
         );
 
         let mut other_timestamp = register();
         other_timestamp.timestamp += 1;
         assert_ne!(
-            transaction_id(&Transaction::Register(other_timestamp)).unwrap(),
+            transaction_id(&Transaction::RegisterDomain(other_timestamp)).unwrap(),
             base
         );
 
         let mut other_proof = register();
         other_proof.proof = Proof::from_bytes(vec![0xbb; 4]);
         assert_ne!(
-            transaction_id(&Transaction::Register(other_proof)).unwrap(),
+            transaction_id(&Transaction::RegisterDomain(other_proof)).unwrap(),
             base
         );
 
@@ -171,20 +187,20 @@ mod tests {
         other_key.public_key = key(2).public_key();
         other_key.owner = crate::validate::owner_from_public_key(&key(2).public_key());
         assert_ne!(
-            transaction_id(&Transaction::Register(other_key)).unwrap(),
+            transaction_id(&Transaction::RegisterDomain(other_key)).unwrap(),
             base
         );
 
         let mut other_signature = register();
         other_key_signature_bump(&mut other_signature);
         assert_ne!(
-            transaction_id(&Transaction::Register(other_signature)).unwrap(),
+            transaction_id(&Transaction::RegisterDomain(other_signature)).unwrap(),
             base
         );
     }
 
     /// Flips one byte of the signature in place (test helper).
-    fn other_key_signature_bump(register: &mut Register) {
+    fn other_key_signature_bump(register: &mut RegisterDomain) {
         let mut raw = register.signature.to_bytes();
         raw[63] ^= 0x01;
         register.signature = Signature::from_bytes(raw);
@@ -192,7 +208,7 @@ mod tests {
 
     #[test]
     fn update_field_sensitivity() {
-        let base = transaction_id(&Transaction::Update(update())).unwrap();
+        let base = transaction_id(&Transaction::UpdateDomain(update())).unwrap();
 
         // Note: owner alone cannot change without the key (binding
         // enforced at encode); key+owner together is the meaningful
@@ -200,14 +216,14 @@ mod tests {
         let mut other_sequence = update();
         other_sequence.sequence = 2;
         assert_ne!(
-            transaction_id(&Transaction::Update(other_sequence)).unwrap(),
+            transaction_id(&Transaction::UpdateDomain(other_sequence)).unwrap(),
             base
         );
 
         let mut other_hash = update();
         other_hash.record_hash = RecordHash::from_bytes([8; 32]);
         assert_ne!(
-            transaction_id(&Transaction::Update(other_hash)).unwrap(),
+            transaction_id(&Transaction::UpdateDomain(other_hash)).unwrap(),
             base
         );
 
@@ -215,7 +231,7 @@ mod tests {
         other_key.public_key = key(2).public_key();
         other_key.owner = crate::validate::owner_from_public_key(&key(2).public_key());
         assert_ne!(
-            transaction_id(&Transaction::Update(other_key)).unwrap(),
+            transaction_id(&Transaction::UpdateDomain(other_key)).unwrap(),
             base
         );
     }
@@ -225,20 +241,20 @@ mod tests {
         let mut tx = update();
         tx.sequence = 0;
         assert!(matches!(
-            transaction_id(&Transaction::Update(tx)),
+            transaction_id(&Transaction::UpdateDomain(tx)),
             Err(BlockchainError::Protocol(_))
         ));
     }
 
     #[test]
     fn bytes_roundtrip_and_map_key() {
-        let id = transaction_id(&Transaction::Register(register())).unwrap();
+        let id = transaction_id(&Transaction::RegisterDomain(register())).unwrap();
         assert_eq!(TxId::from_bytes(*id.as_bytes()), id);
         assert_eq!(TxId::from(*id.as_bytes()), id);
 
         let mut set = std::collections::HashSet::new();
         set.insert(id);
-        assert!(set.contains(&transaction_id(&Transaction::Register(register())).unwrap()));
-        assert!(!set.contains(&transaction_id(&Transaction::Update(update())).unwrap()));
+        assert!(set.contains(&transaction_id(&Transaction::RegisterDomain(register())).unwrap()));
+        assert!(!set.contains(&transaction_id(&Transaction::UpdateDomain(update())).unwrap()));
     }
 }

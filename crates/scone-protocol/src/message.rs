@@ -174,7 +174,9 @@ mod tests {
     use crate::block::{BlockHeader, MerkleRoot};
     use crate::codec::{decode_complete, encode_to_vec};
     use crate::record::tests_fixtures as record_fixtures;
-    use scone_core::{DomainName, OwnerId, Proof, RecordHash, Register, Signature, Update};
+    use scone_core::{
+        DomainName, OwnerId, Proof, RecordHash, RegisterDomain, Signature, UpdateDomain,
+    };
     use scone_crypto::SigningKey;
 
     fn signer() -> SigningKey {
@@ -192,13 +194,15 @@ mod tests {
                 timestamp: 1_700_000_000,
                 consensus: vec![0xaa; 8],
             },
-            transactions: vec![Transaction::Register(Register::register_signed(
-                DomainId::from_name(&DomainName::new("example.uip").unwrap()),
-                1_700_000_000,
-                Proof::from_bytes(Vec::new()),
-                sk.public_key(),
-                sk.sign(b"fixture"),
-            ))],
+            transactions: vec![Transaction::RegisterDomain(
+                RegisterDomain::register_domain_signed(
+                    DomainName::new("example.uip").unwrap(),
+                    1_700_000_000,
+                    Proof::from_bytes(Vec::new()),
+                    sk.public_key(),
+                    sk.sign(b"fixture"),
+                ),
+            )],
         }
     }
 
@@ -225,13 +229,15 @@ mod tests {
                 max_blocks: limits::MAX_BLOCKS_PER_REQUEST as u32,
             },
             Message::Block(Box::new(block_fixture())),
-            Message::Transaction(Transaction::Update(Update::update_signed(
-                DomainId::from_name(&DomainName::new("example.uip").unwrap()),
-                2,
-                RecordHash::from_bytes([9; 32]),
-                signer().public_key(),
-                signer().sign(b"fixture"),
-            ))),
+            Message::Transaction(Transaction::UpdateDomain(
+                UpdateDomain::update_domain_signed(
+                    DomainId::from_name(&DomainName::new("example.uip").unwrap()),
+                    2,
+                    RecordHash::from_bytes([9; 32]),
+                    signer().public_key(),
+                    signer().sign(b"fixture"),
+                ),
+            )),
             Message::GetRecord {
                 domain_id: DomainId::from_name(&DomainName::new("example.uip").unwrap()),
             },
@@ -286,11 +292,11 @@ mod tests {
             encode_to_vec(&Message::Hello {
                 version: PROTOCOL_VERSION + 1
             }),
-            Err(ProtocolError::UnsupportedVersion(3))
+            Err(ProtocolError::UnsupportedVersion(2))
         ));
         assert!(matches!(
-            decode_complete::<Message>(&[msg_type::HELLO, 0x03]),
-            Err(ProtocolError::UnsupportedVersion(3))
+            decode_complete::<Message>(&[msg_type::HELLO, 0x02]),
+            Err(ProtocolError::UnsupportedVersion(2))
         ));
         // v1 handshake: accepted (a v1 peer is just behind, its
         // transactions/blocks will be rejected by format rules).

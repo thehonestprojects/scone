@@ -53,24 +53,25 @@ mod tests {
     use scone_blockchain::BlockBuilder;
     use scone_storage::RedbStore;
 
-    fn register_tx(name: &str, seed: u8) -> scone_core::Transaction {
-        use scone_core::{DomainId, DomainName, Proof, Register};
+    fn register_domain_tx(name: &str, seed: u8) -> scone_core::Transaction {
+        use scone_core::{DomainName, Proof, RegisterDomain};
         use scone_crypto::{Signature, SigningKey};
         let sk = SigningKey::from_bytes([seed; 32]);
-        let unsigned = scone_core::Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).unwrap()),
-            1,
-            Proof::from_bytes(Vec::new()),
-            sk.public_key(),
-            Signature::from_bytes([0; 64]),
-        ));
+        let unsigned =
+            scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
+                1,
+                Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
-            scone_core::Transaction::Register(mut r) => {
+            scone_core::Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                scone_core::Transaction::Register(r)
+                scone_core::Transaction::RegisterDomain(r)
             }
-            scone_core::Transaction::Update(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
@@ -83,7 +84,7 @@ mod tests {
             let mut builder =
                 BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(i + 1);
             builder
-                .push_tx(register_tx(
+                .push_tx(register_domain_tx(
                     &format!("d{i}.uip"),
                     u8::try_from(i).unwrap() + 1,
                 ))

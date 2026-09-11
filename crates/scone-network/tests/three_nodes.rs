@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use scone_core::{
     DnsRecord, DomainId, DomainName, OwnerId, Proof, PublicKeyRef, RecordData, RecordHash,
-    Register, Transaction, Update,
+    RegisterDomain, Transaction, UpdateDomain,
 };
 use scone_crypto::{Signature, SigningKey};
 use scone_network::rpc::{RpcClient, RpcRequest, RpcResponse};
@@ -37,21 +37,25 @@ fn hex(bytes: &[u8]) -> String {
 fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     let payload = signing_payload(&unsigned).expect("signing payload");
     match unsigned {
-        Transaction::Register(mut r) => {
+        Transaction::RegisterDomain(mut r) => {
             r.signature = sk.sign(&payload);
-            Transaction::Register(r)
+            Transaction::RegisterDomain(r)
         }
-        Transaction::Update(mut u) => {
+        Transaction::UpdateDomain(mut u) => {
             u.signature = sk.sign(&payload);
-            Transaction::Update(u)
+            Transaction::UpdateDomain(u)
+        }
+        Transaction::RegisterTld(mut t) => {
+            t.signature = sk.sign(&payload);
+            Transaction::RegisterTld(t)
         }
     }
 }
 
-fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
+fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
-        Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).expect("valid name")),
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).expect("valid name"),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -61,9 +65,9 @@ fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
     )
 }
 
-fn update_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
+fn update_domain_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
     sign(
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             DomainId::from_name(&DomainName::new(name).expect("valid name")),
             sequence,
             RecordHash::from_bytes(hash),
@@ -76,8 +80,8 @@ fn update_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Tran
 
 /// A register tx with a FORGED signature (C1 ammo).
 fn forged_register_tx(sk: &SigningKey, name: &str) -> Transaction {
-    let unsigned = Transaction::Register(Register::register_signed(
-        DomainId::from_name(&DomainName::new(name).expect("valid name")),
+    let unsigned = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+        DomainName::new(name).expect("valid name"),
         1_700_000_000,
         Proof::from_bytes(Vec::new()),
         sk.public_key(),
@@ -279,7 +283,7 @@ async fn three_nodes_cycle_security_regression() {
 
     // ---- H2: one valid tx on the cycle must settle, not loop ------
     let name = "cycle.uip";
-    let tx_hex = hex(&encode_to_vec(&register_tx(&sk, name)).expect("encode tx"));
+    let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
     let response = nodes[0]
         .client_ref()
         .request(RpcRequest::SubmitTx {
@@ -340,7 +344,7 @@ async fn three_nodes_cycle_security_regression() {
     let record = signed_record(&sk, name, 1);
     let expected_hash = *scone_protocol::record_hash(&record.record).as_bytes();
     let update_hex =
-        hex(&encode_to_vec(&update_tx(&sk, name, 1, expected_hash)).expect("encode update"));
+        hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode update"));
     let response = nodes[1]
         .client_ref()
         .request(RpcRequest::SubmitTx { tx_hex: update_hex })

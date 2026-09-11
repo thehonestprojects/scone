@@ -385,7 +385,7 @@ fn two_nodes_cli_end_to_end() {
     ]);
     assert!(err.contains("already registered"), "err: {err}");
 
-    // Update with a NON-owner identity: refused before touching the chain.
+    // UpdateDomain with a NON-owner identity: refused before touching the chain.
     let id_bob = identity("bob");
     let err = scone_err(&[
         "domain",
@@ -440,7 +440,7 @@ fn two_nodes_cli_end_to_end() {
         "--rpc",
         &rpc_a.to_string(),
     ]);
-    // Update of an unregistered domain: refused.
+    // UpdateDomain of an unregistered domain: refused.
     scone_err(&[
         "domain",
         "update",

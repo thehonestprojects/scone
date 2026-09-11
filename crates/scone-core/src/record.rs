@@ -38,7 +38,7 @@ pub enum RecordData {
 ///
 /// Not stored on-chain: the blockchain keeps only the
 /// [`RecordHash`](crate::transaction::RecordHash) (see
-/// [`crate::transaction::Update`]); the full signed record is published in
+/// [`crate::transaction::UpdateDomain`]); the full signed record is published in
 /// the DHT.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DnsRecord {

@@ -31,7 +31,7 @@ Chaîne de dépendance complète :
 ```text
 DomainId
     ↓
-Register / Update
+RegisterDomain / UpdateDomain
     ↓
 Transaction
     ↓
@@ -62,7 +62,7 @@ TxId = BLAKE3-256("SCONE-TX-V1" || canonical_encode(Transaction))
 - aucune dépendance au stockage ou au réseau ;
 - l'identité ne garantit pas l'unicité d'application : rejouer une
   transaction identique échoue sur les règles d'état (double
-  `Register`, replay de séquence), pas sur le `TxId`.
+  `RegisterDomain`, replay de séquence), pas sur le `TxId`.
 
 API : `scone_blockchain::transaction_id(&Transaction) -> Result<TxId>`.
 
@@ -139,7 +139,7 @@ ChainState   = DomainId -> DomainState        (accès direct, en mémoire)
 - accès direct par `DomainId` (32 octets) : jamais de `String` comme
   clé, jamais de scan complet — condition nécessaire pour viser des
   centaines de milliards de domaines ;
-- `record_hash == None` tant qu'aucun `Update` n'a été appliqué.
+- `record_hash == None` tant qu'aucun `UpdateDomain` n'a été appliqué.
 
 ### Règles d'application
 
@@ -158,7 +158,7 @@ d'erreur, l'état est inchangé) :
 - le domaine doit exister ;
 - `tx.owner` doit être le propriétaire actuel ;
 - `tx.sequence` doit être **exactement** `sequence_courante + 1` (aucun
-  trou, aucun replay ; après `Register`, le premier `Update` valide
+  trou, aucun replay ; après `RegisterDomain`, le premier `UpdateDomain` valide
   porte `sequence = 1`) ;
 - à l'application : `sequence` avance, `record_hash` est remplacé.
 
@@ -194,9 +194,9 @@ pour argent comptant :
    si le parent est inconnu, `ParentNotTip` s'il est connu mais pas la
    pointe : détection de fork minimale) ;
 2. `height` == hauteur pointe + 1 ;
-3. `version` == `PROTOCOL_VERSION` **exactement** (un bloc v1 —
-   format antérieur aux transactions signées — est rejeté, pas
-   réinterprété) ;
+3. `version` == `PROTOCOL_VERSION` **exactement** (toute autre
+   version — inférieure ou supérieure — est rejetée, pas
+   réinterprétée) ;
 4. nombre de transactions ≤ `MAX_TXS_PER_BLOCK` (4096) ;
 5. `tx_root` recalculé sur les transactions dans l'ordre du bloc ;
 6. crochets du consensus (`validate_header`, `validate_tx`) ;
@@ -282,7 +282,7 @@ Volontairement non définis dans cette crate :
 - **ordering global** : autorité de tri, tie-break final ;
 - **timestamp authority / anti-replay** : les champs `timestamp`
   existent dans le format mais aucune règle ne les contraint encore ;
-- **validation de la `proof` de `Register`** : crochet prêt, règles à
+- **validation de la `proof` de `RegisterDomain`** : crochet prêt, règles à
   venir ;
 - expiration / renouvellement des claims de domaine ;
 - stockage : l'état est en mémoire ; le backend (`scone-storage`,

@@ -268,7 +268,9 @@ mod tests {
     use super::*;
     use crate::error::BlockchainError;
     use crate::txid::transaction_id;
-    use scone_core::{DomainId, DomainName, Proof, RecordHash, Register, Transaction, Update};
+    use scone_core::{
+        DomainId, DomainName, Proof, RecordHash, RegisterDomain, Transaction, UpdateDomain,
+    };
     use scone_crypto::{Signature, SigningKey};
     use scone_protocol::codec::{decode_complete, encode_to_vec};
     use scone_protocol::{BlockHeader, MerkleRoot};
@@ -281,20 +283,24 @@ mod tests {
     fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
-            Transaction::Register(mut r) => {
+            Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                Transaction::Register(r)
+                Transaction::RegisterDomain(r)
             }
-            Transaction::Update(mut u) => {
+            Transaction::UpdateDomain(mut u) => {
                 u.signature = sk.sign(&payload);
-                Transaction::Update(u)
+                Transaction::UpdateDomain(u)
+            }
+            Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RegisterTld(t)
             }
         }
     }
 
-    fn unsigned_register(name: &str, seed: u8) -> Transaction {
-        Transaction::Register(Register::register_signed(
-            domain_id(name),
+    fn unsigned_register_domain(name: &str, seed: u8) -> Transaction {
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).unwrap(),
             1,
             Proof::from_bytes(Vec::new()),
             SigningKey::from_bytes([seed; 32]).public_key(),
@@ -302,15 +308,15 @@ mod tests {
         ))
     }
 
-    fn register_tx(name: &str, seed: u8) -> Transaction {
+    fn register_domain_tx(name: &str, seed: u8) -> Transaction {
         sign(
-            unsigned_register(name, seed),
+            unsigned_register_domain(name, seed),
             &SigningKey::from_bytes([seed; 32]),
         )
     }
 
     fn unsigned_update(name: &str, seed: u8, sequence: u64) -> Transaction {
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             domain_id(name),
             sequence,
             RecordHash::from_bytes([sequence as u8; 32]),
@@ -319,7 +325,7 @@ mod tests {
         ))
     }
 
-    fn update_tx(name: &str, seed: u8, sequence: u64) -> Transaction {
+    fn update_domain_tx(name: &str, seed: u8, sequence: u64) -> Transaction {
         sign(
             unsigned_update(name, seed, sequence),
             &SigningKey::from_bytes([seed; 32]),
@@ -374,13 +380,13 @@ mod tests {
     #[test]
     fn valid_blocks_extend_the_chain() {
         let mut chain = Blockchain::new();
-        let b1 = child(&chain, vec![register_tx("example.uip", 1)]);
+        let b1 = child(&chain, vec![register_domain_tx("example.uip", 1)]);
         let h1 = chain.push_block(&b1).unwrap();
         assert_eq!(chain.height(), 1);
         assert_eq!(chain.tip_hash(), h1);
         assert_eq!(chain.tip(), &b1);
 
-        let b2 = child(&chain, vec![update_tx("example.uip", 1, 1)]);
+        let b2 = child(&chain, vec![update_domain_tx("example.uip", 1, 1)]);
         let h2 = chain.push_block(&b2).unwrap();
         assert_eq!(chain.height(), 2);
         assert_eq!(chain.tip_hash(), h2);
@@ -392,10 +398,10 @@ mod tests {
     fn register_then_update_reaches_the_state() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
         chain
-            .push_block(&child(&chain, vec![update_tx("example.uip", 1, 1)]))
+            .push_block(&child(&chain, vec![update_domain_tx("example.uip", 1, 1)]))
             .unwrap();
 
         let domain = chain.state().domain(&domain_id("example.uip")).unwrap();
@@ -415,8 +421,8 @@ mod tests {
             .push_block(&child(
                 &chain,
                 vec![
-                    register_tx("example.uip", 1),
-                    update_tx("example.uip", 1, 1),
+                    register_domain_tx("example.uip", 1),
+                    update_domain_tx("example.uip", 1, 1),
                 ],
             ))
             .unwrap();
@@ -434,12 +440,15 @@ mod tests {
 
         let b1 = child(
             &left,
-            vec![register_tx("a.uip", 1), register_tx("b.uip", 2)],
+            vec![
+                register_domain_tx("a.uip", 1),
+                register_domain_tx("b.uip", 2),
+            ],
         );
         left.push_block(&b1).unwrap();
         right.push_block(&b1).unwrap();
 
-        let b2 = child(&left, vec![update_tx("a.uip", 1, 1)]);
+        let b2 = child(&left, vec![update_domain_tx("a.uip", 1, 1)]);
         left.push_block(&b2).unwrap();
         right.push_block(&b2).unwrap();
 
@@ -464,11 +473,11 @@ mod tests {
         let mut chain = Blockchain::new();
         let genesis_hash = chain.tip_hash();
         chain
-            .push_block(&child(&chain, vec![register_tx("a.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("a.uip", 1)]))
             .unwrap();
 
         // Competing block on the same (now non-tip) genesis parent.
-        let competitor = make_block(genesis_hash, 1, vec![register_tx("b.uip", 1)]);
+        let competitor = make_block(genesis_hash, 1, vec![register_domain_tx("b.uip", 1)]);
         assert_eq!(
             chain.push_block(&competitor),
             Err(BlockchainError::ParentNotTip)
@@ -497,8 +506,9 @@ mod tests {
     #[test]
     fn invalid_version_rejected() {
         let mut chain = Blockchain::new();
-        // 0, future versions AND the old v1 format are all rejected.
-        for version in [0u32, 1, PROTOCOL_VERSION + 1] {
+        // 0 and future versions are both rejected: there is exactly
+        // one block format.
+        for version in [0u32, PROTOCOL_VERSION + 1] {
             let mut block = child(&chain, vec![]);
             block.header.version = version;
             assert_eq!(
@@ -513,7 +523,7 @@ mod tests {
     fn too_many_transactions_rejected() {
         let mut chain = Blockchain::new();
         let txs: Vec<Transaction> = (0..=MAX_TXS_PER_BLOCK)
-            .map(|i| register_tx(&format!("d{i}.uip"), 1))
+            .map(|i| register_domain_tx(&format!("d{i}.uip"), 1))
             .collect();
         let mut block = child(&chain, txs);
         block.header.tx_root = tx_root(&block.transactions).unwrap();
@@ -526,7 +536,7 @@ mod tests {
     #[test]
     fn merkle_mismatch_rejected() {
         let mut chain = Blockchain::new();
-        let mut block = child(&chain, vec![register_tx("example.uip", 1)]);
+        let mut block = child(&chain, vec![register_domain_tx("example.uip", 1)]);
         block.header.tx_root = MerkleRoot::from_bytes([0xcd; 32]);
         assert_eq!(
             chain.push_block(&block),
@@ -541,7 +551,10 @@ mod tests {
         // Same transactions, header claims the root of the reversed
         // list: must be rejected even though both roots are "valid".
         let mut chain = Blockchain::new();
-        let txs = vec![register_tx("a.uip", 1), register_tx("b.uip", 1)];
+        let txs = vec![
+            register_domain_tx("a.uip", 1),
+            register_domain_tx("b.uip", 1),
+        ];
         let mut block = child(&chain, txs.clone());
         block.header.tx_root = tx_root(&txs.iter().rev().cloned().collect::<Vec<_>>()).unwrap();
         assert_eq!(
@@ -553,8 +566,8 @@ mod tests {
     #[test]
     fn invalid_transaction_rejected_chain_unchanged() {
         let mut chain = Blockchain::new();
-        // Update on an unregistered domain.
-        let block = child(&chain, vec![update_tx("example.uip", 1, 1)]);
+        // UpdateDomain on an unregistered domain.
+        let block = child(&chain, vec![update_domain_tx("example.uip", 1, 1)]);
         assert_eq!(
             chain.push_block(&block),
             Err(BlockchainError::UnknownDomain)
@@ -572,9 +585,9 @@ mod tests {
         let block = child(
             &chain,
             vec![
-                register_tx("a.uip", 1),
-                register_tx("b.uip", 2),
-                register_tx("a.uip", 3), // double register: fails
+                register_domain_tx("a.uip", 1),
+                register_domain_tx("b.uip", 2),
+                register_domain_tx("a.uip", 3), // double register: fails
             ],
         );
         assert_eq!(
@@ -594,8 +607,8 @@ mod tests {
             .push_block(&child(
                 &chain,
                 vec![
-                    register_tx("example.uip", 1),
-                    update_tx("example.uip", 1, 1),
+                    register_domain_tx("example.uip", 1),
+                    update_domain_tx("example.uip", 1, 1),
                 ],
             ))
             .unwrap();
@@ -604,8 +617,8 @@ mod tests {
         let block = child(
             &chain2,
             vec![
-                update_tx("example.uip", 1, 1),
-                register_tx("example.uip", 1),
+                update_domain_tx("example.uip", 1, 1),
+                register_domain_tx("example.uip", 1),
             ],
         );
         assert_eq!(
@@ -619,11 +632,17 @@ mod tests {
         let mut chain = Blockchain::new();
         let ab = child(
             &chain,
-            vec![register_tx("a.uip", 1), register_tx("b.uip", 1)],
+            vec![
+                register_domain_tx("a.uip", 1),
+                register_domain_tx("b.uip", 1),
+            ],
         );
         let ba = child(
             &chain,
-            vec![register_tx("b.uip", 1), register_tx("a.uip", 1)],
+            vec![
+                register_domain_tx("b.uip", 1),
+                register_domain_tx("a.uip", 1),
+            ],
         );
         let hash_ab = chain.push_block(&ab.clone()).unwrap();
         let hash_ba = {
@@ -638,11 +657,14 @@ mod tests {
     fn long_update_chain() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
         for sequence in 1..=50 {
             chain
-                .push_block(&child(&chain, vec![update_tx("example.uip", 1, sequence)]))
+                .push_block(&child(
+                    &chain,
+                    vec![update_domain_tx("example.uip", 1, sequence)],
+                ))
                 .unwrap();
         }
         let domain = chain.state().domain(&domain_id("example.uip")).unwrap();
@@ -654,13 +676,13 @@ mod tests {
     fn update_from_previous_block_owner_rules_hold() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
         // Wrong owner, correct sequence.
-        let block = child(&chain, vec![update_tx("example.uip", 2, 1)]);
+        let block = child(&chain, vec![update_domain_tx("example.uip", 2, 1)]);
         assert_eq!(chain.push_block(&block), Err(BlockchainError::NotOwner));
         // Wrong owner and wrong sequence: owner is checked first.
-        let block = child(&chain, vec![update_tx("example.uip", 2, 5)]);
+        let block = child(&chain, vec![update_domain_tx("example.uip", 2, 5)]);
         assert_eq!(chain.push_block(&block), Err(BlockchainError::NotOwner));
     }
 
@@ -684,7 +706,7 @@ mod tests {
             Ok(())
         }
         fn validate_tx(&self, tx: &Transaction) -> Result<()> {
-            if matches!(tx, Transaction::Register(r) if r.domain_id == domain_id("pow.uip")) {
+            if matches!(tx, Transaction::RegisterDomain(r) if r.domain_id == domain_id("pow.uip")) {
                 return Err(BlockchainError::Consensus(self.0.clone()));
             }
             Ok(())
@@ -706,7 +728,10 @@ mod tests {
         let mut chain = Blockchain::with_consensus(RejectTx("pow missing".into()));
         let block = child(
             &chain,
-            vec![register_tx("pow.uip", 1), register_tx("other.uip", 1)],
+            vec![
+                register_domain_tx("pow.uip", 1),
+                register_domain_tx("other.uip", 1),
+            ],
         );
         assert!(matches!(
             chain.push_block(&block),
@@ -714,7 +739,7 @@ mod tests {
         ));
         // The chain still accepts blocks without a `pow.uip` register.
         chain
-            .push_block(&child(&chain, vec![register_tx("other.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("other.uip", 1)]))
             .unwrap();
     }
 
@@ -722,14 +747,14 @@ mod tests {
     fn chain_unchanged_after_every_rejection_kind() {
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
         let (height, tip, state) = (chain.height(), chain.tip_hash(), chain.state().clone());
 
         let cases: Vec<Block> = vec![
             make_block(BlockHash::from_bytes([9; 32]), 1, vec![]), // unknown parent
             make_block(chain.tip_hash(), 7, vec![]),               // bad height
-            make_block(chain.tip_hash(), 2, vec![update_tx("no.uip", 1, 1)]), // bad tx
+            make_block(chain.tip_hash(), 2, vec![update_domain_tx("no.uip", 1, 1)]), // bad tx
         ];
         for block in cases {
             assert!(chain.push_block(&block).is_err());
@@ -738,7 +763,7 @@ mod tests {
             assert_eq!(*chain.state(), state);
         }
 
-        let mut bad_root = child(&chain, vec![register_tx("z.uip", 1)]);
+        let mut bad_root = child(&chain, vec![register_domain_tx("z.uip", 1)]);
         bad_root.header.tx_root = MerkleRoot::from_bytes([1; 32]);
         assert!(chain.push_block(&bad_root).is_err());
         assert_eq!(chain.height(), height);
@@ -747,7 +772,7 @@ mod tests {
     #[test]
     fn corrupted_encoded_blocks_never_panic() {
         let mut chain = Blockchain::new();
-        let block = child(&chain, vec![register_tx("example.uip", 1)]);
+        let block = child(&chain, vec![register_domain_tx("example.uip", 1)]);
         let bytes = encode_to_vec(&block).unwrap();
         chain.push_block(&block).unwrap();
 
@@ -767,7 +792,7 @@ mod tests {
     fn txids_are_stable_across_nodes() {
         // The TxId of a transaction inside a block does not depend on
         // the node computing it (no local clock, no position).
-        let tx = register_tx("example.uip", 1);
+        let tx = register_domain_tx("example.uip", 1);
         let chain = Blockchain::new();
         let block = child(&chain, vec![tx.clone()]);
         assert_eq!(
@@ -781,8 +806,8 @@ mod tests {
     #[test]
     fn forged_signature_is_rejected() {
         let mut chain = Blockchain::new();
-        let mut tx = register_tx("example.uip", 1);
-        if let Transaction::Register(r) = &mut tx {
+        let mut tx = register_domain_tx("example.uip", 1);
+        if let Transaction::RegisterDomain(r) = &mut tx {
             let mut raw = r.signature.to_bytes();
             raw[0] ^= 0x01;
             r.signature = Signature::from_bytes(raw);
@@ -801,7 +826,7 @@ mod tests {
         // owner/public_key consistent (owner of seed 2), but the
         // signature was produced by the key of seed 1.
         let mut chain = Blockchain::new();
-        let mut tx = unsigned_register("example.uip", 2);
+        let mut tx = unsigned_register_domain("example.uip", 2);
         tx = sign(tx, &SigningKey::from_bytes([1; 32]));
         let block = child(&chain, vec![tx]);
         assert_eq!(
@@ -815,8 +840,8 @@ mod tests {
         // Sign correctly, then modify a protected field: the
         // recomputed payload no longer matches the signature.
         let mut chain = Blockchain::new();
-        let mut tx = register_tx("example.uip", 1);
-        if let Transaction::Register(r) = &mut tx {
+        let mut tx = register_domain_tx("example.uip", 1);
+        if let Transaction::RegisterDomain(r) = &mut tx {
             r.timestamp = 999; // protected by the signature
         }
         let block = child(&chain, vec![tx]);
@@ -828,23 +853,25 @@ mod tests {
 
     #[test]
     fn owner_not_derived_from_embedded_key_is_rejected() {
-        let tx = unsigned_register("example.uip", 2);
+        let tx = unsigned_register_domain("example.uip", 2);
         // Consistent signature by seed 2's key…
         let tx = sign(tx, &SigningKey::from_bytes([2; 32]));
         // …but a forged owner field. The forgery is built at the WIRE
         // level (encode valid → flip the owner bytes → decode): the
-        // in-memory API cannot construct an owner-forged Register
+        // in-memory API cannot construct an owner-forged RegisterDomain
         // anymore (Encode validates the binding, docs/transactions.md).
         let mut raw = scone_protocol::encode_to_vec(&tx).unwrap();
-        // Layout: disc(1) version(1) domain_id(32) owner(32) ...
-        raw[2 + 32..2 + 64].copy_from_slice(
+        // Layout: disc(1) version(1) name(str) domain_id(32) owner(32)…
+        let name_len = raw[2] as usize;
+        let owner_off = 2 + 1 + name_len + 32;
+        raw[owner_off..owner_off + 32].copy_from_slice(
             crate::validate::owner_from_public_key(&SigningKey::from_bytes([9; 32]).public_key())
                 .as_bytes(),
         );
         let forged_result = scone_protocol::decode_complete::<Transaction>(&raw);
         assert!(
             forged_result.is_err(),
-            "owner-forged Register must be rejected on decode (binding owner/pk)"
+            "owner-forged RegisterDomain must be rejected on decode (binding owner/pk)"
         );
         // Defense in depth: the chain itself also refuses a forged owner
         // if one ever reaches push (e.g. built in memory then validated).
@@ -853,13 +880,13 @@ mod tests {
 
     #[test]
     fn forged_update_for_someone_elses_domain_is_rejected() {
-        // The attacker (seed 2) correctly signs an Update but the
+        // The attacker (seed 2) correctly signs an UpdateDomain but the
         // domain belongs to seed 1: NotOwner at application time.
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
-        let attack = update_tx("example.uip", 2, 1);
+        let attack = update_domain_tx("example.uip", 2, 1);
         let block = child(&chain, vec![attack]);
         assert_eq!(chain.push_block(&block), Err(BlockchainError::NotOwner));
     }
@@ -870,14 +897,14 @@ mod tests {
             let sk = SigningKey::from_bytes([5; 32]);
             let mut chain = Blockchain::new();
             chain
-                .push_block(&child(&chain, vec![register_tx("example.uip", 5)]))
+                .push_block(&child(&chain, vec![register_domain_tx("example.uip", 5)]))
                 .unwrap();
             let _ = sk;
             chain
-                .push_block(&child(&chain, vec![update_tx("example.uip", 5, 1)]))
+                .push_block(&child(&chain, vec![update_domain_tx("example.uip", 5, 1)]))
                 .unwrap();
             chain
-                .push_block(&child(&chain, vec![update_tx("example.uip", 5, 2)]))
+                .push_block(&child(&chain, vec![update_domain_tx("example.uip", 5, 2)]))
                 .unwrap();
             chain
         };
@@ -899,13 +926,13 @@ mod tests {
         // are the node store's job.
         let mut chain = Blockchain::new();
         chain
-            .push_block(&child(&chain, vec![register_tx("example.uip", 1)]))
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
             .unwrap();
         for height in 2..=8 {
             chain
                 .push_block(&child(
                     &chain,
-                    vec![update_tx("example.uip", 1, height - 1)],
+                    vec![update_domain_tx("example.uip", 1, height - 1)],
                 ))
                 .unwrap();
         }
@@ -934,7 +961,7 @@ mod tests {
         // Blocks pushed after restore keep being served: the window
         // extends from the restored tip onward.
         let mut extended = restored;
-        let b9 = child(&extended, vec![update_tx("example.uip", 1, 8)]);
+        let b9 = child(&extended, vec![update_domain_tx("example.uip", 1, 8)]);
         extended.push_block(&b9).unwrap();
         assert_eq!(extended.block(8), Some(&tip_block));
         assert_eq!(extended.block(9), Some(&b9));

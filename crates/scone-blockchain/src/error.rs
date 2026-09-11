@@ -38,16 +38,19 @@ pub enum BlockchainError {
     /// More transactions than `MAX_TXS_PER_BLOCK`.
     #[error("too many transactions: {0}")]
     TooManyTransactions(usize),
-    /// A `Register` targets an already-registered domain.
+    /// A `RegisterDomain` targets an already-registered domain.
     #[error("domain already registered")]
     DomainAlreadyRegistered,
-    /// An `Update` targets an unregistered domain.
+    /// A `RegisterTld` targets an already-registered TLD.
+    #[error("TLD already registered")]
+    TldAlreadyRegistered,
+    /// An `UpdateDomain` targets an unregistered domain.
     #[error("unknown domain")]
     UnknownDomain,
-    /// An `Update` is not signed by the current domain owner.
+    /// An `UpdateDomain` is not signed by the current domain owner.
     #[error("transaction owner is not the domain owner")]
     NotOwner,
-    /// An `Update` sequence is not exactly `current + 1`.
+    /// An `UpdateDomain` sequence is not exactly `current + 1`.
     #[error("invalid sequence: expected {expected}, got {got}")]
     InvalidSequence {
         /// Sequence the transaction should carry.

@@ -30,6 +30,7 @@ impl_fixed_id!(DomainId);
 impl_fixed_id!(OwnerId);
 impl_fixed_id!(PublicKeyRef);
 impl_fixed_id!(RecordHash);
+impl_fixed_id!(scone_core::TldId);
 
 // Domain names: varint length + canonical UTF-8 bytes, re-validated by
 // `scone-core` on decode (no duplicated naming rules).

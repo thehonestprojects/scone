@@ -80,7 +80,7 @@ pub fn tx_root(transactions: &[Transaction]) -> Result<MerkleRoot> {
 mod tests {
     use super::*;
     use crate::txid::TX_ID_VERSION;
-    use scone_core::{DomainId, DomainName, RecordHash, Register, Update};
+    use scone_core::{DomainId, DomainName, RecordHash, RegisterDomain, UpdateDomain};
     use scone_crypto::{Signature, SigningKey};
 
     fn txid(byte: u8) -> TxId {
@@ -91,18 +91,19 @@ mod tests {
         SigningKey::from_bytes([1u8; 32])
     }
 
-    fn register_tx(name: &str) -> scone_core::Transaction {
+    fn register_domain_tx(name: &str) -> scone_core::Transaction {
         let sk = key();
-        let unsigned = scone_core::Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).unwrap()),
-            1,
-            scone_core::Proof::from_bytes(Vec::new()),
-            sk.public_key(),
-            Signature::from_bytes([0; 64]),
-        ));
+        let unsigned =
+            scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
+                1,
+                scone_core::Proof::from_bytes(Vec::new()),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
-        scone_core::Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).unwrap()),
+        scone_core::Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).unwrap(),
             1,
             scone_core::Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -110,9 +111,9 @@ mod tests {
         ))
     }
 
-    fn update_tx(name: &str, sequence: u64) -> scone_core::Transaction {
+    fn update_domain_tx(name: &str, sequence: u64) -> scone_core::Transaction {
         let sk = key();
-        let unsigned = scone_core::Transaction::Update(Update::update_signed(
+        let unsigned = scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             DomainId::from_name(&DomainName::new(name).unwrap()),
             sequence,
             RecordHash::from_bytes([sequence as u8; 32]),
@@ -120,7 +121,7 @@ mod tests {
             Signature::from_bytes([0; 64]),
         ));
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
-        scone_core::Transaction::Update(Update::update_signed(
+        scone_core::Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             DomainId::from_name(&DomainName::new(name).unwrap()),
             sequence,
             RecordHash::from_bytes([sequence as u8; 32]),
@@ -219,7 +220,10 @@ mod tests {
 
     #[test]
     fn tx_root_over_transactions_matches_txids_root() {
-        let txs = [register_tx("example.uip"), update_tx("example.uip", 1)];
+        let txs = [
+            register_domain_tx("example.uip"),
+            update_domain_tx("example.uip", 1),
+        ];
         let ids: Vec<TxId> = txs
             .iter()
             .map(transaction_id)
@@ -235,8 +239,8 @@ mod tests {
 
     #[test]
     fn tx_root_order_matters() {
-        let ab = tx_root(&[register_tx("a.uip"), register_tx("b.uip")]).unwrap();
-        let ba = tx_root(&[register_tx("b.uip"), register_tx("a.uip")]).unwrap();
+        let ab = tx_root(&[register_domain_tx("a.uip"), register_domain_tx("b.uip")]).unwrap();
+        let ba = tx_root(&[register_domain_tx("b.uip"), register_domain_tx("a.uip")]).unwrap();
         assert_ne!(ab, ba);
     }
 
@@ -244,7 +248,7 @@ mod tests {
     fn tx_root_invalid_transaction_is_an_error() {
         // sequence = 0 violates a core invariant: encoding must fail,
         // not panic.
-        assert!(tx_root(&[update_tx("example.uip", 0)]).is_err());
+        assert!(tx_root(&[update_domain_tx("example.uip", 0)]).is_err());
     }
 
     #[test]

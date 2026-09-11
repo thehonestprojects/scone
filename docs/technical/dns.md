@@ -137,7 +137,7 @@ DHT (le relay reste l'unique autorité de vérification).
   troncature TC=1 d'un set trop grand, rejet d'une réponse amont
   (TXID ou question ne matchant pas), non-cache de SERVFAIL/REFUSED.
 - Intégration réelle (`tests/dns_server.rs`) : un relay complet
-  (production devnet incluse) + enregistrement + Update + PutRecord,
+  (production devnet incluse) + enregistrement + UpdateDomain + PutRecord,
   puis requêtes UDP réelles : A vérifié (bit AA), TXT, NODATA AAAA,
   NXDOMAIN, fallback via mock, re-quête, sous-nom via apex.
 - E2E binaire (`crates/scone/tests/dns_cli.rs`) : le binaire

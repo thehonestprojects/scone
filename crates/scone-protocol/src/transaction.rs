@@ -1,17 +1,16 @@
-//! Wire encoding of blockchain transactions (format v2 — signed).
+//! Wire encoding of blockchain transactions (signed format).
 //!
 //! ```text
-//! Transaction = disc u8 || version u8 (0x02) || payload
-//!   0x01 Register
-//!   0x02 Update
+//! Transaction = disc u8 || version u8 (0x01) || payload
+//!   0x01 RegisterDomain
+//!   0x02 UpdateDomain
+//!   0x03 RegisterTld
 //! ```
 //!
-//! The `version` byte after the discriminator is new in format v2: a
-//! v1 stream (no version byte) is detected and rejected explicitly
-//! with [`ProtocolError::UnsupportedVersion(1)`]. Old-format bytes are
-//! never parsed as v2 by accident: after `0x01`/`0x02`, the old format
-//! continued with the first byte of `domain_id`, whereas v2 requires
-//! exactly `0x02`.
+//! The `version` byte after the discriminator must be exactly
+//! `0x01`: any other value is rejected with
+//! [`ProtocolError::UnsupportedVersion`] (generic invalid-version
+//! rule).
 //!
 //! Every transaction embeds the signer's Ed25519 public key (32 raw
 //! bytes) and signature (exactly 64 raw bytes — no length prefix, no
@@ -21,7 +20,10 @@
 //! prefix followed by the canonical encoding of the transaction
 //! **without** the signature. See `/docs/technical/transactions.md` (normative).
 
-use scone_core::{DomainId, OwnerId, Proof, RecordHash, Register, Transaction, Update};
+use scone_core::{
+    DomainId, DomainName, OwnerId, Proof, RecordHash, RegisterDomain, RegisterTld, Transaction,
+    UpdateDomain,
+};
 use scone_crypto::{PublicKey, Signature};
 
 use crate::codec::{self, Decode, Encode};
@@ -29,15 +31,24 @@ use crate::error::{ProtocolError, Result};
 use crate::varint;
 
 /// Transaction wire discriminants.
+///
+/// Allocation rule (normative, see `/docs/technical/transactions.md`):
+/// each discriminant is a **fixed, arbitrary, opaque value** — chosen
+/// distinct on purpose so the wire never suggests a logical order
+/// between types. `0x00` is never a valid type (typical corruption
+/// byte). Future types take any unused value, documented once and for
+/// all in the normative table.
 pub mod tx_type {
     /// Claims ownership of a domain.
-    pub const REGISTER: u8 = 0x01;
+    pub const REGISTER_DOMAIN: u8 = 0x21;
     /// Publishes a new version of a domain's DNS data.
-    pub const UPDATE: u8 = 0x02;
+    pub const UPDATE_DOMAIN: u8 = 0x52;
+    /// Claims ownership of a top-level domain (M7b).
+    pub const REGISTER_TLD: u8 = 0x93;
 }
 
-/// Version byte of the signed transaction format (v2).
-pub const TX_FORMAT_VERSION: u8 = 0x02;
+/// Version byte of the signed transaction format.
+pub const TX_FORMAT_VERSION: u8 = 0x01;
 
 /// Domain-separation prefix of the transaction signing payload.
 pub const TX_SIG_PREFIX: &[u8] = b"SCONE-TX-SIG-V1";
@@ -96,14 +107,18 @@ impl Decode for Signature {
     }
 }
 
-// Register = domain_id[32] || owner[32] || timestamp.v || proof
-//          || public_key[32] || signature[64]
+// RegisterDomain = name(str ≤ 253) || domain_id[32] || owner[32]
+//          || timestamp.v || proof || public_key[32] || signature[64]
+//
+// The canonical name is carried in clear (M7b): the chain is
+// self-describing and decode re-checks domain_id == from_name(name).
 
-impl Encode for Register {
+impl Encode for RegisterDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
-        // Binding owner/pk vérifié aussi à l'encodage (symétrie avec Update,
-        // docs/transactions.md § Dérivation de l'owner — doc normative).
+        // Binding owner/pk and name/id vérifié aussi à l'encodage
+        // (symétrie avec UpdateDomain, docs/transactions.md — doc normative).
         self.validate()?;
+        self.name.encode(out)?;
         self.domain_id.encode(out)?;
         self.owner.encode(out)?;
         varint::put_u64(self.timestamp, out);
@@ -113,9 +128,10 @@ impl Encode for Register {
     }
 }
 
-impl Decode for Register {
+impl Decode for RegisterDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let register = Self {
+            name: DomainName::decode(input)?,
             domain_id: DomainId::decode(input)?,
             owner: OwnerId::decode(input)?,
             timestamp: u64::decode(input)?,
@@ -128,10 +144,40 @@ impl Decode for Register {
     }
 }
 
-// Update = domain_id[32] || owner[32] || sequence.v || record_hash[32]
+// RegisterTld = tld_id[32] || owner[32] || timestamp.v || proof
+//            || public_key[32] || signature[64]
+
+impl Encode for RegisterTld {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate().map_err(ProtocolError::Validation)?;
+        self.tld_id.encode(out)?;
+        self.owner.encode(out)?;
+        varint::put_u64(self.timestamp, out);
+        self.proof.encode(out)?;
+        self.public_key.encode(out)?;
+        self.signature.encode(out)
+    }
+}
+
+impl Decode for RegisterTld {
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let register_tld = Self {
+            tld_id: scone_core::TldId::decode(input)?,
+            owner: OwnerId::decode(input)?,
+            timestamp: u64::decode(input)?,
+            proof: Proof::decode(input)?,
+            public_key: PublicKey::decode(input)?,
+            signature: Signature::decode(input)?,
+        };
+        register_tld.validate().map_err(ProtocolError::Validation)?;
+        Ok(register_tld)
+    }
+}
+
+// UpdateDomain = domain_id[32] || owner[32] || sequence.v || record_hash[32]
 //        || public_key[32] || signature[64]
 
-impl Encode for Update {
+impl Encode for UpdateDomain {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate().map_err(ProtocolError::Validation)?;
         self.domain_id.encode(out)?;
@@ -143,7 +189,7 @@ impl Encode for Update {
     }
 }
 
-impl Decode for Update {
+impl Decode for UpdateDomain {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let update = Self {
             domain_id: DomainId::decode(input)?,
@@ -161,13 +207,18 @@ impl Decode for Update {
 impl Encode for Transaction {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
-            Self::Register(tx) => {
-                out.push(tx_type::REGISTER);
+            Self::RegisterDomain(tx) => {
+                out.push(tx_type::REGISTER_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
                 tx.encode(out)
             }
-            Self::Update(tx) => {
-                out.push(tx_type::UPDATE);
+            Self::UpdateDomain(tx) => {
+                out.push(tx_type::UPDATE_DOMAIN);
+                out.push(TX_FORMAT_VERSION);
+                tx.encode(out)
+            }
+            Self::RegisterTld(tx) => {
+                out.push(tx_type::REGISTER_TLD);
                 out.push(TX_FORMAT_VERSION);
                 tx.encode(out)
             }
@@ -180,15 +231,12 @@ impl Decode for Transaction {
         let disc = codec::take_u8(input)?;
         let version = codec::take_u8(input)?;
         if version != TX_FORMAT_VERSION {
-            // A v1 stream has no version byte: after the discriminator
-            // it continues with `domain_id[0]`, which is never 0x02 for
-            // a valid v1 DomainId derivation — but even the crafted
-            // corner case lands on this same explicit error.
             return Err(ProtocolError::UnsupportedVersion(u64::from(version)));
         }
         Ok(match disc {
-            tx_type::REGISTER => Self::Register(Register::decode(input)?),
-            tx_type::UPDATE => Self::Update(Update::decode(input)?),
+            tx_type::REGISTER_DOMAIN => Self::RegisterDomain(RegisterDomain::decode(input)?),
+            tx_type::UPDATE_DOMAIN => Self::UpdateDomain(UpdateDomain::decode(input)?),
+            tx_type::REGISTER_TLD => Self::RegisterTld(RegisterTld::decode(input)?),
             value => {
                 return Err(ProtocolError::UnknownDiscriminant {
                     kind: "transaction",
@@ -203,9 +251,11 @@ impl Decode for Transaction {
 /// payload.
 #[derive(Debug, Clone)]
 pub enum UnsignedTransaction {
-    /// See [`scone_core::Register`].
-    Register {
-        /// Claimed domain.
+    /// See [`scone_core::RegisterDomain`].
+    RegisterDomain {
+        /// Claimed domain, canonical name.
+        name: DomainName,
+        /// Derived identity of `name`.
         domain_id: DomainId,
         /// Derived owner identity.
         owner: OwnerId,
@@ -216,8 +266,8 @@ pub enum UnsignedTransaction {
         /// Signer public key.
         public_key: PublicKey,
     },
-    /// See [`scone_core::Update`].
-    Update {
+    /// See [`scone_core::UpdateDomain`].
+    UpdateDomain {
         /// Target domain.
         domain_id: DomainId,
         /// Derived owner identity.
@@ -229,23 +279,44 @@ pub enum UnsignedTransaction {
         /// Signer public key.
         public_key: PublicKey,
     },
+    /// See [`scone_core::RegisterTld`].
+    RegisterTld {
+        /// Claimed TLD (namespace id).
+        tld_id: scone_core::TldId,
+        /// Derived owner identity.
+        owner: OwnerId,
+        /// Ordering information.
+        timestamp: u64,
+        /// Registration proof (opaque).
+        proof: Proof,
+        /// Signer public key.
+        public_key: PublicKey,
+    },
 }
 
 impl From<&Transaction> for UnsignedTransaction {
     fn from(tx: &Transaction) -> Self {
         match tx {
-            Transaction::Register(tx) => Self::Register {
+            Transaction::RegisterDomain(tx) => Self::RegisterDomain {
+                name: tx.name.clone(),
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 timestamp: tx.timestamp,
                 proof: tx.proof.clone(),
                 public_key: tx.public_key,
             },
-            Transaction::Update(tx) => Self::Update {
+            Transaction::UpdateDomain(tx) => Self::UpdateDomain {
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 sequence: tx.sequence,
                 record_hash: tx.record_hash,
+                public_key: tx.public_key,
+            },
+            Transaction::RegisterTld(tx) => Self::RegisterTld {
+                tld_id: tx.tld_id,
+                owner: tx.owner,
+                timestamp: tx.timestamp,
+                proof: tx.proof.clone(),
                 public_key: tx.public_key,
             },
         }
@@ -255,34 +326,51 @@ impl From<&Transaction> for UnsignedTransaction {
 impl Encode for UnsignedTransaction {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
-            Self::Register {
+            Self::RegisterDomain {
+                name,
                 domain_id,
                 owner,
                 timestamp,
                 proof,
                 public_key,
             } => {
-                out.push(tx_type::REGISTER);
+                out.push(tx_type::REGISTER_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
+                name.encode(out)?;
                 domain_id.encode(out)?;
                 owner.encode(out)?;
                 varint::put_u64(*timestamp, out);
                 proof.encode(out)?;
                 public_key.encode(out)
             }
-            Self::Update {
+            Self::UpdateDomain {
                 domain_id,
                 owner,
                 sequence,
                 record_hash,
                 public_key,
             } => {
-                out.push(tx_type::UPDATE);
+                out.push(tx_type::UPDATE_DOMAIN);
                 out.push(TX_FORMAT_VERSION);
                 domain_id.encode(out)?;
                 owner.encode(out)?;
                 varint::put_u64(*sequence, out);
                 record_hash.encode(out)?;
+                public_key.encode(out)
+            }
+            Self::RegisterTld {
+                tld_id,
+                owner,
+                timestamp,
+                proof,
+                public_key,
+            } => {
+                out.push(tx_type::REGISTER_TLD);
+                out.push(TX_FORMAT_VERSION);
+                tld_id.encode(out)?;
+                owner.encode(out)?;
+                varint::put_u64(*timestamp, out);
+                proof.encode(out)?;
                 public_key.encode(out)
             }
         }
@@ -297,18 +385,26 @@ impl Decode for UnsignedTransaction {
             return Err(ProtocolError::UnsupportedVersion(u64::from(version)));
         }
         Ok(match disc {
-            tx_type::REGISTER => Self::Register {
+            tx_type::REGISTER_DOMAIN => Self::RegisterDomain {
+                name: DomainName::decode(input)?,
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 timestamp: u64::decode(input)?,
                 proof: Proof::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
-            tx_type::UPDATE => Self::Update {
+            tx_type::UPDATE_DOMAIN => Self::UpdateDomain {
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 sequence: u64::decode(input)?,
                 record_hash: RecordHash::decode(input)?,
+                public_key: PublicKey::decode(input)?,
+            },
+            tx_type::REGISTER_TLD => Self::RegisterTld {
+                tld_id: scone_core::TldId::decode(input)?,
+                owner: OwnerId::decode(input)?,
+                timestamp: u64::decode(input)?,
+                proof: Proof::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             value => {
@@ -348,29 +444,37 @@ mod tests {
     use super::*;
     use crate::codec::{decode_complete, encode_to_vec};
     use crate::limits;
-    use scone_core::DomainName;
+    use scone_core::{DomainName, TldId, TldName};
     use scone_crypto::SigningKey;
 
     fn domain_id() -> DomainId {
         DomainId::from_name(&DomainName::new("example.uip").unwrap())
     }
 
+    fn name() -> DomainName {
+        DomainName::new("example.uip").unwrap()
+    }
+
+    fn tld_id() -> TldId {
+        TldId::from_tld(&TldName::new("uip").unwrap())
+    }
+
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes([seed; 32])
     }
 
-    fn signed_register() -> Register {
+    fn signed_register_domain() -> RegisterDomain {
         let sk = key(1);
-        let unsigned = Transaction::Register(Register::register_signed(
-            domain_id(),
+        let unsigned = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            name(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         ));
         let payload = signing_payload(&unsigned).unwrap();
-        Register::register_signed(
-            domain_id(),
+        RegisterDomain::register_domain_signed(
+            name(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -378,9 +482,9 @@ mod tests {
         )
     }
 
-    fn signed_update() -> Update {
+    fn signed_update_domain() -> UpdateDomain {
         let sk = key(1);
-        let unsigned = Transaction::Update(Update::update_signed(
+        let unsigned = Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             domain_id(),
             1,
             RecordHash::from_bytes([9; 32]),
@@ -388,10 +492,29 @@ mod tests {
             Signature::from_bytes([0; 64]),
         ));
         let payload = signing_payload(&unsigned).unwrap();
-        Update::update_signed(
+        UpdateDomain::update_domain_signed(
             domain_id(),
             1,
             RecordHash::from_bytes([9; 32]),
+            sk.public_key(),
+            sk.sign(&payload),
+        )
+    }
+
+    fn signed_register_tld() -> RegisterTld {
+        let sk = key(1);
+        let unsigned = Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            tld_id(),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = signing_payload(&unsigned).unwrap();
+        RegisterTld::register_tld_signed(
+            tld_id(),
+            1_700_000_000,
+            Proof::from_bytes(Vec::new()),
             sk.public_key(),
             sk.sign(&payload),
         )
@@ -399,37 +522,52 @@ mod tests {
 
     #[test]
     fn register_roundtrip_and_layout() {
-        let bytes = encode_to_vec(&Transaction::Register(signed_register())).unwrap();
-        assert_eq!(bytes[0], tx_type::REGISTER);
+        let bytes = encode_to_vec(&Transaction::RegisterDomain(signed_register_domain())).unwrap();
+        assert_eq!(bytes[0], tx_type::REGISTER_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
-        // disc + version + domain_id + owner + timestamp (5-byte varint)
-        // + empty proof (1) + pk + signature.
-        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 5 + 1 + 32 + 64);
+        // disc + version + name (1 + 11) + domain_id + owner
+        // + timestamp (5-byte varint) + empty proof (1) + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 1 + 11 + 32 + 32 + 5 + 1 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
-            Transaction::Register(signed_register())
+            Transaction::RegisterDomain(signed_register_domain())
         );
     }
 
     #[test]
     fn update_roundtrip_and_layout() {
-        let bytes = encode_to_vec(&Transaction::Update(signed_update())).unwrap();
-        assert_eq!(bytes[0], tx_type::UPDATE);
+        let bytes = encode_to_vec(&Transaction::UpdateDomain(signed_update_domain())).unwrap();
+        assert_eq!(bytes[0], tx_type::UPDATE_DOMAIN);
         assert_eq!(bytes[1], TX_FORMAT_VERSION);
         // disc + version + domain_id + owner + sequence (1) + record_hash
         // + pk + signature.
         assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 1 + 32 + 32 + 64);
         assert_eq!(
             decode_complete::<Transaction>(&bytes).unwrap(),
-            Transaction::Update(signed_update())
+            Transaction::UpdateDomain(signed_update_domain())
+        );
+    }
+
+    #[test]
+    fn register_tld_roundtrip_and_layout() {
+        let bytes = encode_to_vec(&Transaction::RegisterTld(signed_register_tld())).unwrap();
+        assert_eq!(bytes[0], tx_type::REGISTER_TLD);
+        assert_eq!(bytes[1], TX_FORMAT_VERSION);
+        // disc + version + tld_id + owner + timestamp (5-byte varint)
+        // + empty proof (1) + pk + signature.
+        assert_eq!(bytes.len(), 1 + 1 + 32 + 32 + 5 + 1 + 32 + 64);
+        assert_eq!(
+            decode_complete::<Transaction>(&bytes).unwrap(),
+            Transaction::RegisterTld(signed_register_tld())
         );
     }
 
     #[test]
     fn encoding_is_deterministic() {
         for tx in [
-            Transaction::Register(signed_register()),
-            Transaction::Update(signed_update()),
+            Transaction::RegisterDomain(signed_register_domain()),
+            Transaction::UpdateDomain(signed_update_domain()),
+            Transaction::RegisterTld(signed_register_tld()),
         ] {
             assert_eq!(encode_to_vec(&tx).unwrap(), encode_to_vec(&tx).unwrap());
         }
@@ -438,33 +576,55 @@ mod tests {
     #[test]
     fn signing_payload_excludes_the_signature() {
         let sk = key(1);
-        let unsigned = Transaction::Register(Register::register_signed(
-            domain_id(),
+        let unsigned = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            name(),
             42,
             Proof::from_bytes(vec![0xaa; 4]),
             sk.public_key(),
             Signature::from_bytes([0; 64]),
         ));
         let payload = signing_payload(&unsigned).unwrap();
-        // prefix + disc + version + domain + owner + timestamp + proof
-        // + pk; no signature bytes.
+        // prefix + disc + version + name + domain + owner + timestamp
+        // + proof + pk; no signature bytes.
         assert_eq!(
             payload.len(),
-            TX_SIG_PREFIX.len() + 1 + 1 + 32 + 32 + 1 + 1 + 4 + 32
+            TX_SIG_PREFIX.len() + 1 + 1 + 1 + 11 + 32 + 32 + 1 + 1 + 4 + 32
         );
         assert!(payload.starts_with(TX_SIG_PREFIX));
         // Changing the signature never changes the payload…
         let mut resigned = unsigned.clone();
         let sig = key(2).sign(&payload);
-        if let Transaction::Register(tx) = &mut resigned {
+        if let Transaction::RegisterDomain(tx) = &mut resigned {
             tx.signature = sig;
         }
         assert_eq!(signing_payload(&resigned).unwrap(), payload);
-        // …but changing any signed field does.
-        if let Transaction::Register(tx) = &mut resigned {
+        // …but changing any signed field does — including the name.
+        if let Transaction::RegisterDomain(tx) = &mut resigned {
             tx.timestamp += 1;
         }
         assert_ne!(signing_payload(&resigned).unwrap(), payload);
+    }
+
+    #[test]
+    fn register_signing_payload_covers_the_name() {
+        // Two Registers differing only by name produce different
+        // signing payloads (and thus different signatures).
+        let sk = key(1);
+        let a = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            name(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let b = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new("other.uip").unwrap(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        assert_ne!(signing_payload(&a).unwrap(), signing_payload(&b).unwrap());
     }
 
     #[test]
@@ -472,7 +632,7 @@ mod tests {
         // End-to-end contract: sign(signing_payload(tx)) verifies
         // against the embedded key, tampering the payload fails.
         let sk = key(3);
-        let unsigned = Transaction::Update(Update::update_signed(
+        let unsigned = Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             domain_id(),
             1,
             RecordHash::from_bytes([7; 32]),
@@ -489,10 +649,29 @@ mod tests {
     }
 
     #[test]
+    fn register_tld_signing_payload_is_what_verifies() {
+        let sk = key(4);
+        let unsigned = Transaction::RegisterTld(RegisterTld::register_tld_signed(
+            tld_id(),
+            1,
+            Proof::from_bytes(Vec::new()),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = signing_payload(&unsigned).unwrap();
+        let sig = sk.sign(&payload);
+        assert!(sk.public_key().verify(&payload, &sig));
+        let mut tampered = payload.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(!sk.public_key().verify(&tampered, &sig));
+    }
+
+    #[test]
     fn u64_max_register_timestamp_roundtrip() {
         let sk = key(1);
-        let tx = Register::register_signed(
-            domain_id(),
+        let tx = RegisterDomain::register_domain_signed(
+            name(),
             u64::MAX,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -500,17 +679,17 @@ mod tests {
         );
         assert_eq!(
             decode_complete::<Transaction>(
-                &encode_to_vec(&Transaction::Register(tx.clone())).unwrap()
+                &encode_to_vec(&Transaction::RegisterDomain(tx.clone())).unwrap()
             )
             .unwrap(),
-            Transaction::Register(tx)
+            Transaction::RegisterDomain(tx)
         );
     }
 
     #[test]
     fn u64_max_sequence_roundtrip() {
         let sk = key(1);
-        let tx = Update::update_signed(
+        let tx = UpdateDomain::update_domain_signed(
             domain_id(),
             u64::MAX,
             RecordHash::from_bytes([9; 32]),
@@ -519,31 +698,21 @@ mod tests {
         );
         assert_eq!(
             decode_complete::<Transaction>(
-                &encode_to_vec(&Transaction::Update(tx.clone())).unwrap()
+                &encode_to_vec(&Transaction::UpdateDomain(tx.clone())).unwrap()
             )
             .unwrap(),
-            Transaction::Update(tx)
+            Transaction::UpdateDomain(tx)
         );
     }
 
     #[test]
-    fn v1_format_is_rejected_explicitly() {
-        // Old-format Register: disc + domain_id + owner + timestamp +
-        // proof, NO version byte and no key/signature.
-        let mut old = Vec::new();
-        old.push(tx_type::REGISTER);
-        domain_id().encode(&mut old).unwrap();
-        OwnerId::from_bytes([1; 32]).encode(&mut old).unwrap();
-        varint::put_u64(1_700_000_000, &mut old);
-        varint::put_u64(0, &mut old); // empty proof
-        assert!(matches!(
-            decode_complete::<Transaction>(&old),
-            Err(ProtocolError::UnsupportedVersion(v)) if v != u64::from(TX_FORMAT_VERSION)
-        ));
-        // Any version byte other than 0x02 is an explicit version error.
-        for bad in [0x00u8, 0x01, 0x03, 0xff] {
-            let mut bytes = vec![tx_type::REGISTER, bad];
-            bytes.extend_from_slice(&old[1..]);
+    fn wrong_version_byte_is_rejected_explicitly() {
+        // Any version byte other than 0x01 is an explicit version
+        // error (generic invalid-version rule).
+        let mut valid = encode_to_vec(&Transaction::UpdateDomain(signed_update_domain())).unwrap();
+        for bad in [0x00u8, 0x02, 0x03, 0xff] {
+            let mut bytes = valid.clone();
+            bytes[1] = bad;
             assert!(
                 matches!(
                     decode_complete::<Transaction>(&bytes),
@@ -552,11 +721,12 @@ mod tests {
                 "version byte {bad:#04x}"
             );
         }
+        valid.clear();
     }
 
     #[test]
     fn unknown_discriminant_rejected() {
-        for disc in [0x00u8, 0x03, 0xff] {
+        for disc in [0x00u8, 0x04, 0xff] {
             assert!(matches!(
                 decode_complete::<Transaction>(&[disc, TX_FORMAT_VERSION]),
                 Err(ProtocolError::UnknownDiscriminant {
@@ -570,7 +740,7 @@ mod tests {
     #[test]
     fn zero_sequence_rejected_on_encode_and_decode() {
         let sk = key(1);
-        let raw = Update {
+        let raw = UpdateDomain {
             domain_id: domain_id(),
             owner: test_support::owner_of(&sk.public_key()),
             sequence: 0,
@@ -578,10 +748,10 @@ mod tests {
             public_key: sk.public_key(),
             signature: sk.sign(&[0]),
         };
-        assert!(encode_to_vec(&Transaction::Update(raw.clone())).is_err());
+        assert!(encode_to_vec(&Transaction::UpdateDomain(raw.clone())).is_err());
 
         let mut bytes = Vec::new();
-        bytes.push(tx_type::UPDATE);
+        bytes.push(tx_type::UPDATE_DOMAIN);
         bytes.push(TX_FORMAT_VERSION);
         raw.domain_id.encode(&mut bytes).unwrap();
         raw.owner.encode(&mut bytes).unwrap();
@@ -597,12 +767,34 @@ mod tests {
         // owner field not derived from the embedded key: rejected.
         let sk = key(1);
         let mut bytes = Vec::new();
-        bytes.push(tx_type::REGISTER);
+        bytes.push(tx_type::REGISTER_DOMAIN);
         bytes.push(TX_FORMAT_VERSION);
+        name().encode(&mut bytes).unwrap();
         domain_id().encode(&mut bytes).unwrap();
         OwnerId::from_bytes([0xab; 32]).encode(&mut bytes).unwrap(); // forged
         varint::put_u64(1, &mut bytes);
         varint::put_u64(0, &mut bytes); // empty proof
+        sk.public_key().encode(&mut bytes).unwrap();
+        Signature::from_bytes([0; 64]).encode(&mut bytes).unwrap();
+        assert!(decode_complete::<Transaction>(&bytes).is_err());
+    }
+
+    #[test]
+    fn register_name_id_mismatch_rejected_on_decode() {
+        // domain_id not derived from the carried name: rejected.
+        let sk = key(1);
+        let mut bytes = Vec::new();
+        bytes.push(tx_type::REGISTER_DOMAIN);
+        bytes.push(TX_FORMAT_VERSION);
+        name().encode(&mut bytes).unwrap();
+        DomainId::from_name(&DomainName::new("other.uip").unwrap())
+            .encode(&mut bytes)
+            .unwrap(); // forged id
+        test_support::owner_of(&sk.public_key())
+            .encode(&mut bytes)
+            .unwrap();
+        varint::put_u64(1, &mut bytes);
+        varint::put_u64(0, &mut bytes);
         sk.public_key().encode(&mut bytes).unwrap();
         Signature::from_bytes([0; 64]).encode(&mut bytes).unwrap();
         assert!(decode_complete::<Transaction>(&bytes).is_err());
@@ -614,8 +806,9 @@ mod tests {
         let mut not_on_curve = [0u8; 32];
         not_on_curve[0] = 0x02;
         let mut bytes = Vec::new();
-        bytes.push(tx_type::REGISTER);
+        bytes.push(tx_type::REGISTER_DOMAIN);
         bytes.push(TX_FORMAT_VERSION);
+        name().encode(&mut bytes).unwrap();
         domain_id().encode(&mut bytes).unwrap();
         OwnerId::from_bytes([0; 32]).encode(&mut bytes).unwrap();
         varint::put_u64(1, &mut bytes);
@@ -630,35 +823,71 @@ mod tests {
 
     #[test]
     fn proof_boundaries() {
-        let mut tx = signed_register();
+        let mut tx = signed_register_domain();
         tx.proof = Proof::from_bytes(vec![0xaa; limits::MAX_PROOF_LEN]);
-        assert!(encode_to_vec(&Transaction::Register(tx.clone())).is_ok());
+        assert!(encode_to_vec(&Transaction::RegisterDomain(tx.clone())).is_ok());
 
         tx.proof = Proof::from_bytes(vec![0xaa; limits::MAX_PROOF_LEN + 1]);
         assert!(matches!(
-            encode_to_vec(&Transaction::Register(tx)),
+            encode_to_vec(&Transaction::RegisterDomain(tx)),
             Err(ProtocolError::LimitExceeded("proof length"))
         ));
     }
 
     #[test]
     fn truncated_transaction_rejected() {
-        let bytes = encode_to_vec(&Transaction::Update(signed_update())).unwrap();
-        for end in 0..bytes.len() {
-            assert!(decode_complete::<Transaction>(&bytes[..end]).is_err());
+        for tx in [
+            Transaction::UpdateDomain(signed_update_domain()),
+            Transaction::RegisterTld(signed_register_tld()),
+        ] {
+            let bytes = encode_to_vec(&tx).unwrap();
+            for end in 0..bytes.len() {
+                assert!(decode_complete::<Transaction>(&bytes[..end]).is_err());
+            }
         }
     }
 
     #[test]
     fn corrupted_transaction_never_panics() {
-        let bytes = encode_to_vec(&Transaction::Update(signed_update())).unwrap();
-        for i in 0..bytes.len() {
-            for mask in [0x01u8, 0x80, 0xff] {
-                let mut corrupted = bytes.clone();
-                corrupted[i] ^= mask;
-                let _ = decode_complete::<Transaction>(&corrupted);
+        for tx in [
+            Transaction::UpdateDomain(signed_update_domain()),
+            Transaction::RegisterTld(signed_register_tld()),
+        ] {
+            let bytes = encode_to_vec(&tx).unwrap();
+            for i in 0..bytes.len() {
+                for mask in [0x01u8, 0x80, 0xff] {
+                    let mut corrupted = bytes.clone();
+                    corrupted[i] ^= mask;
+                    let _ = decode_complete::<Transaction>(&corrupted);
+                }
             }
         }
+    }
+
+    // --- Pinned wire fixtures (regenerated at M7b; any change to the
+    // format breaks these instead of silently renumbering) ---
+
+    #[test]
+    fn register_tld_pinned_wire_prefix() {
+        // Deterministic prefix of the canonical encoding of a
+        // RegisterTld("uip", ts=1, empty proof, seed-1 key): disc,
+        // version, tld_id.
+        let bytes = encode_to_vec(&Transaction::RegisterTld(signed_register_tld())).unwrap();
+        // Arbitrary opaque discriminants (docs/technical/transactions.md).
+        assert_eq!(bytes[0], 0x93);
+        assert_eq!(bytes[1], 0x01);
+        // TldId("uip") — pinned derivation vector (docs/general/naming.md).
+        assert_eq!(
+            &bytes[2..34],
+            hex("ad5a86d68643d5c22d6a959bb1a315530c77dfda241f1ac1a8107450f3fab25e")
+        );
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }
 

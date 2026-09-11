@@ -48,13 +48,17 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
     block
         .transactions
         .iter()
+        // A RegisterTld never touches a domain state (separate
+        // registry, M7b).
         .filter(|tx| match tx {
-            Transaction::Register(r) => seen.insert(r.domain_id),
-            Transaction::Update(u) => seen.insert(u.domain_id),
+            Transaction::RegisterDomain(r) => seen.insert(r.domain_id),
+            Transaction::UpdateDomain(u) => seen.insert(u.domain_id),
+            Transaction::RegisterTld(_) => false,
         })
-        .map(|tx| match tx {
-            Transaction::Register(r) => &r.domain_id,
-            Transaction::Update(u) => &u.domain_id,
+        .filter_map(|tx| match tx {
+            Transaction::RegisterDomain(r) => Some(&r.domain_id),
+            Transaction::UpdateDomain(u) => Some(&u.domain_id),
+            Transaction::RegisterTld(_) => None,
         })
         .collect()
 }
@@ -208,29 +212,32 @@ pub fn load_chain_replay(store: &impl NodeStore) -> Result<Blockchain> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scone_core::{DomainName, Proof, RecordHash, Register, Update};
+    use scone_core::{DomainName, Proof, RecordHash, RegisterDomain, UpdateDomain};
     use scone_crypto::{Signature, SigningKey};
 
     /// Signs a transaction over its canonical signing payload.
     fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
-            Transaction::Register(mut r) => {
+            Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                Transaction::Register(r)
+                Transaction::RegisterDomain(r)
             }
-            Transaction::Update(mut u) => {
+            Transaction::UpdateDomain(mut u) => {
                 u.signature = sk.sign(&payload);
-                Transaction::Update(u)
+                Transaction::UpdateDomain(u)
+            }
+            Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RegisterTld(t)
             }
         }
     }
 
-    fn signed_register(sk: &SigningKey, name: &str) -> Transaction {
-        let domain = DomainId::from_name(&DomainName::new(name).unwrap());
+    fn signed_register_domain(sk: &SigningKey, name: &str) -> Transaction {
         sign(
-            Transaction::Register(Register::register_signed(
-                domain,
+            Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
                 1,
                 Proof::from_bytes(Vec::new()),
                 sk.public_key(),
@@ -240,10 +247,10 @@ mod tests {
         )
     }
 
-    fn signed_update(sk: &SigningKey, name: &str, sequence: u64) -> Transaction {
+    fn signed_update_domain(sk: &SigningKey, name: &str, sequence: u64) -> Transaction {
         let domain = DomainId::from_name(&DomainName::new(name).unwrap());
         sign(
-            Transaction::Update(Update::update_signed(
+            Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
                 domain,
                 sequence,
                 RecordHash::from_bytes([sequence as u8; 32]),
@@ -262,9 +269,15 @@ mod tests {
             .unwrap();
         block.transactions.clear();
         // Two transactions on a.uip, one on b.uip.
-        block.transactions.push(signed_register(&sk, "a.uip"));
-        block.transactions.push(signed_update(&sk, "a.uip", 1));
-        block.transactions.push(signed_register(&sk, "b.uip"));
+        block
+            .transactions
+            .push(signed_register_domain(&sk, "a.uip"));
+        block
+            .transactions
+            .push(signed_update_domain(&sk, "a.uip", 1));
+        block
+            .transactions
+            .push(signed_register_domain(&sk, "b.uip"));
         let a = DomainId::from_name(&DomainName::new("a.uip").unwrap());
         let b = DomainId::from_name(&DomainName::new("b.uip").unwrap());
         assert_eq!(touched_domains(&block), vec![&a, &b]);

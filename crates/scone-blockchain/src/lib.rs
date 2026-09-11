@@ -31,7 +31,7 @@
 //! Identity chain (see `/docs/technical/blockchain.md`):
 //!
 //! ```text
-//! DomainId -> Register/Update -> Transaction -> TxId -> MerkleRoot
+//! DomainId -> RegisterDomain/UpdateDomain -> Transaction -> TxId -> MerkleRoot
 //!          -> BlockHeader -> BlockHash -> prev_hash -> chain
 //! ```
 //!

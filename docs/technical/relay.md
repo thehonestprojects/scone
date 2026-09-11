@@ -91,7 +91,7 @@ borné : jamais plus d'un bloc en vol par pair.
 1. décodage strict borné (`MAX_MESSAGE_LEN`) ;
 2. validation cryptographique complète (`validate_transaction` :
    binding owner/clé, `verify_strict` sur le payload canonique) ;
-3. pré-contrôle d'état : `Register` → nom libre ; `Update` → domaine
+3. pré-contrôle d'état : `RegisterDomain` → nom libre ; `UpdateDomain` → domaine
    connu, séquence exacte `current + 1`, propriétaire ;
 4. insertion au mempool (capacité fixe, dédup par `TxId` —
    re-soumettre une tx déjà en pool est un no-op) ;
@@ -254,7 +254,7 @@ Ces commandes enchaînent build → sign (keystore) → submit →
 (confirmation) en une seule invocation ; elles suppriment le
 pipe-shell `tx build | tx sign | submit tx` du devnet M4.
 
-- **register** : construit une `Register` signée (timestamp = now,
+- **register** : construit une `RegisterDomain` signée (timestamp = now,
   proof vide en devnet), la soumet, attend la confirmation on-chain
   (séquence ≥ 0, timeout 30 s). Un nom déjà enregistré est refusé
   côté client ET côté relay.
@@ -262,7 +262,7 @@ pipe-shell `tx build | tx sign | submit tx` du devnet M4.
   La séquence (on-chain + 1) et le `record_hash` (BLAKE3 canonique
   des records du fichier) sont **dérivés**, jamais saisis : signataire
   et vérificateurs ne peuvent pas diverger. Après confirmation de
-  l'Update, le `SignedDnsRecord` (records du fichier + owner +
+  l'UpdateDomain, le `SignedDnsRecord` (records du fichier + owner +
   signature Ed25519 sur l'encodage canonique) est publié dans la
   DHT via `put_record` (qui revérifie contre la chaîne). Un domaine
   non enregistré, une identité non-propriétaire ou une erreur de

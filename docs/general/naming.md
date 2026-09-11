@@ -106,8 +106,11 @@ TldId = BLAKE3-256("SCONE-TLD-V1" || tld)
   `TldId("uip") = ad5a86d68643d5c22d6a959bb1a315530c77dfda241f1ac1a8107450f3fab25e`.
 
 La transaction `RegisterTld` (claim signée d'un TLD, `owner` toujours
-recomputé de la clé embarquée) est définie dans `scone-core` ; le
-format wire et l'enum `Transaction` suivent en M7b.
+recomputé de la clé embarquée) fait partie de l'enum `Transaction` et
+du format wire depuis M7b : discriminant `0x93` (constante opaque
+arbitraire), payload signé `SCONE-TX-SIG-V1`, règles complètes dans
+`/docs/technical/transactions.md`. Le `RegisterDomain` d'un domaine
+porte parallèlement le nom canonique en clair.
 
 ## Réservation/gouvernance des TLDs
 

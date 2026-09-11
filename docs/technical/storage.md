@@ -90,10 +90,10 @@ tag = 0x02 : record_hash absent  → 41 octets exactement
 ```
 
 - `owner` : `OwnerId` (32 o) ;
-- `sequence` : dernière séquence `Update` appliquée (0 juste après
-  un `Register`) ;
+- `sequence` : dernière séquence `UpdateDomain` appliquée (0 juste après
+  un `RegisterDomain`) ;
 - `record_hash` : engagement on-chain courant du jeu d'enregistrements
-  DNS (`None` tant qu'aucun `Update` n'a été appliqué).
+  DNS (`None` tant qu'aucun `UpdateDomain` n'a été appliqué).
 
 Décodage **strict** (`DomainStateBytes::decode`) : tag inconnu,
 longueur erronée ou octets en excès → `StorageError::Corrupted`,
@@ -110,7 +110,7 @@ redb :
 2. le bloc dans `blocks_by_hash` ;
 3. chaque delta d'état de domaine (`domains`) ;
 4. le compteur `domain_count` (incrémenté du nombre de domaines
-   **nouveaux** seulement ; un `Update` d'un domaine existant ne
+   **nouveaux** seulement ; un `UpdateDomain` d'un domaine existant ne
    l'incrémente pas) ;
 5. `tip` et `tip_height`.
 

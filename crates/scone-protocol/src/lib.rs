@@ -61,8 +61,5 @@ pub use transaction::{TX_FORMAT_VERSION, TX_SIG_PREFIX, UnsignedTransaction, sig
 ///
 /// - a version received that is **greater** than the local one (or zero)
 ///   is rejected with [`ProtocolError::UnsupportedVersion`];
-/// - version **1** is the pre-signature transaction format (milestone
-///   M1): transactions are rejected explicitly (see
-///   [`transaction`]), blocks are rejected on their header version;
 /// - there is no major/minor split yet: one integer, bumped on break.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 1;

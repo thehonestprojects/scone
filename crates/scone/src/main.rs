@@ -450,7 +450,7 @@ mod tests {
         let built = run(cli(&[
             "tx",
             "build",
-            "register",
+            "register-domain",
             "--name",
             "example.uip",
             "--timestamp",
@@ -526,7 +526,7 @@ mod tests {
         let err = run(cli(&[
             "tx",
             "build",
-            "update",
+            "update-domain",
             "--name",
             "example.uip",
             "--sequence",

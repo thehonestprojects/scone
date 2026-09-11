@@ -111,7 +111,9 @@ impl BlockBuilder {
 mod tests {
     use super::*;
     use crate::genesis::genesis_hash;
-    use scone_core::{DomainId, DomainName, Proof, RecordHash, Register, Transaction, Update};
+    use scone_core::{
+        DomainId, DomainName, Proof, RecordHash, RegisterDomain, Transaction, UpdateDomain,
+    };
     use scone_crypto::{Signature, SigningKey};
 
     fn domain_id() -> DomainId {
@@ -119,11 +121,10 @@ mod tests {
     }
 
     /// Signs a register over the canonical payload (test helper).
-    fn signed_register(sk: &SigningKey, name: &str) -> Transaction {
-        let domain = DomainId::from_name(&DomainName::new(name).unwrap());
+    fn signed_register_domain(sk: &SigningKey, name: &str) -> Transaction {
         sign(
-            Transaction::Register(Register::register_signed(
-                domain,
+            Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
                 1,
                 Proof::from_bytes(Vec::new()),
                 sk.public_key(),
@@ -133,9 +134,9 @@ mod tests {
         )
     }
 
-    fn signed_update(sk: &SigningKey, sequence: u64) -> Transaction {
+    fn signed_update_domain(sk: &SigningKey, sequence: u64) -> Transaction {
         sign(
-            Transaction::Update(Update::update_signed(
+            Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
                 domain_id(),
                 sequence,
                 RecordHash::from_bytes([sequence as u8; 32]),
@@ -151,13 +152,17 @@ mod tests {
     fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
-            Transaction::Register(mut r) => {
+            Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                Transaction::Register(r)
+                Transaction::RegisterDomain(r)
             }
-            Transaction::Update(mut u) => {
+            Transaction::UpdateDomain(mut u) => {
                 u.signature = sk.sign(&payload);
-                Transaction::Update(u)
+                Transaction::UpdateDomain(u)
+            }
+            Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RegisterTld(t)
             }
         }
     }
@@ -167,7 +172,7 @@ mod tests {
         let sk = SigningKey::from_bytes([1; 32]);
         let mut builder = BlockBuilder::after(0, genesis_hash()).with_timestamp(1_700_000_000);
         builder
-            .push_tx(signed_register(&sk, "example.uip"))
+            .push_tx(signed_register_domain(&sk, "example.uip"))
             .unwrap();
         let block = builder.build().unwrap();
 
@@ -192,14 +197,15 @@ mod tests {
 
         let b1 = {
             let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
-            b.push_tx(signed_register(&sk, "example.uip")).unwrap();
+            b.push_tx(signed_register_domain(&sk, "example.uip"))
+                .unwrap();
             b.build().unwrap()
         };
         chain.push_block(&b1).unwrap();
 
         let b2 = {
             let mut b = BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(20);
-            b.push_tx(signed_update(&sk, 1)).unwrap();
+            b.push_tx(signed_update_domain(&sk, 1)).unwrap();
             b.build().unwrap()
         };
         chain.push_block(&b2).unwrap();
@@ -218,15 +224,16 @@ mod tests {
             let b1 = {
                 let mut b =
                     BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(10);
-                b.push_tx(signed_register(&sk, "example.uip")).unwrap();
+                b.push_tx(signed_register_domain(&sk, "example.uip"))
+                    .unwrap();
                 b.build().unwrap()
             };
             chain.push_block(&b1).unwrap();
             let b2 = {
                 let mut b =
                     BlockBuilder::after(chain.height(), chain.tip_hash()).with_timestamp(20);
-                b.push_tx(signed_update(&sk, 1)).unwrap();
-                b.push_tx(signed_update(&sk, 2)).unwrap();
+                b.push_tx(signed_update_domain(&sk, 1)).unwrap();
+                b.push_tx(signed_update_domain(&sk, 2)).unwrap();
                 b.build().unwrap()
             };
             chain.push_block(&b2).unwrap();
@@ -245,11 +252,11 @@ mod tests {
         let sk = SigningKey::from_bytes([1; 32]);
         for i in 0..MAX_TXS_PER_BLOCK {
             builder
-                .push_tx(signed_register(&sk, &format!("d{i}.uip")))
+                .push_tx(signed_register_domain(&sk, &format!("d{i}.uip")))
                 .unwrap();
         }
         assert_eq!(
-            builder.push_tx(signed_register(&sk, "overflow.uip")),
+            builder.push_tx(signed_register_domain(&sk, "overflow.uip")),
             Err(BlockchainError::TooManyTransactions(MAX_TXS_PER_BLOCK + 1))
         );
         assert_eq!(builder.len(), MAX_TXS_PER_BLOCK);

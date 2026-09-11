@@ -125,7 +125,7 @@ pub trait NodeStore {
     /// On I/O errors or corrupted metadata.
     fn tip(&self) -> Result<(u64, [u8; 32])>;
 
-    /// Persists the state of one domain ( Register/Update replay,
+    /// Persists the state of one domain ( RegisterDomain/UpdateDomain replay,
     /// repair tools). Prefer [`NodeStore::append_block_with_state`] on
     /// the block path.
     ///

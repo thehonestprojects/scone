@@ -24,4 +24,4 @@ pub use id::{DomainId, TldId};
 pub use name::{DomainName, TldName};
 pub use owner::{OwnerId, PublicKeyRef};
 pub use record::{DnsRecord, RecordData, Signature, SignedDnsRecord};
-pub use transaction::{Proof, RecordHash, Register, RegisterTld, Transaction, Update};
+pub use transaction::{Proof, RecordHash, RegisterDomain, RegisterTld, Transaction, UpdateDomain};

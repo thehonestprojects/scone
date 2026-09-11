@@ -44,10 +44,10 @@ fn build_block(
     sk: &scone_crypto::SigningKey,
     name: &str,
 ) -> (scone_protocol::Block, scone_protocol::BlockHash) {
-    use scone_core::{Proof, Register, Transaction};
+    use scone_core::{Proof, RegisterDomain, Transaction};
     let tx = {
-        let unsigned = Transaction::Register(Register::register_signed(
-            domain_id(name),
+        let unsigned = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            scone_core::DomainName::new(name).unwrap(),
             1,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -55,13 +55,17 @@ fn build_block(
         ));
         let payload = scone_protocol::signing_payload(&unsigned).unwrap();
         match unsigned {
-            Transaction::Register(mut r) => {
+            Transaction::RegisterDomain(mut r) => {
                 r.signature = sk.sign(&payload);
-                Transaction::Register(r)
+                Transaction::RegisterDomain(r)
             }
-            Transaction::Update(mut u) => {
+            Transaction::UpdateDomain(mut u) => {
                 u.signature = sk.sign(&payload);
-                Transaction::Update(u)
+                Transaction::UpdateDomain(u)
+            }
+            Transaction::RegisterTld(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::RegisterTld(t)
             }
         }
     };
@@ -227,10 +231,10 @@ fn stored_domain_states_match_replayed_state() {
         let sk = scone_crypto::SigningKey::from_bytes([4; 32]);
         let (b1, h1) = build_block(&mut chain, &sk, "a.uip");
         store_block(&mut store, &chain, &b1, h1).unwrap();
-        // Update a.uip in block 2 (delta on an existing domain).
+        // UpdateDomain a.uip in block 2 (delta on an existing domain).
         let tx = {
-            use scone_core::{Transaction, Update};
-            let unsigned = Transaction::Update(Update::update_signed(
+            use scone_core::{Transaction, UpdateDomain};
+            let unsigned = Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
                 domain_id("a.uip"),
                 1,
                 RecordHash::from_bytes([0x44; 32]),
@@ -239,13 +243,17 @@ fn stored_domain_states_match_replayed_state() {
             ));
             let payload = scone_protocol::signing_payload(&unsigned).unwrap();
             match unsigned {
-                Transaction::Register(mut r) => {
+                Transaction::RegisterDomain(mut r) => {
                     r.signature = sk.sign(&payload);
-                    Transaction::Register(r)
+                    Transaction::RegisterDomain(r)
                 }
-                Transaction::Update(mut u) => {
+                Transaction::UpdateDomain(mut u) => {
                     u.signature = sk.sign(&payload);
-                    Transaction::Update(u)
+                    Transaction::UpdateDomain(u)
+                }
+                Transaction::RegisterTld(mut t) => {
+                    t.signature = sk.sign(&payload);
+                    Transaction::RegisterTld(t)
                 }
             }
         };
@@ -423,7 +431,7 @@ fn domain_count_is_exact_across_insert_update_and_reopen() {
                 .unwrap();
         }
         assert_eq!(store.domain_count().unwrap(), 5);
-        // Update (re-put) does not inflate the counter.
+        // UpdateDomain (re-put) does not inflate the counter.
         store
             .put_domain_state(domain_id("c0.uip"), state_bytes(9))
             .unwrap();

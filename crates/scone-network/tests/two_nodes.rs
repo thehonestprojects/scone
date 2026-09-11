@@ -4,7 +4,7 @@
 //! Scenario (matches the M4 acceptance criteria):
 //!
 //! 1. A and B start at genesis; B bootstraps on A;
-//! 2. a `Register` tx is submitted to A via its control RPC;
+//! 2. a `RegisterDomain` tx is submitted to A via its control RPC;
 //! 3. A produces a devnet block; B syncs it (same tip hash + height);
 //! 4. the matching signed DNS record is published in the DHT at A
 //!    and resolved at B (verified against the chain).
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use scone_core::{
     DnsRecord, DomainId, DomainName, OwnerId, Proof, PublicKeyRef, RecordData, RecordHash,
-    Register, Transaction, Update,
+    RegisterDomain, Transaction, UpdateDomain,
 };
 use scone_crypto::{Signature, SigningKey};
 use scone_network::rpc::{RpcClient, RpcRequest, RpcResponse};
@@ -33,21 +33,25 @@ fn hex(bytes: &[u8]) -> String {
 fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     let payload = signing_payload(&unsigned).expect("signing payload");
     match unsigned {
-        Transaction::Register(mut r) => {
+        Transaction::RegisterDomain(mut r) => {
             r.signature = sk.sign(&payload);
-            Transaction::Register(r)
+            Transaction::RegisterDomain(r)
         }
-        Transaction::Update(mut u) => {
+        Transaction::UpdateDomain(mut u) => {
             u.signature = sk.sign(&payload);
-            Transaction::Update(u)
+            Transaction::UpdateDomain(u)
+        }
+        Transaction::RegisterTld(mut t) => {
+            t.signature = sk.sign(&payload);
+            Transaction::RegisterTld(t)
         }
     }
 }
 
-fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
+fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
-        Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).expect("valid name")),
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).expect("valid name"),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -57,9 +61,9 @@ fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
     )
 }
 
-fn update_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
+fn update_domain_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
     sign(
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             DomainId::from_name(&DomainName::new(name).expect("valid name")),
             sequence,
             RecordHash::from_bytes(hash),
@@ -146,10 +150,10 @@ async fn two_nodes_sync_blocks_and_records() {
     let status = status_of(&client_b, deadline).await;
     assert_eq!(status["height"], 0, "B starts at genesis: {status}");
 
-    // ---- submit a Register to A -------------------------------------
+    // ---- submit a RegisterDomain to A -------------------------------------
     let sk = SigningKey::from_bytes([7u8; 32]);
     let name = "example.uip";
-    let tx_hex = hex(&encode_to_vec(&register_tx(&sk, name)).expect("encode tx"));
+    let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode tx"));
     let response = request(
         &client_a,
         RpcRequest::SubmitTx {
@@ -187,11 +191,11 @@ async fn two_nodes_sync_blocks_and_records() {
     );
 
     // ---- publish the record at A, resolve it at B ---------------------
-    // First the chain must carry the record hash: an Update tx.
+    // First the chain must carry the record hash: an UpdateDomain tx.
     let record = signed_record(&sk, name, 1);
     let expected_hash = *scone_protocol::record_hash(&record.record).as_bytes();
     let update_hex =
-        hex(&encode_to_vec(&update_tx(&sk, name, 1, expected_hash)).expect("encode update"));
+        hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode update"));
     let response = request(
         &client_a,
         RpcRequest::SubmitTx { tx_hex: update_hex },
@@ -223,7 +227,7 @@ async fn two_nodes_sync_blocks_and_records() {
     assert_eq!(resolved_record, record, "round-tripped record");
 }
 
-/// M5 fix-up, F1 (crash prouvé) : deux `Register` concurrents pour le
+/// M5 fix-up, F1 (crash prouvé) : deux `RegisterDomain` concurrents pour le
 /// même nom — le second mis en mempool avant que le premier ne soit
 /// miné — ne doivent JAMAIS tuer le producteur. Avant le correctif,
 /// `push_block` rejetait le bloc entier (`DomainAlreadyRegistered`)
@@ -297,7 +301,7 @@ async fn concurrent_registers_never_kill_the_producer() {
 
 /// Signs an arbitrary register with the given key (race test).
 fn register_tx_sk(sk: &SigningKey, name: &str) -> Transaction {
-    register_tx(sk, name)
+    register_domain_tx(sk, name)
 }
 
 async fn request(

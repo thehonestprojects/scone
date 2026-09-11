@@ -74,7 +74,7 @@ doit pas contaminer le core. Résolution :
 
 **scone-core** — noms (`TldName`, `DomainName`), identifiants (`DomainId`,
 `OwnerId`, `PublicKeyRef`), données DNS (`DnsRecord`, `SignedDnsRecord`),
-transactions (`Register`, `Update`). Déterministe et portable. Interdits
+transactions (`RegisterDomain`, `UpdateDomain`). Déterministe et portable. Interdits
 dans ce crate : libp2p, redb, tokio/async, réseau, fichiers, OS, serveur
 DNS, logique blockchain.
 

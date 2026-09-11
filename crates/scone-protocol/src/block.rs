@@ -209,17 +209,17 @@ impl Decode for Block {
 mod tests {
     use super::*;
     use crate::codec::{decode_complete, encode_to_vec};
-    use scone_core::{DomainName, Proof, RecordHash, Register, Update};
+    use scone_core::{DomainName, Proof, RecordHash, RegisterDomain, UpdateDomain};
     use scone_crypto::SigningKey;
 
     fn signer() -> SigningKey {
         SigningKey::from_bytes([1u8; 32])
     }
 
-    fn register_tx() -> Transaction {
+    fn register_domain_tx() -> Transaction {
         let sk = signer();
-        Transaction::Register(Register::register_signed(
-            scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new("example.uip").unwrap(),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -227,9 +227,9 @@ mod tests {
         ))
     }
 
-    fn update_tx() -> Transaction {
+    fn update_domain_tx() -> Transaction {
         let sk = signer();
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             scone_core::DomainId::from_name(&DomainName::new("example.uip").unwrap()),
             1,
             RecordHash::from_bytes([9; 32]),
@@ -252,7 +252,7 @@ mod tests {
     fn block() -> Block {
         Block {
             header: header(),
-            transactions: vec![register_tx(), update_tx()],
+            transactions: vec![register_domain_tx(), update_domain_tx()],
         }
     }
 
@@ -269,8 +269,8 @@ mod tests {
         let block = block();
         let decoded = decode_complete::<Block>(&encode_to_vec(&block).unwrap()).unwrap();
         assert_eq!(decoded, block);
-        assert_eq!(decoded.transactions[0], register_tx());
-        assert_eq!(decoded.transactions[1], update_tx());
+        assert_eq!(decoded.transactions[0], register_domain_tx());
+        assert_eq!(decoded.transactions[1], update_domain_tx());
     }
 
     #[test]
@@ -302,25 +302,20 @@ mod tests {
         header.version = PROTOCOL_VERSION + 1;
         assert!(encode_to_vec(&header).is_err());
         assert!(matches!(
-            decode_complete::<BlockHeader>(&[0x03]),
-            Err(ProtocolError::UnsupportedVersion(3))
+            decode_complete::<BlockHeader>(&[0x02]),
+            Err(ProtocolError::UnsupportedVersion(2))
         ));
     }
 
     #[test]
-    fn v1_block_format_rejected_explicitly() {
-        // Format v1 (pre-signature transactions) must be rejected as a
-        // version error, not mis-parsed: `0x01` is a valid minimal
-        // varint on the wire.
-        assert!(matches!(
-            decode_complete::<BlockHeader>(&[0x01]),
-            Err(ProtocolError::UnsupportedVersion(1))
-        ));
+    fn below_current_version_rejected() {
+        // There is exactly one block format: version 1. A version
+        // below it (only 0) is a version error, never mis-parsed.
         let mut header = header();
-        header.version = 1;
+        header.version = 0;
         assert!(matches!(
             encode_to_vec(&header),
-            Err(ProtocolError::UnsupportedVersion(1))
+            Err(ProtocolError::UnsupportedVersion(0))
         ));
     }
 
@@ -386,7 +381,7 @@ mod tests {
     fn tx_count_limit_enforced() {
         // Encode side.
         let mut block = block();
-        block.transactions = vec![register_tx(); limits::MAX_TXS_PER_BLOCK + 1];
+        block.transactions = vec![register_domain_tx(); limits::MAX_TXS_PER_BLOCK + 1];
         assert!(matches!(
             encode_to_vec(&block),
             Err(ProtocolError::LimitExceeded("transaction count"))

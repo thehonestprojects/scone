@@ -7,7 +7,7 @@
 //!
 //! 1. relay starts with `dns_addr` on a dynamic localhost port
 //!    (fallback upstreams: a local mock, second phase);
-//! 2. `Register` + `Update` (record hash) txs are submitted through
+//! 2. `RegisterDomain` + `UpdateDomain` (record hash) txs are submitted through
 //!    the control RPC; the devnet producer mines them;
 //! 3. the signed record is published in the DHT (`PutRecord`);
 //! 4. a real UDP query `A example.uip` returns the chain-verified
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use scone_core::{
     DnsRecord, DomainId, DomainName, OwnerId, Proof, PublicKeyRef, RecordData, RecordHash,
-    Register, Transaction, Update,
+    RegisterDomain, Transaction, UpdateDomain,
 };
 use scone_crypto::{Signature, SigningKey};
 use scone_network::rpc::{RpcClient, RpcRequest, RpcResponse};
@@ -41,21 +41,25 @@ fn hex(bytes: &[u8]) -> String {
 fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
     let payload = signing_payload(&unsigned).expect("signing payload");
     match unsigned {
-        Transaction::Register(mut r) => {
+        Transaction::RegisterDomain(mut r) => {
             r.signature = sk.sign(&payload);
-            Transaction::Register(r)
+            Transaction::RegisterDomain(r)
         }
-        Transaction::Update(mut u) => {
+        Transaction::UpdateDomain(mut u) => {
             u.signature = sk.sign(&payload);
-            Transaction::Update(u)
+            Transaction::UpdateDomain(u)
+        }
+        Transaction::RegisterTld(mut t) => {
+            t.signature = sk.sign(&payload);
+            Transaction::RegisterTld(t)
         }
     }
 }
 
-fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
+fn register_domain_tx(sk: &SigningKey, name: &str) -> Transaction {
     sign(
-        Transaction::Register(Register::register_signed(
-            DomainId::from_name(&DomainName::new(name).expect("valid name")),
+        Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+            DomainName::new(name).expect("valid name"),
             1_700_000_000,
             Proof::from_bytes(Vec::new()),
             sk.public_key(),
@@ -65,9 +69,9 @@ fn register_tx(sk: &SigningKey, name: &str) -> Transaction {
     )
 }
 
-fn update_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
+fn update_domain_tx(sk: &SigningKey, name: &str, sequence: u64, hash: [u8; 32]) -> Transaction {
     sign(
-        Transaction::Update(Update::update_signed(
+        Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
             DomainId::from_name(&DomainName::new(name).expect("valid name")),
             sequence,
             RecordHash::from_bytes(hash),
@@ -276,14 +280,15 @@ async fn dns_server_serves_verified_records_over_udp() {
     // ---- register + commit a record hash ----------------------------
     let sk = SigningKey::from_bytes([9u8; 32]);
     let name = "example.uip";
-    let tx_hex = hex(&encode_to_vec(&register_tx(&sk, name)).expect("encode"));
+    let tx_hex = hex(&encode_to_vec(&register_domain_tx(&sk, name)).expect("encode"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
     wait_for_height(&client, 1, deadline).await;
 
     let record = signed_record(&sk, name, 1);
     let expected_hash = *scone_protocol::record_hash(&record.record).as_bytes();
-    let upd_hex = hex(&encode_to_vec(&update_tx(&sk, name, 1, expected_hash)).expect("encode"));
+    let upd_hex =
+        hex(&encode_to_vec(&update_domain_tx(&sk, name, 1, expected_hash)).expect("encode"));
     let resp = request(&client, RpcRequest::SubmitTx { tx_hex: upd_hex }, deadline).await;
     assert!(resp["txid"].is_string(), "{resp}");
     wait_for_height(&client, 2, deadline).await;

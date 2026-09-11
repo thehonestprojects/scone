@@ -9,19 +9,16 @@ Les éléments marqués **(provisoire)** ne sont pas figés.
 
 ## Version du protocole
 
-- constante : `PROTOCOL_VERSION: u32 = 2` (`scone-protocol`) ;
+- constante : `PROTOCOL_VERSION: u32 = 1` (`scone-protocol`) ;
 - transportée par `Hello.version` (handshake) et `BlockHeader.version` ;
 - règles de compatibilité :
   - version reçue **supérieure** à la version locale → rejet
     (`ProtocolError::UnsupportedVersion`) ; le nœud ne devine pas le
     format d'une version qu'il ne connaît pas ;
   - version `0` → invalide ;
-  - version **1** (transactions non signées, jalon M1) → rejet
-    **explicite** pour les transactions (octet de version du format
-    tx, voir `/docs/technical/transactions.md`) et pour les blocs
-    (`BlockHeader.version` doit être exactement la version locale) ;
-    le handshake `Hello` v1 reste accepté (un pair en retard sera
-    rejeté par les règles de format) ;
+  - il n'existe qu'un seul ensemble de formats : les octets de
+    version des transactions (`0x01`) et la version des blocs
+    doivent correspondre **exactement** aux valeurs locales ;
 - pas de découpage majeur/mineur à ce stade : un entier unique,
   incrémenté à toute rupture de format wire.
 
@@ -79,6 +76,7 @@ pour qu'une valeur n'ait qu'une seule séquence d'octets valide
 | Type | Représentation wire |
 |---|---|
 | `DomainId` | 32 octets nus |
+| `TldId` | 32 octets nus |
 | `OwnerId` | 32 octets nus |
 | `PublicKeyRef` | 32 octets nus |
 | `RecordHash` | 32 octets nus |
@@ -97,34 +95,53 @@ Transaction = disc u8 || version u8 || payload
 
 | Discriminant | Type |
 |---|---|
-| `0x01` | `Register` |
-| `0x02` | `Update` |
+| `0x21` | `RegisterDomain` |
+| `0x52` | `UpdateDomain` |
+| `0x93` | `RegisterTld` |
 
-L'octet `version` (valeur courante `0x02`) suit le discriminant : un
-flux v1 (sans cet octet) est rejeté explicitement
-(`UnsupportedVersion(1)`). **Toutes les transactions sont signées**
-(Ed25519) : spécification complète, payload signé et règles de
-validation dans **`/docs/technical/transactions.md`** (normatif).
+Chaque discriminant est une constante opaque arbitraire (pas de suite
+logique ; `0x00` jamais valide) — table normative complète dans
+`/docs/technical/transactions.md`.
 
-### REGISTER (0x01)
+L'octet `version` (valeur courante `0x01`) suit le discriminant :
+toute autre valeur est rejetée explicitement
+(`UnsupportedVersion(valeur)`). **Toutes les transactions sont
+signées** (Ed25519) : spécification complète, payload signé et règles
+de validation dans **`/docs/technical/transactions.md`** (normatif).
+
+### REGISTER_DOMAIN (0x21)
 
 ```text
-domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+name(str ≤ 253) domain_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
 ```
 
-`proof` est opaque : réservé au futur PoW de registration.
-`public_key` est la clé Ed25519 du signataire (32 octets exactement) ;
-`owner` doit être la dérivation BLAKE3 de cette clé (recomputé,
-jamais cru) ; `signature` fait exactement 64 octets.
+Le `RegisterDomain` porte le **nom canonique en clair**, suivi de
+son `DomainId` — la cohérence `domain_id == DomainId(name)` est
+re-vérifiée au décodage (recomputée, jamais crue). `proof` est
+opaque : réservé au futur PoW de registration. `public_key` est la
+clé Ed25519 du signataire (32 octets exactement) ; `owner` doit être
+la dérivation BLAKE3 de cette clé (recomputé, jamais cru) ;
+`signature` fait exactement 64 octets.
 
-### UPDATE (0x02)
+### REGISTER_TLD (0x93)
+
+```text
+tld_id[32] owner[32] timestamp.v proof(bytes ≤ 256) public_key[32] signature[64]
+```
+
+Claim d'un TLD (registre séparé de celui des domaines, M7) : le
+`tld_id` est la dérivation `SCONE-TLD-V1` du TLD claimé, disjointe de
+tout `DomainId` par construction. Règle d'état : le TLD doit être
+libre.
+
+### UPDATE_DOMAIN (0x52)
 
 ```text
 domain_id[32] owner[32] sequence.v record_hash[32] public_key[32] signature[64]
 ```
 
 Invariant re-vérifié au décodage : `sequence > 0` et `owner` ==
-dérivation de `public_key`. Pas de `timestamp` en v2 : l'ordre passe
+dérivation de `public_key`. Pas de `timestamp` : l'ordre passe
 par `sequence`. La transaction ne porte que des références
 compactes — le contenu DNS complet reste dans la DHT (voir
 ci-dessous).
@@ -325,8 +342,8 @@ Le décodage ne panique jamais sur des données réseau.
 - schéma : **Ed25519** (RFC 8032) via `scone-crypto`
   (`ed25519-dalek`, vérification `verify_strict` — signatures
   malléables et clés faibles rejetées) ;
-- **transactions de la chaîne** (format v2) : chaque `Register` /
-  `Update` embarque `public_key` (32 o) + `signature` (64 o) sur le
+- **transactions de la chaîne** : chaque `RegisterDomain` / `RegisterTld` /
+  `UpdateDomain` embarque `public_key` (32 o) + `signature` (64 o) sur le
   payload `"SCONE-TX-SIG-V1" || canonical_encode(tx_sans_signature)` ;
   spécification normative complète : `/docs/technical/transactions.md` ;
 - **records DHT** (`SignedDnsRecord`) : le payload signé est
