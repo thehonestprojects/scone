@@ -964,6 +964,21 @@ mod tests {
     }
 
     #[test]
+    fn icann_tld_claim_is_rejected_typed() {
+        // The ICANN root belongs to the legacy DNS: a claim on com,
+        // fr, org… is refused at the state layer, whatever the PoW.
+        let mut chain = Blockchain::new();
+        assert!(matches!(
+            chain.push_block(&child(&chain, vec![register_tld_tx("com", 1)])),
+            Err(BlockchainError::IcannTldReserved(t)) if t == "com"
+        ));
+        // And an unknown-but-free TLD still works (uip is the usual
+        // fixture TLD — not in the ICANN list).
+        claim_open_uip(&mut chain, 1);
+        assert!(chain.state().tld(&tld_id_of("uip")).is_some());
+    }
+
+    #[test]
     fn wrong_height_rejected() {
         let mut chain = Blockchain::new();
         for bad_height in [0u64, 2, 3, u64::MAX] {

@@ -577,6 +577,16 @@ impl ChainState {
                 if self.tlds.contains_key(&register_tld.tld_id) {
                     return Err(BlockchainError::TldAlreadyRegistered);
                 }
+                // ICANN root TLDs are claimable by NO ONE on Scone:
+                // they belong to the legacy DNS (resolution forwards
+                // them upstream / REFUSED — see dns.rs). A claim
+                // would silently shadow the real zone for every
+                // relay user.
+                if scone_core::icann_tlds::is_icann_tld(register_tld.name.as_str()) {
+                    return Err(BlockchainError::IcannTldReserved(
+                        register_tld.name.as_str().to_owned(),
+                    ));
+                }
                 // PoW over the TLD derivation input, recomputed from
                 // the carried name.
                 let mut challenge =
@@ -1148,10 +1158,10 @@ mod tests {
     fn distinct_tlds_do_not_interfere() {
         let mut state = ChainState::new();
         state.apply(&register_tld("uip", 1)).unwrap();
-        state.apply(&register_tld("com", 2)).unwrap();
+        state.apply(&register_tld("zap", 2)).unwrap();
         assert_eq!(state.tld_len(), 2);
         assert_eq!(state.tld(&tld_id("uip")).unwrap().owner, owner(1));
-        assert_eq!(state.tld(&tld_id("com")).unwrap().owner, owner(2));
+        assert_eq!(state.tld(&tld_id("zap")).unwrap().owner, owner(2));
     }
 
     #[test]
@@ -1243,8 +1253,8 @@ mod tests {
     #[test]
     fn another_registered_tld_does_not_help() {
         let mut state = ChainState::new();
-        state.apply(&register_tld("com", 1)).unwrap();
-        state.apply(&set_open("com", 1, true)).unwrap();
+        state.apply(&register_tld("zap", 1)).unwrap();
+        state.apply(&set_open("zap", 1, true)).unwrap();
         assert_eq!(
             state.apply(&register("example.uip", 1)),
             Err(BlockchainError::UnknownTld)
@@ -1659,10 +1669,10 @@ mod tests {
             .unwrap();
         assert_smt_invariant(&state);
         // TLD transfer + revoke on another namespace.
-        state.apply(&register_tld("com", 4)).unwrap();
+        state.apply(&register_tld("zap", 4)).unwrap();
         assert_smt_invariant(&state);
         let transfer = Transaction::TransferTld(scone_core::TransferTld::transfer_tld_signed(
-            tld_id("com"),
+            tld_id("zap"),
             owner(5),
             key(4).public_key(),
             Signature::from_bytes([0; 64]),
@@ -1670,7 +1680,7 @@ mod tests {
         state.apply(&transfer).unwrap();
         assert_smt_invariant(&state);
         let assign = Transaction::AssignDomain(scone_core::AssignDomain::assign_domain_signed(
-            DomainName::new("vip.com").unwrap(),
+            DomainName::new("vip.zap").unwrap(),
             owner(5),
             key(5).public_key(),
             Signature::from_bytes([0; 64]),
@@ -1678,7 +1688,7 @@ mod tests {
         state.apply(&assign).unwrap();
         assert_smt_invariant(&state);
         let revoke = Transaction::RevokeTld(scone_core::RevokeTld::revoke_tld_signed(
-            tld_id("com"),
+            tld_id("zap"),
             key(5).public_key(),
             Signature::from_bytes([0; 64]),
         ));
@@ -1740,9 +1750,9 @@ mod tests {
         let mut right = ChainState::new();
         for state in [&mut left, &mut right] {
             state.apply(&register_tld("uip", 1)).unwrap();
-            state.apply(&register_tld("com", 4)).unwrap();
+            state.apply(&register_tld("zap", 4)).unwrap();
             state.apply(&set_open("uip", 1, true)).unwrap();
-            state.apply(&set_open("com", 4, true)).unwrap();
+            state.apply(&set_open("zap", 4, true)).unwrap();
         }
         // left: a, b, upd a, upd b — right: b, a, upd b, upd a.
         left.apply(&register("a.uip", 2)).unwrap();

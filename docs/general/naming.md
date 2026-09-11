@@ -121,3 +121,11 @@ est complète : claim avec PoW (difficulté par réseau), namespace
 (`SetTldOpen`), transfert (`TransferTld`), abandon (`RevokeTld`,
 re-claimable). Les domaines expirent après 1 an (renouvelables,
 grâce 30 j — voir `/docs/technical/blockchain.md`).
+
+**TLD de la racine ICANN** : réservés. `RegisterTld` sur un TLD de la
+liste figée IANA (`is_icann_tld`, ~1 440 entrées + RFC 2606) est
+rejeté typé (`IcannTldReserved`) — la racine legacy appartient au
+DNS existant. À la résolution, ces noms sont forwardés vers les
+upstreams configurés (`--dns-upstream`) ou REFUSED sans upstream.
+Les TLD ajoutés par l'ICANN plus tard restent claimables (liste
+figée : cohérence > fraîcheur).

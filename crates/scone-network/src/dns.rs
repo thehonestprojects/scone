@@ -437,6 +437,11 @@ fn scone_candidate(name: &str) -> bool {
                 && tld
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                // ICANN root TLDs belong to the legacy DNS: never
+                // resolved authoritatively by Scone. With upstreams
+                // configured the query is forwarded there; without
+                // upstreams it falls through to REFUSED.
+                && !scone_core::icann_tlds::is_icann_tld(tld)
         })
 }
 
@@ -1113,11 +1118,23 @@ mod tests {
             u16::from(RCODE_REFUSED),
             "REFUSED without fallback"
         );
-        // Contrast: `example.com` IS a valid Scone name shape → the
-        // chain is authoritative → NXDOMAIN even without upstream.
+        // Contrast 1: an ICANN TLD (`example.com`) is NEVER a Scone
+        // name anymore (M-icann): without upstream → REFUSED, the
+        // legacy root owns it.
         let resp = handle_packet(
             &resolver,
             &query(5, false, "example.com", TYPE_A),
+            &[],
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&resp), 5, "ICANN TLD → REFUSED (legacy root)");
+        // Contrast 2: a non-ICANN, Scone-shaped name → the chain is
+        // authoritative → NXDOMAIN even without upstream.
+        let resp = handle_packet(
+            &resolver,
+            &query(6, false, "example.uip", TYPE_A),
             &[],
             &mut cache,
         )

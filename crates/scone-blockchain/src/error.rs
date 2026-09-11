@@ -135,6 +135,10 @@ pub enum BlockchainError {
     /// allowed-producer set (M5 of the .bak port).
     #[error("invalid block producer: {0}")]
     InvalidProducer(String),
+    /// The TLD belongs to the ICANN root: claimable by no one on
+    /// Scone (resolution forwards it to the legacy DNS).
+    #[error("ICANN root TLD reserved: {0}")]
+    IcannTldReserved(String),
     /// The `owner` field of a transaction is not the identity derived
     /// from its embedded `public_key` (recomputed — never trusted).
     #[error("transaction owner does not match its public key")]

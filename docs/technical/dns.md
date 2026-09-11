@@ -64,11 +64,15 @@ Client de validation : `scone dig <name> --dns 127.0.0.1:5353
    chaque requête. Éviction FIFO à la capacité.
 2. **Forme Scone ?** Pré-filtre strict : labels `[a-z0-9-_]` (1..63),
    ≥ 2 labels, TLD 1..63 octets `[a-z0-9-]` (cf. `TldName::MAX_LEN`),
-   longueur totale ≤ 253.
+   longueur totale ≤ 253 — **et TLD hors de la racine ICANN**
+   (`is_icann_tld`, liste figée IANA + RFC 2606 : `com`, `fr`, `org`…
+   n'appartiennent jamais à Scone).
    Un nom qui ne peut PAS être un nom Scone (ex. `www.foo_bar`,
-   underscore dans le TLD) part au fallback ; un nom qui POURRAIT l'être
+   underscore dans le TLD) part au fallback ; un nom Scone-possible
    (`absent.uip`) relève de la chaîne : non enregistré → NXDOMAIN
-   autoritaire, même sans upstream.
+   autoritaire, même sans upstream. Un TLD ICANN (`example.com`) est
+   forwardé vers les upstreams si configurés, REFUSED sinon — jamais
+   résolu autoritairement par Scone.
 3. **Recherche d'apex** : suffixes du plus long au plus court (min.
    2 labels). Premier suffixe dont le relay connaît l'état on-chain
    = apex ; le record set sert le qname entier (sous-noms inclus —
