@@ -94,6 +94,7 @@ mod tests {
                 network_id: NetworkId::MAINNET,
                 tld_pow_difficulty: MAINNET.tld_pow_difficulty,
                 domain_pow_difficulty: MAINNET.domain_pow_difficulty,
+                consensus: MAINNET.consensus,
             })
         );
     }

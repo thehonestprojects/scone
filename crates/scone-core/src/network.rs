@@ -114,10 +114,15 @@ pub struct NetworkParams {
     /// Difficulty (leading zero bits) to register a domain under an
     /// open TLD.
     pub domain_pow_difficulty: u32,
+    /// PoS consensus parameters (committee, epochs, recovery) — the
+    /// block-production authority and checkpoint finality. Ported
+    /// from the .bak (M3 of the port).
+    pub consensus: crate::consensus_params::ConsensusParams,
 }
 
 /// Testnet parameters: symbolic difficulties (M8b).
 pub const TESTNET: NetworkParams = NetworkParams {
+    consensus: crate::consensus_params::ConsensusParams::TESTNET,
     network_id: NetworkId::TESTNET,
     tld_pow_difficulty: 8,
     domain_pow_difficulty: 4,
@@ -125,6 +130,7 @@ pub const TESTNET: NetworkParams = NetworkParams {
 
 /// Mainnet parameters: real difficulties (M8b).
 pub const MAINNET: NetworkParams = NetworkParams {
+    consensus: crate::consensus_params::ConsensusParams::PRODUCTION,
     network_id: NetworkId::MAINNET,
     tld_pow_difficulty: 24,
     domain_pow_difficulty: 20,

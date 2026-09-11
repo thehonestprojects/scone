@@ -13,6 +13,7 @@
 //! for hashing.
 
 pub mod checkpoint;
+pub mod consensus_params;
 pub mod error;
 pub mod icann_tlds;
 pub mod id;
@@ -30,6 +31,7 @@ pub use checkpoint::{
 pub use error::{Result, SconeError};
 pub use id::{DomainId, TldId};
 pub use name::{DomainName, TldName};
+pub use consensus_params::{ConsensusParams, MIN_FINALITY_COMMITTEE_SIZE, quorum_for};
 pub use network::{MAINNET, NetworkId, NetworkParams, TESTNET};
 pub use owner::{OwnerId, PublicKeyRef};
 pub use pow::{CheckedPow, check, encode_proof, leading_zero_bits, mine, verify};
