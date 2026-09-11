@@ -1,8 +1,8 @@
-//! UDP DNS server (milestone M6): authoritative for names the local
-//! chain state knows, optional recursive fallback (`addr:port`
-//! upstreams) for everything else. Built strictly on the existing
-//! verified path: the relay is the only resolver — this module never
-//! touches the chain, the store or the DHT itself.
+//! UDP + TCP DNS server (milestones M6 + M7b): authoritative for
+//! names the local chain state knows, optional recursive fallback
+//! (`addr:port` upstreams) for everything else. Built strictly on the
+//! existing verified path: the relay is the only resolver — this
+//! module never touches the chain, the store or the DHT itself.
 //!
 //! # Wire codec (RFC 1035 subset, strict)
 //!
@@ -15,10 +15,12 @@
 //! - Response: QR|RD(echo)|RA bits, AA **only** on chain-backed
 //!   (authoritative) answers, the question echoed verbatim, answers
 //!   with **uncompressed** owner names (the qname), TTL 60, bounded
-//!   by [`MAX_PACKET_LEN`]: an answer set that does not fit is cut
-//!   at the last fitting record with **TC=1** (honest truncation;
-//!   real resolvers retry over TCP which this devnet milestone does
-//!   not serve).
+//!   by the transport's payload limit: an answer set that does not
+//!   fit is cut at the last fitting record with **TC=1** (honest
+//!   truncation, RFC 1035 §4.2.1). On UDP the cut happens at the
+//!   512-o classic payload ([`UDP_PAYLOAD_LIMIT`], no EDNS) so the
+//!   client retries over TCP (RFC 7766), which serves the **full**
+//!   set up to [`MAX_TCP_RESPONSE`].
 //! - Anything unparseable is answered with **silence** (garbage must
 //!   cost nothing); `REFUSED` is returned for a QCLASS we refuse.
 //!
@@ -50,6 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scone_core::{DomainName, RecordData, TldName};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
@@ -73,6 +76,24 @@ const RCODE_REFUSED: u8 = 5;
 
 /// Hard cap on a DNS datagram (query or response).
 pub const MAX_PACKET_LEN: usize = 4096;
+/// Maximum DNS **query** accepted over TCP (RFC 7766 §6: a query
+/// fits the classic 512-o payload; we allow generous headroom for
+/// EDNS-style oversized queries from stub resolvers, bounded).
+pub const MAX_TCP_QUERY: usize = 512;
+/// Maximum DNS **response** served over TCP (2-byte length prefix
+/// caps a message at 65535; our answers are far smaller — records
+/// are ≤ 4096 B at decode — this is the hard ceiling).
+pub const MAX_TCP_RESPONSE: usize = 65_535;
+/// Maximum simultaneously in-flight TCP DNS connections (anti-flood
+/// bound; extra connections are shed, never queued).
+pub const MAX_TCP_CONNS: usize = 64;
+/// Read timeout for a TCP DNS message (header or body): a client
+/// that stalls is dropped, its connection slot freed.
+pub const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// UDP payload limit assumed when answering a client that did not
+/// signal EDNS (RFC 1035 §2.3.4 / RFC 7766 §9): larger answers are
+/// cut with TC=1 so the client retries over TCP.
+pub const UDP_PAYLOAD_LIMIT: usize = 512;
 /// TTL served on authoritative answers (devnet: short, chain-sequenced).
 pub const ANSWER_TTL: u32 = 60;
 /// Maximum TTL accepted on a cached fallback answer.
@@ -111,7 +132,10 @@ pub type Resolver = Arc<
 
 // ---- server -------------------------------------------------------------
 
-/// Runs the UDP DNS loop on an already-bound socket.
+/// Runs the UDP DNS loop on an already-bound socket. Responses are
+/// bounded by [`UDP_PAYLOAD_LIMIT`] (classic 512-o payload, no
+/// EDNS): an answer set that does not fit is cut with TC=1 — the
+/// standard retry-over-TCP signal (RFC 7766), served by [`run_tcp`].
 ///
 /// # Errors
 ///
@@ -141,8 +165,14 @@ pub async fn run_udp(
         let upstreams = upstreams.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            if let Some(resp) =
-                handle_packet(&resolver, &data, &upstreams, &mut *cache.lock().await).await
+            if let Some(resp) = handle_packet_transport(
+                &resolver,
+                &data,
+                &upstreams,
+                &mut *cache.lock().await,
+                UDP_PAYLOAD_LIMIT,
+            )
+            .await
                 && resp.len() <= MAX_PACKET_LEN
             {
                 let _ = socket.send_to(&resp, peer).await;
@@ -152,9 +182,102 @@ pub async fn run_udp(
     }
 }
 
+/// Runs the TCP DNS loop (RFC 7766) on an already-bound listener,
+/// same port as the UDP surface. Messages are prefixed with their
+/// 2-byte big-endian length (RFC 1035 §4.2.2). Bounds:
+///
+/// - at most [`MAX_TCP_CONNS`] concurrent connections (semaphore:
+///   a 65th connection is dropped immediately, never queued);
+/// - a query larger than [`MAX_TCP_QUERY`] closes the connection;
+/// - each read (length header or body) is capped at
+///   [`TCP_READ_TIMEOUT`] — a stalled client is dropped;
+/// - pipelining is served serially per connection (requests are
+///   answered in order), which is correct and bounded.
+///
+/// Errors (read/write/timeout) are logged at `debug` and close the
+/// connection cleanly — no panic on network input, ever.
+///
+/// # Errors
+///
+/// [`NetworkError::Io`] only on a fatal accept-loop failure.
+pub async fn run_tcp(
+    listener: tokio::net::TcpListener,
+    resolver: Resolver,
+    upstreams: Vec<SocketAddr>,
+    cache: Arc<tokio::sync::Mutex<Cache>>,
+) -> Result<()> {
+    let listen = listener.local_addr()?;
+    info!(%listen, upstreams = upstreams.len(), "dns: listening tcp");
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNS));
+    loop {
+        let (mut stream, peer) = listener.accept().await?;
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            // At capacity: shed now (drop closes the socket — the
+            // client's own timeout drives the retry). try_acquire:
+            // queueing permits would park accept-loop iterations and
+            // let backlog grow without bound.
+            warn!(%peer, "dns: tcp connection shed (at capacity)");
+            continue;
+        };
+        let resolver = resolver.clone();
+        let upstreams = upstreams.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            debug!(%peer, "dns: tcp connection");
+            loop {
+                // Length header (2 B), bounded read time. Clean EOF
+                // (0 byte) or stall (timeout) ends the conversation.
+                let mut hdr = [0u8; 2];
+                let len = match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut hdr))
+                    .await
+                {
+                    Ok(Ok(_)) => u16::from_be_bytes(hdr) as usize,
+                    Ok(Err(_)) => break, // reset / closed: done
+                    Err(_) => break,     // stalled: drop
+                };
+                if len == 0 || len > MAX_TCP_QUERY {
+                    // Zero-length or oversized: protocol violation,
+                    // close (RFC 7766 §6: the query limit is strict).
+                    debug!(%peer, len, "dns: tcp query out of bounds, closing");
+                    break;
+                }
+                let mut msg = vec![0u8; len];
+                let body =
+                    tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut msg)).await;
+                if !matches!(body, Ok(Ok(_))) {
+                    break; // short read, reset or stall: drop
+                }
+                if let Some(resp) = handle_packet_transport(
+                    &resolver,
+                    &msg,
+                    &upstreams,
+                    &mut *cache.lock().await,
+                    MAX_TCP_RESPONSE,
+                )
+                .await
+                {
+                    let mut out = (u16::try_from(resp.len()).unwrap_or(u16::MAX))
+                        .to_be_bytes()
+                        .to_vec();
+                    out.extend_from_slice(&resp);
+                    if stream.write_all(&out).await.is_err() {
+                        break;
+                    }
+                }
+                // else: garbage → silence → keep serving pipelined
+                // requests on this connection (closing on garbage
+                // would let a single bad byte kill a good session).
+            }
+            drop(permit); // free the connection slot
+        });
+    }
+}
+
 /// Handles one datagram: cache → authoritative → fallback. Returns
 /// `None` for garbage (silence). Pure-ish entry point (the cache is
-/// injected), fully covered by tests.
+/// injected), fully covered by tests. Payload budget =
+/// [`MAX_PACKET_LEN`] (maximal); transport-aware callers (the UDP
+/// loop's 512-o bound) use [`handle_packet_transport`].
 ///
 /// Honesty rules: the AA bit is set **only** on answers produced by
 /// the authoritative path (fresh or cached-authoritative); fallback
@@ -167,16 +290,31 @@ pub async fn handle_packet(
     upstreams: &[SocketAddr],
     cache: &mut Cache,
 ) -> Option<Vec<u8>> {
+    handle_packet_transport(resolver, data, upstreams, cache, MAX_PACKET_LEN).await
+}
+
+/// [`handle_packet`] with an explicit response payload budget: an
+/// answer set that does not fit is cut at the last record that does
+/// with TC=1 (the client retries over TCP per RFC 7766; the TCP loop
+/// calls this with [`MAX_TCP_RESPONSE`], so the full set fits there).
+pub async fn handle_packet_transport(
+    resolver: &Resolver,
+    data: &[u8],
+    upstreams: &[SocketAddr],
+    cache: &mut Cache,
+    budget: usize,
+) -> Option<Vec<u8>> {
     let q = parse_query(data)?;
     // Cache hit (positive or negative): AA follows the origin of the
     // cached entry, not the path that produced it.
     if let Some(entry) = cache.get(&q.name, q.qtype) {
-        return Some(build_response(
+        return Some(build_response_bounded(
             &q,
             data,
             &entry.answers,
             entry.rcode,
             entry.authoritative,
+            budget,
         ));
     }
     let (answers, rcode) = if scone_candidate(&q.name) {
@@ -188,26 +326,40 @@ pub async fn handle_packet(
             Some(resp) => {
                 // Validated upstream reply (TXID + question echo +
                 // connect-checked socket — see [`forward`]). Pass it
-                // through unchanged; cache its answers on the
-                // fallback path, but never an error rcode.
+                // through unchanged when it fits the transport's
+                // budget; cache its answers on the fallback path, but
+                // never an error rcode.
                 let up_rcode = resp.get(3).map_or(RCODE_NOERROR, |b| b & 0x0F);
-                if up_rcode == RCODE_NOERROR || up_rcode == RCODE_NXDOMAIN {
-                    if let Some(extracted) = extract_answers(&resp, &q) {
-                        cache.put(
-                            q.name.clone(),
-                            q.qtype,
-                            CacheEntry {
-                                answers: extracted.0,
-                                rcode: up_rcode,
-                                ttl: extracted.1.min(MAX_FALLBACK_TTL),
-                                authoritative: false,
-                            },
-                        );
-                    }
+                let extracted = if up_rcode == RCODE_NOERROR || up_rcode == RCODE_NXDOMAIN {
+                    extract_answers(&resp, &q)
                 } else {
                     debug!(rcode = up_rcode, "dns: upstream error not cached");
+                    None
+                };
+                if let Some((ans, ttl)) = &extracted {
+                    cache.put(
+                        q.name.clone(),
+                        q.qtype,
+                        CacheEntry {
+                            answers: ans.clone(),
+                            rcode: up_rcode,
+                            ttl: (*ttl).min(MAX_FALLBACK_TTL),
+                            authoritative: false,
+                        },
+                    );
                 }
-                return Some(resp);
+                if resp.len() <= budget {
+                    return Some(resp);
+                }
+                // Oversized fallback reply: the verbatim bytes do not
+                // fit this transport (e.g. > 512 over UDP). Re-encode
+                // a bounded honest version — cut with TC=1 over UDP so
+                // the client retries over TCP, where the larger budget
+                // carries the whole set.
+                let (ans, rcode) = extracted
+                    .map(|(a, _)| (a, up_rcode))
+                    .unwrap_or_else(|| (Vec::new(), RCODE_SERVFAIL));
+                return Some(build_response_bounded(&q, data, &ans, rcode, false, budget));
             }
             None => (Vec::new(), RCODE_SERVFAIL),
         }
@@ -226,7 +378,9 @@ pub async fn handle_packet(
         );
     }
     // Only the authoritative path sets AA; REFUSED/SERVFAIL do not.
-    Some(build_response(&q, data, &answers, rcode, cacheable))
+    Some(build_response_bounded(
+        &q, data, &answers, rcode, cacheable, budget,
+    ))
 }
 
 /// Longest-suffix apex search + record selection.
@@ -366,16 +520,18 @@ fn parse_query(b: &[u8]) -> Option<Query> {
 
 /// Builds a response. `authoritative` controls the AA bit honestly:
 /// only the chain-backed path sets it. If the full answer set does
-/// not fit in [`MAX_PACKET_LEN`], answers are truncated to the last
-/// one that fits and the **TC bit is set** (RFC 1035 §4.2.1: the
-/// client knows to retry over TCP / give up, instead of trusting a
-/// silently short answer).
-fn build_response(
+/// not fit in `budget`, answers are truncated to the last one that
+/// fits and the **TC bit is set** (RFC 1035 §4.2.1: the client knows
+/// to retry over TCP / give up, instead of trusting a silently short
+/// answer). `budget` = transport payload limit (512 for classic UDP,
+/// [`MAX_TCP_RESPONSE`] over TCP).
+fn build_response_bounded(
     q: &Query,
     original: &[u8],
     answers: &[(u16, u32, Vec<u8>)],
     rcode: u8,
     authoritative: bool,
+    budget: usize,
 ) -> Vec<u8> {
     let question = question_bytes(original).unwrap_or(&[]);
     let mut out = Vec::with_capacity(12 + question.len() + 16 * answers.len());
@@ -398,7 +554,7 @@ fn build_response(
     for (tc, ttl, rdata) in answers {
         // Owner + TYPE + CLASS + TTL + RDLEN + RDATA.
         let need = qname.len() + 10 + rdata.len();
-        if out.len() + need > MAX_PACKET_LEN {
+        if out.len() + need > budget {
             break;
         }
         out.extend_from_slice(qname);
@@ -420,6 +576,7 @@ fn build_response(
         warn!(
             kept,
             total = answers.len(),
+            budget,
             "dns: response truncated (TC=1)"
         );
     }
@@ -1173,5 +1330,309 @@ mod tests {
         let ok = parse_upstreams(&["1.1.1.1:53".into(), "[::1]:53".into()]).unwrap();
         assert_eq!(ok.len(), 2);
         assert!(parse_upstreams(&["not an addr".into()]).is_err());
+    }
+
+    // ---- M7b: TCP transport + per-transport budgets -----------------
+
+    /// Builds the wire form of one TXT record (uncompressed owner).
+    fn txt_rdata(s: &str) -> Vec<u8> {
+        let mut rdata = Vec::new();
+        for chunk in s.as_bytes().chunks(255) {
+            rdata.push(u8::try_from(chunk.len()).unwrap());
+            rdata.extend_from_slice(chunk);
+        }
+        rdata
+    }
+
+    /// A set whose encoded answers exceed the 512-o classic UDP
+    /// payload but fit TCP: over UDP it is cut at the last fitting
+    /// record with TC=1; over TCP (budget = MAX_TCP_RESPONSE) the
+    /// full set is served, TC clear. RFC 7766 end to end.
+    #[tokio::test]
+    async fn udp_budget_truncates_tc_tcp_serves_full() {
+        // 20 TXT answers of ~320 B each → ~6.4 KB total: > 512, < 65535.
+        let big: Vec<RecordData> = (0..20).map(|_| RecordData::Txt("x".repeat(300))).collect();
+        let resolver = mock_resolver(vec![("big.uip", big)]);
+        let q = query(31, false, "big.uip", TYPE_TXT);
+
+        // Fresh caches per transport (same entry would hit the cache).
+        let mut udp_cache = Cache::new();
+        let udp = handle_packet_transport(&resolver, &q, &[], &mut udp_cache, UDP_PAYLOAD_LIMIT)
+            .await
+            .unwrap();
+        assert!(udp.len() <= UDP_PAYLOAD_LIMIT, "fits 512 B");
+        assert!(ancount_of(&udp) >= 1 && (ancount_of(&udp) as usize) < 20);
+        assert_eq!(udp[2] & 0x02, 0x02, "TC set on 512 B truncation");
+        assert_eq!(udp[2] & 0x04, 0x04, "AA still set");
+
+        let mut tcp_cache = Cache::new();
+        let tcp = handle_packet_transport(&resolver, &q, &[], &mut tcp_cache, MAX_TCP_RESPONSE)
+            .await
+            .unwrap();
+        assert_eq!(ancount_of(&tcp), 20, "TCP serves the full set");
+        assert!(tcp.len() > UDP_PAYLOAD_LIMIT && tcp.len() <= MAX_TCP_RESPONSE);
+        assert_eq!(tcp[2] & 0x02, 0x00, "TC clear over TCP");
+        assert_eq!(tcp[2] & 0x04, 0x04, "AA over TCP");
+        // Same TXID as the query.
+        assert_eq!(&tcp[0..2], &q[0..2]);
+    }
+
+    /// Truncation on a cache hit too: the first (UDP) reply caches the
+    /// full answer set; a second UDP query gets the cut version.
+    #[tokio::test]
+    async fn cached_answers_also_truncated_on_udp() {
+        let big: Vec<RecordData> = (0..20).map(|_| RecordData::Txt("x".repeat(300))).collect();
+        let resolver = mock_resolver(vec![("big.uip", big)]);
+        let mut cache = Cache::new();
+        let _ = handle_packet_transport(
+            &resolver,
+            &query(32, false, "big.uip", TYPE_TXT),
+            &[],
+            &mut cache,
+            MAX_TCP_RESPONSE,
+        )
+        .await
+        .unwrap();
+        let cached = handle_packet_transport(
+            &resolver,
+            &query(33, false, "big.uip", TYPE_TXT),
+            &[],
+            &mut cache,
+            UDP_PAYLOAD_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert!(cached.len() <= UDP_PAYLOAD_LIMIT);
+        assert_eq!(cached[2] & 0x02, 0x02, "TC on cached UDP truncation");
+    }
+
+    /// Sends one length-prefixed DNS query over TCP and reads the
+    /// length-prefixed reply.
+    async fn tcp_query(stream: &mut tokio::net::TcpStream, q: &[u8]) -> Option<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut framed = (u16::try_from(q.len()).unwrap()).to_be_bytes().to_vec();
+        framed.extend_from_slice(q);
+        stream.write_all(&framed).await.ok()?;
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr).await.ok()?;
+        let len = u16::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.ok()?;
+        Some(body)
+    }
+
+    /// `run_tcp` end to end against a mock resolver: a full (large)
+    /// answer set is served in one TCP message, TC clear, while the
+    /// same query over the UDP budget would be cut.
+    #[tokio::test]
+    async fn run_tcp_serves_oversized_answer() {
+        let big: Vec<RecordData> = (0..20).map(|_| RecordData::Txt("x".repeat(300))).collect();
+        let resolver = mock_resolver(vec![("big.uip", big)]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(Cache::new()));
+        tokio::spawn(run_tcp(listener, resolver, Vec::new(), cache));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let resp = tcp_query(&mut stream, &query(34, false, "big.uip", TYPE_TXT))
+            .await
+            .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert_eq!(ancount_of(&resp), 20, "full set over TCP");
+        assert_eq!(resp[2] & 0x02, 0x00, "TC clear");
+        assert!(resp.len() > UDP_PAYLOAD_LIMIT);
+    }
+
+    /// Pipelining: two queries on one connection are both answered,
+    /// in order.
+    #[tokio::test]
+    async fn run_tcp_pipelines_two_queries() {
+        let resolver = mock_resolver(vec![(
+            "example.uip",
+            vec![RecordData::A("192.0.2.10".parse().unwrap())],
+        )]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(Cache::new()));
+        tokio::spawn(run_tcp(listener, resolver, Vec::new(), cache));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r1 = tcp_query(&mut stream, &query(35, false, "example.uip", TYPE_A))
+            .await
+            .unwrap();
+        let r2 = tcp_query(&mut stream, &query(36, false, "example.uip", TYPE_AAAA))
+            .await
+            .unwrap();
+        assert_eq!(rcode_of(&r1), 0);
+        assert_eq!(ancount_of(&r1), 1);
+        assert_eq!(&r1[0..2], &35u16.to_be_bytes(), "first reply = first txid");
+        assert_eq!(rcode_of(&r2), 0, "NODATA is NOERROR");
+        assert_eq!(ancount_of(&r2), 0);
+        assert_eq!(
+            &r2[0..2],
+            &36u16.to_be_bytes(),
+            "second reply = second txid"
+        );
+    }
+
+    /// Bounds: an oversized length prefix (> MAX_TCP_QUERY) closes the
+    /// connection without reading a body; a zero-length prefix too.
+    #[tokio::test]
+    async fn run_tcp_rejects_oversized_query() {
+        let resolver = mock_resolver(vec![]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(Cache::new()));
+        tokio::spawn(run_tcp(listener, resolver, Vec::new(), cache));
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Announce an oversized body: the server must close on the
+        // header alone (nothing else is written, so the close is a
+        // clean FIN the client observes as EOF).
+        stream
+            .write_all(&(MAX_TCP_QUERY as u16 + 1).to_be_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let mut leftover = [0u8; 8];
+        let n = stream.read(&mut leftover).await.unwrap();
+        assert_eq!(n, 0, "connection closed on oversized query");
+    }
+
+    /// Bounds: a client that connects and never sends anything is
+    /// dropped after TCP_READ_TIMEOUT (the slot is freed — no
+    /// unbounded accumulation). Timing-based: budget 2× the timeout.
+    #[tokio::test]
+    async fn run_tcp_drops_stalled_client() {
+        let resolver = mock_resolver(vec![]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(Cache::new()));
+        tokio::spawn(run_tcp(listener, resolver, Vec::new(), cache));
+
+        use tokio::io::AsyncReadExt;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let start = std::time::Instant::now();
+        let mut buf = [0u8; 8];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "server closed the idle connection");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= TCP_READ_TIMEOUT && elapsed < TCP_READ_TIMEOUT * 2,
+            "closed by the read timeout (got {elapsed:?})"
+        );
+    }
+
+    /// Garbage on an established TCP connection is answered with
+    /// silence (no reply) but does not kill the session: a valid
+    /// query on the same connection is still served.
+    #[tokio::test]
+    async fn run_tcp_garbage_then_valid_query() {
+        let resolver = mock_resolver(vec![(
+            "example.uip",
+            vec![RecordData::A("192.0.2.10".parse().unwrap())],
+        )]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cache = Arc::new(tokio::sync::Mutex::new(Cache::new()));
+        tokio::spawn(run_tcp(listener, resolver, Vec::new(), cache));
+
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Garbage frame: a header claiming 12 bytes, then garbage
+        // that parse_query refuses (QR set + garbage qname).
+        let mut garbage = vec![0u8; 12];
+        garbage[2] = 0x80; // QR set → refused by parse_query
+        garbage[4..6].copy_from_slice(&1u16.to_be_bytes()); // qdcount 1
+        garbage.extend_from_slice(&[9, b'x']); // invalid label len
+        let mut framed = (u16::try_from(garbage.len()).unwrap())
+            .to_be_bytes()
+            .to_vec();
+        framed.extend_from_slice(&garbage);
+        stream.write_all(&framed).await.unwrap();
+        // A valid query must still be answered on this connection.
+        let resp = tcp_query(&mut stream, &query(38, false, "example.uip", TYPE_A))
+            .await
+            .unwrap();
+        assert_eq!(rcode_of(&resp), 0);
+        assert_eq!(ancount_of(&resp), 1);
+    }
+
+    /// A fallback reply larger than the UDP budget is re-encoded cut
+    /// with TC=1 (the verbatim upstream bytes would not fit); over
+    /// TCP the same exchange passes the reply through unchanged.
+    #[tokio::test]
+    async fn oversized_fallback_reply_truncated_on_udp() {
+        // Mock upstream answering 3 big TXT records (~1 KB total).
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80; // QR
+            resp[7] = 3; // ANCOUNT
+            for _ in 0..3u8 {
+                resp.push(0); // root name
+                resp.extend_from_slice(&TYPE_TXT.to_be_bytes());
+                resp.extend_from_slice(&CLASS_IN.to_be_bytes());
+                resp.extend_from_slice(&120u32.to_be_bytes());
+                let rdata = txt_rdata(&"x".repeat(300));
+                resp.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+                resp.extend_from_slice(&rdata);
+            }
+            upstream.send_to(&resp, peer).await.unwrap();
+        });
+        let resolver = mock_resolver(vec![]);
+        let q = query(39, true, "www.foo_bar", TYPE_TXT);
+
+        let mut udp_cache = Cache::new();
+        let udp =
+            handle_packet_transport(&resolver, &q, &[up_addr], &mut udp_cache, UDP_PAYLOAD_LIMIT)
+                .await
+                .unwrap();
+        assert_eq!(rcode_of(&udp), 0);
+        assert!(udp.len() <= UDP_PAYLOAD_LIMIT, "re-encoded to fit 512 B");
+        assert_eq!(udp[2] & 0x02, 0x02, "TC set on the cut fallback reply");
+        assert_eq!(ancount_of(&udp) as usize, 1, "one record fits");
+        up.await.unwrap();
+
+        // Same upstream shape again (3 big records, ~1 KB reply) with
+        // a TCP-sized budget: the verbatim reply passes through.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let up = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80;
+            resp[7] = 3;
+            for _ in 0..3u8 {
+                resp.push(0);
+                resp.extend_from_slice(&TYPE_TXT.to_be_bytes());
+                resp.extend_from_slice(&CLASS_IN.to_be_bytes());
+                resp.extend_from_slice(&120u32.to_be_bytes());
+                let rdata = txt_rdata(&"y".repeat(300));
+                resp.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+                resp.extend_from_slice(&rdata);
+            }
+            upstream.send_to(&resp, peer).await.unwrap();
+        });
+        let mut tcp_cache = Cache::new();
+        let tcp = handle_packet_transport(
+            &resolver,
+            &query(40, true, "www.foo_bar", TYPE_TXT),
+            &[up_addr],
+            &mut tcp_cache,
+            MAX_TCP_RESPONSE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rcode_of(&tcp), 0);
+        assert_eq!(ancount_of(&tcp), 3, "verbatim reply kept (3 records)");
+        assert!(tcp.len() > UDP_PAYLOAD_LIMIT, "verbatim reply kept");
+        assert_eq!(tcp[2] & 0x02, 0x00, "no TC on TCP-sized fallback");
+        up.await.unwrap();
     }
 }

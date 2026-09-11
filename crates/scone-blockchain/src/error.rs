@@ -21,6 +21,18 @@ pub enum BlockchainError {
     /// (fork choice belongs to the future consensus).
     #[error("parent is not the canonical tip (fork)")]
     ParentNotTip,
+    /// The canonical block at `height` was evicted from the RAM
+    /// window (M7a): it sits below the finality floor (last
+    /// finalized checkpoint) and outside
+    /// [`crate::RAM_WINDOW_BLOCKS`]. The node store (`scone-storage`,
+    /// `NodeStore`) serves it; reorg paths that would need it abort
+    /// with this error and the relay falls back to reloading from
+    /// storage or to a full sync.
+    #[error("block at height {height} pruned from the RAM window (below the finality floor)")]
+    BlockPruned {
+        /// Height of the evicted canonical block.
+        height: u64,
+    },
     /// Block height is not exactly `parent height + 1`.
     #[error("invalid height: expected {expected}, got {got}")]
     InvalidHeight {

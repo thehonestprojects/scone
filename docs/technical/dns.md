@@ -1,4 +1,4 @@
-# Serveur DNS UDP (M6) — `scone dns`
+# Serveur DNS UDP + TCP (M6 + M7b) — `scone dns`
 
 > Spécification normative de la surface DNS de Scone.
 > Toute divergence doc/code = bug (corriger la source de vérité).
@@ -6,15 +6,15 @@
 ## Vue d'ensemble
 
 Le **serveur DNS** est une surface optionnelle du relay : il répond
-aux requêtes DNS UDP pour les noms Scone **uniquement à partir de
-données vérifiées contre la chaîne**, et propose un **fallback
-récursif optionnel** (`addr:port`) pour le reste. Il ne possède ni
-chaîne, ni store, ni DHT : la résolution passe par le relay
-(processus), via le RPC de contrôle local — le même chemin vérifié
-que le CLI.
+aux requêtes DNS **UDP et TCP** (RFC 7766, même port) pour les noms
+Scone **uniquement à partir de données vérifiées contre la chaîne**,
+et propose un **fallback récursif optionnel** (`addr:port`) pour le
+reste. Il ne possède ni chaîne, ni store, ni DHT : la résolution
+passe par le relay (processus), via le RPC de contrôle local — le
+même chemin vérifié que le CLI.
 
 ```text
-              UDP :5353 (par défaut 127.0.0.1)
+              UDP+TCP :5353 (par défaut 127.0.0.1)
                     │
              scone relay --dns 127.0.0.1:5353
                     │  ┌────────────────────────────────┐
@@ -29,6 +29,13 @@ que le CLI.
                     │  │        apex sans record publié → NODATA
                     │  └─ NON → fallback amont (si configuré)
                     │           sinon REFUSED
+                    │
+                    │  budget de réponse :
+                    │    UDP → 512 o (pas d'EDNS) ; dépassement =
+                    │          coupe au dernier record + TC=1 → le
+                    │          client rejoue en TCP
+                    │    TCP → 64 KiB (préfixe longueur 2 o,
+                    │          RFC 1035 §4.2.2) : set complet
 ```
 
 ## Démarrage
@@ -88,11 +95,16 @@ Client de validation : `scone dig <name> --dns 127.0.0.1:5353
 - Types servis : A, AAAA, CNAME, NS, MX, TXT (+ Unknown re-encodé
   tel quel). Une requête A/AAAA inclut les CNAME du set (suivi
   d'alias). Requête ANY (255) : tout le set filtré par le codec.
-- Limites : datagramme ≤ 4096 octets ; un set dépassant la borne est
-  coupé au dernier record qui tient avec **TC=1** (troncature
-  honnête, RFC 1035 §4.2.1 — le client sait qu'il doit retenter en
-  TCP ou s'arrêter, pas se fier à une réponse raccourcie en
-  silence ; pas de TCP — voir RECOMMENDATIONS).
+- Limites (M7b) : **le budget de réponse dépend du transport** —
+  512 octets en UDP (charge utile classique RFC 1035 §2.3.4, pas
+  d'EDNS), 65 535 en TCP. Un set dépassant le budget est coupé au
+  dernier record qui tient avec **TC=1** (troncature honnête, RFC
+  1035 §4.2.1) : le client rejoue en TCP (RFC 7766), où le set
+  complet est servi. Une réplique amont plus grande que le budget
+  UDP est ré-encodée coupée (TC=1) au lieu d'être livrée telle
+  quelle ; sur TCP elle passe byte pour byte. La troncature
+  s'applique aussi aux hits de cache (le budget est appliqué au
+  moment de la réponse, pas du remplissage du cache).
 - RCODEs : 0 NOERROR (avec ou sans réponses), 2 SERVFAIL (failure
   RPC locale), 3 NXDOMAIN (autoritaire), 5 REFUSED (hors Scone sans
   upstream).
@@ -112,11 +124,47 @@ Client de validation : `scone dig <name> --dns 127.0.0.1:5353
 - **Privé par défaut** : pas d'amont = REFUSED sur les noms hors
   forme Scone.
 
+## TCP (M7b, RFC 7766)
+
+Même port que l'UDP (second bind TCP sur l'adresse `--dns`). Le
+transport suit RFC 1035 §4.2.2 : chaque message est préfixé de sa
+longueur sur **2 octets** big-endian.
+
+- **Requête** : longueur préfixe ≥ 1 et ≤ 512 octets (une requête
+  DNS tient la charge utile classique — RFC 7766 §6 ; pas d'EDNS
+  servi). Hors bornes → fermeture immédiate de la connexion.
+- **Réponse** : budget 65 535 octets (le maximum du préfixe 2 o) —
+  un set trop grand pour l'UDP y est servi **en entier**, TC=0.
+- **Pipelining** : plusieurs requêtes par connexion sont servies
+  en série, dans l'ordre (une écriture = une réponse préfixée).
+- **Timeout de lecture** : 5 s par lecture (préfixe ou corps) — un
+  client muet est déconnecté, son slot libéré.
+- **Connexions concurrentes** : 64 max (sémaphore) ; la 65e est
+  rejetée immédiatement (connexion fermée), jamais mise en file —
+  aucune croissance non bornée de tâches ou de mémoire.
+- Erreurs lecture/écriture/timeout : log debug + fermeture propre.
+  **Jamais de panic sur entrée réseau.**
+- Le garbage (requête incompréhensible) reçoit le silence mais ne
+  ferme pas la connexion : la requête suivante (valide) est servie.
+
+```text
+client                     serveur
+  │ [len u16][requête]        │
+  │ ─────────────────────►   │ cache → autoritaire → fallback
+  │ ◄─────────────────────   │ [len u16][réponse ≤ 64 KiB]
+  │ (UDP avait répondu TC=1 → le client rejoue ici)
+```
+
 ## Bornes et garde-fous
 
 | Garde-fou | Valeur |
 |---|---|
-| Paquet (req/rép) | 4096 octets |
+| Datagramme UDP (req/rép) | 4096 octets (rejet au-delà) |
+| Budget réponse UDP (TC=1 au-delà) | 512 octets (pas d'EDNS) |
+| Requête TCP max | 512 octets (fermeture au-delà) |
+| Réponse TCP max | 65 535 octets |
+| Connexions TCP concurrentes | 64 (sémaphore, rejet immédiat) |
+| Timeout lecture TCP | 5 s |
 | Cache | 1024 entrées (FIFO) |
 | TTL autoritaire | 60 s |
 | TTL fallback (clamp) | 600 s |
@@ -136,6 +184,12 @@ DHT (le relay reste l'unique autorité de vérification).
   (autoritaire vs fallback vs erreurs, y compris hit de cache),
   troncature TC=1 d'un set trop grand, rejet d'une réponse amont
   (TXID ou question ne matchant pas), non-cache de SERVFAIL/REFUSED.
+- M7b : budget par transport (UDP 512 o → TC=1, TCP → set complet),
+  troncature d'un hit de cache, `run_tcp` réel (set > 512 servi
+  entier, pipelining de 2 requêtes, requête oversize → fermeture,
+  client muet → timeout 5 s, garbage puis requête valide sur la
+  même connexion), réplique amont > 512 ré-encodée TC=1 en UDP /
+  byte pour byte en TCP.
 - Intégration réelle (`tests/dns_server.rs`) : un relay complet
   (production devnet incluse) + enregistrement + UpdateDomain + PutRecord,
   puis requêtes UDP réelles : A vérifié (bit AA), TXT, NODATA AAAA,
@@ -147,7 +201,8 @@ DHT (le relay reste l'unique autorité de vérification).
 
 ## Décisions ouvertes
 
-- Pas de TCP (troncature honnête TC=1 si réponse > 4096) ; pas de EDNS.
+- Pas de EDNS (le budget UDP reste 512 o ; la troncature TC=1 +
+  TCP couvre le besoin devnet).
 - Le record set ne porte pas de nom par record : tout le set sert
   tout sous-nom de l'apex (wildcard implicite). Un adressage par
   enregistrement exigerait d'étendre `DnsRecord` (protocol).

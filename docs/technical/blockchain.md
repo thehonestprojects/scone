@@ -395,6 +395,32 @@ concurrents :
   dans des ordres différents aboutissent au même état) ;
 - aucun bloc reçu n'est canonique avant validation complète.
 
+## Fenêtre RAM bornée (M7a, port .bak)
+
+La chaîne ne garde en RAM que les **512 derniers blocs**
+(`RAM_WINDOW_BLOCKS`, port du `HISTORY_KEEP = 512` du .bak), au-dessus
+du **plancher de finalité** (le dernier checkpoint finalisé) :
+
+- un bloc quitte la RAM seulement s'il est **à la fois** hors de la
+  fenêtre (`height < tip − 511`) **et** strictement sous le plancher
+  de finalité — un reorg au-dessus du plancher reste toujours
+  possible, ces blocs ne sont donc JAMAIS évincés ;
+- avant le premier checkpoint finalisé (bootstrap), **rien n'est
+  évincé** : la mémoire bornée commence avec la finalité ;
+- l'éviction est réelle : blocs, index de hashs (`known_hashes`,
+  borné lui aussi, indexé par hauteur) et txs quittent la mémoire —
+  le store (`NodeStore`, `scone-storage`) détient les copies
+  durables ;
+- `block(h)` sous la fenêtre → `None` ; `block_result(h)` → erreur
+  typée `BlockPruned { height }` — les chemins de reorg
+  (`push_block`, `try_attach`, `adopt_branch`, rejeu de préfixe) la
+  propagent : le relay doit recharger le segment depuis le stockage
+  ou retomber sur une sync complète (limitation documentée : pas
+  d'adoption segmentée avant le port complet du relay) ;
+- un bloc construit sur un parent évincé classe comme `BlockPruned`
+  (pas `UnknownParent`) : hauteur du parent < `base_height` ⇒ le
+  store peut le servir.
+
 ## Abstraction du consensus
 
 ```rust

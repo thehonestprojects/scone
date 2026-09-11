@@ -56,7 +56,7 @@ pub mod validate;
 
 pub use block_hash::{BLOCK_HASH_VERSION, block_hash};
 pub use builder::BlockBuilder;
-pub use chain::{AppliedBlock, Blockchain, REPLAY_WINDOW_BLOCKS};
+pub use chain::{AppliedBlock, Blockchain, RAM_WINDOW_BLOCKS, REPLAY_WINDOW_BLOCKS};
 pub use consensus::{Consensus, PermissiveConsensus};
 pub use error::{BlockchainError, Result};
 pub use finality::FinalizedBase;

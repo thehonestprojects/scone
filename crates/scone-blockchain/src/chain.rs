@@ -1,6 +1,6 @@
 //! Canonical in-memory chain and block validation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use scone_protocol::limits::MAX_TXS_PER_BLOCK;
 use scone_protocol::{Block, BlockHash, PROTOCOL_VERSION};
@@ -24,6 +24,25 @@ use crate::txid::{TxId, transaction_id};
 /// re-application of a transaction the signer consented to, never a
 /// forgery.
 pub const REPLAY_WINDOW_BLOCKS: u64 = 256;
+
+/// Bounded RAM window of canonical blocks (M7a, ported from the
+/// .bak's `HISTORY_KEEP = 512`): the chain keeps at most this many
+/// recent blocks **above the finality floor** in RAM. A block whose
+/// height is strictly below BOTH `tip_height - RAM_WINDOW_BLOCKS + 1`
+/// and the last finalized checkpoint's height is evicted — it can
+/// never be needed again, because a reorg requires a branch that
+/// beats the canonical chain under the fork choice, and any branch
+/// contradicting a finalized checkpoint is refused outright.
+///
+/// Blocks at or above the finality floor are NEVER evicted, whatever
+/// the window says (a reorg through them stays possible until
+/// finality locks them). Consequence: before the first finalized
+/// checkpoint (bootstrap), NOTHING is ever evicted — bounded RAM
+/// starts with finality. The node store (`scone-storage`) serves the
+/// evicted heights; [`Blockchain::block`] returns [`None`] and
+/// [`Blockchain::block_result`] returns
+/// [`BlockchainError::BlockPruned`] for them.
+pub const RAM_WINDOW_BLOCKS: u64 = 512;
 
 use crate::block_hash::block_hash;
 use crate::consensus::{Consensus, PermissiveConsensus};
@@ -53,20 +72,27 @@ use crate::validate::validate_transaction;
 #[derive(Debug)]
 pub struct Blockchain<C: Consensus = PermissiveConsensus> {
     /// Height of the oldest non-genesis block held in RAM. `0` on a
-    /// live chain (`canonical` is dense: index == height, genesis at
-    /// index 0). On a chain restored via [`Blockchain::restore`] only
-    /// genesis and the tip window are in RAM: historical heights in
-    /// `1..base_height` are served from the node store and
-    /// [`block`](Self::block) returns `None` for them.
+    /// young live chain (`canonical` is dense: index == height,
+    /// genesis at index 0). Advanced by the RAM window eviction (M7a,
+    /// see [`RAM_WINDOW_BLOCKS`]) and by [`Blockchain::restore`]:
+    /// historical heights below `base_height` are served from the
+    /// node store — [`block`](Self::block) returns `None` and
+    /// [`block_result`](Self::block_result) returns
+    /// [`BlockchainError::BlockPruned`] for them.
     pub(crate) base_height: u64,
-    /// Canonical blocks held in RAM: dense from genesis on a live
-    /// chain (`canonical[0]` is genesis, index == height), or
-    /// `[genesis, restored tip, blocks pushed since]` on a restored
-    /// chain (see `base_height`).
+    /// Canonical blocks held in RAM: dense from genesis on a young
+    /// chain (`canonical[0]` is genesis, index == height). Once the
+    /// window slides (M7a) or the chain is restored, the layout is
+    /// `[genesis, window base, …, tip]` — `canonical[1 + k]` is the
+    /// block at height `base_height + k`.
     pub(crate) canonical: Vec<Block>,
-    /// Hashes of every accepted block (parent classification for fork
-    /// detection).
-    pub(crate) known_hashes: HashSet<BlockHash>,
+    /// Hash of every accepted block **still in the RAM window**, by
+    /// height (parent classification for fork detection). Bounded
+    /// with the window (M7a): evicted heights leave the index, so a
+    /// fork building on a pruned parent classifies as
+    /// [`BlockchainError::UnknownParent`] — the relay falls back to
+    /// loading it from the node store or to a full sync.
+    pub(crate) known_hashes: HashMap<u64, BlockHash>,
     pub(crate) tip: BlockHash,
     /// The network this chain belongs to (M8b): its genesis, its
     /// PoW parameters, the only network id its transactions may carry.
@@ -159,7 +185,7 @@ impl Blockchain<PermissiveConsensus> {
         Self {
             base_height: tip_height,
             canonical: vec![genesis_block, tip_block],
-            known_hashes: HashSet::from([genesis_h, tip]),
+            known_hashes: HashMap::from([(0, genesis_h), (tip_height, tip)]),
             tip,
             network,
             state,
@@ -187,7 +213,7 @@ impl<C: Consensus> Blockchain<C> {
         Self {
             base_height: 0,
             canonical: vec![genesis_of(&network)],
-            known_hashes: HashSet::from([hash]),
+            known_hashes: HashMap::from([(0, hash)]),
             tip: hash,
             network,
             state: ChainState::for_network(network),
@@ -225,11 +251,12 @@ impl<C: Consensus> Blockchain<C> {
     /// Canonical block at `height`, if it exists — O(1) window
     /// lookup.
     ///
-    /// Blocks of the current session are in RAM; on a chain restored
-    /// from storage (see [`Blockchain::restore`]) only genesis, the
-    /// restored tip and blocks pushed since are — historical blocks
-    /// are served from the node store, and this returns [`None`]
-    /// for them.
+    /// Blocks of the current window are in RAM; heights below
+    /// [`RAM_WINDOW_BLOCKS`]-eviction or a
+    /// [`Blockchain::restore`]d chain's history are not — they are
+    /// served from the node store, and this returns [`None`] for
+    /// them (use [`Blockchain::block_result`] for the typed
+    /// [`BlockchainError::BlockPruned`] distinction).
     #[must_use]
     pub fn block(&self, height: u64) -> Option<&Block> {
         if height == 0 {
@@ -237,10 +264,10 @@ impl<C: Consensus> Blockchain<C> {
             // chain, prepended by `restore`).
             return self.canonical.first().filter(|g| g.header.height == 0);
         }
-        // Heights below `base_height` (a restored chain's historical
-        // window) are not in RAM. On a restored chain the genesis
-        // slot prepended by `restore` shifts the window by one; a
-        // live chain (`base_height == 0`) is dense (index == height).
+        // Heights below `base_height` (advanced by the RAM window
+        // eviction, M7a, or by restore) are not in RAM. The genesis
+        // slot at index 0 shifts the window by one; a young chain
+        // (`base_height == 0`) is dense (index == height).
         let offset: usize = height.checked_sub(self.base_height)?.try_into().ok()?;
         let index = if self.base_height == 0 {
             offset
@@ -250,6 +277,21 @@ impl<C: Consensus> Blockchain<C> {
         self.canonical
             .get(index)
             .filter(|b| b.header.height == height)
+    }
+
+    /// [`Blockchain::block`] with a typed failure (M7a):
+    /// [`BlockchainError::BlockPruned`] when there is no canonical
+    /// block at `height` in RAM — either it was evicted by the
+    /// bounded window (below the finality floor; the node store
+    /// serves it) or the height is beyond the tip (callers check
+    /// [`Blockchain::height`] first).
+    ///
+    /// # Errors
+    ///
+    /// [`BlockchainError::BlockPruned`] — never panics.
+    pub fn block_result(&self, height: u64) -> Result<&Block> {
+        self.block(height)
+            .ok_or(BlockchainError::BlockPruned { height })
     }
 
     /// Authoritative state after all applied blocks.
@@ -267,20 +309,97 @@ impl<C: Consensus> Blockchain<C> {
         self.included.contains_key(id)
     }
 
-    /// Hashes of every block this chain has ever accepted (fork
-    /// classification).
-    pub(crate) fn block_hashes(&self) -> &HashSet<BlockHash> {
-        &self.known_hashes
+    /// Hash of the canonical block at `height`, if it is in the RAM
+    /// window (fork classification, M7a: evicted heights answer
+    /// `None` — the relay then goes through the node store).
+    #[must_use]
+    pub fn block_hash_at(&self, height: u64) -> Option<BlockHash> {
+        self.known_hashes.get(&height).copied()
     }
 
-    /// Owned copy of the known-hash set (reorg swap).
-    pub(crate) fn known_hashes_vec(&self) -> HashSet<BlockHash> {
+    /// Owned copy of the known-hash index (reorg swap).
+    pub(crate) fn known_hashes_vec(&self) -> HashMap<u64, BlockHash> {
         self.known_hashes.clone()
     }
 
-    /// Replaces the known-hash set (reorg swap).
-    pub(crate) fn replace_hashes(&mut self, hashes: HashSet<BlockHash>) {
+    /// Replaces the known-hash index (reorg swap).
+    pub(crate) fn replace_hashes(&mut self, hashes: HashMap<u64, BlockHash>) {
         self.known_hashes = hashes;
+    }
+
+    /// Finality floor (M7a): the height of the last finalized
+    /// checkpoint. Canonical blocks at or above it are NEVER evicted
+    /// from the RAM window — a reorg through them stays possible
+    /// until finality locks them. `None` before the first finalized
+    /// checkpoint (bootstrap: nothing is ever evicted).
+    #[must_use]
+    pub fn finality_floor(&self) -> Option<u64> {
+        self.checkpoints.last().map(|cp| cp.data.height)
+    }
+
+    /// Classifies a parent-hash miss (M7a): when the PARENT's height
+    /// (`child_height - 1`) is below `base_height`, the parent was
+    /// evicted from the RAM window — the caller (relay) must reload
+    /// it from the node store or fall back to a full sync, so the
+    /// miss is typed [`BlockchainError::BlockPruned`]. Anything else
+    /// is a parent this chain has never seen (genesis, height 0, is
+    /// always in RAM and never reported pruned).
+    pub(crate) fn classify_parent_miss(&self, child_height: u64) -> BlockchainError {
+        let parent_height = child_height.saturating_sub(1);
+        if parent_height >= 1 && parent_height < self.base_height {
+            BlockchainError::BlockPruned {
+                height: parent_height,
+            }
+        } else {
+            BlockchainError::UnknownParent
+        }
+    }
+
+    /// Evicts canonical blocks below the RAM window (M7a). A block
+    /// leaves RAM only when BOTH conditions hold:
+    ///
+    /// 1. its height `< tip_height - RAM_WINDOW_BLOCKS + 1` (outside
+    ///    the window);
+    /// 2. its height is strictly below the finality floor (the last
+    ///    finalized checkpoint) — a reorg above the floor is always
+    ///    possible, so those blocks must stay reachable.
+    ///
+    /// Before the first finalized checkpoint, NOTHING is evicted
+    /// (bounded RAM starts with finality). The eviction is REAL:
+    /// blocks, their hash index entries and their Merkle/root data
+    /// are dropped (the `Vec::drain` releases the memory; the node
+    /// store owns the durable copies). Genesis never leaves RAM.
+    fn evict_below_window(&mut self) {
+        let Some(floor) = self.finality_floor() else {
+            return; // bootstrap: no finality, no eviction
+        };
+        let tip_height = self.height();
+        // Invariant: a finalized checkpoint height is ≤ tip.
+        let window_start = tip_height.saturating_sub(RAM_WINDOW_BLOCKS - 1);
+        // Evict strictly below min(window_start, floor): the floor
+        // itself and everything above it survive even outside the
+        // window (a reorg can still require them).
+        let new_base = window_start.min(floor);
+        if new_base <= self.base_height {
+            return;
+        }
+        // Blocks at heights base_height..new_base-1 leave the Vec.
+        // On a never-evicted live chain (`base_height == 0`) the
+        // layout is dense with genesis at index 0 == height 0, so
+        // only `new_base - 1` entries (heights 1..new_base-1) are
+        // drained; afterwards the layout is [genesis, base..tip].
+        let n = if self.base_height == 0 {
+            (new_base - 1) as usize
+        } else {
+            (new_base - self.base_height) as usize
+        };
+        debug_assert!(n < self.canonical.len());
+        self.canonical.drain(1..1 + n);
+        // Genesis hash (key 0) never leaves the index.
+        for h in self.base_height.max(1)..new_base {
+            self.known_hashes.remove(&h);
+        }
+        self.base_height = new_base;
     }
 
     /// Validates `block` and, if fully valid, appends it as the new
@@ -311,11 +430,16 @@ impl<C: Consensus> Blockchain<C> {
 
         // Parent: must extend the canonical tip.
         if header.prev_hash != self.tip {
-            return Err(if self.known_hashes.contains(&header.prev_hash) {
-                BlockchainError::ParentNotTip
-            } else {
-                BlockchainError::UnknownParent
-            });
+            return Err(
+                if self.known_hashes.values().any(|h| *h == header.prev_hash) {
+                    BlockchainError::ParentNotTip
+                } else {
+                    // M7a: a parent height that left the RAM window is a
+                    // typed miss (the node store serves it), not a plain
+                    // unknown parent.
+                    self.classify_parent_miss(header.height)
+                },
+            );
         }
         // Height: strictly parent + 1.
         let expected_height =
@@ -427,9 +551,14 @@ impl<C: Consensus> Blockchain<C> {
             }
         }
 
-        self.known_hashes.insert(hash);
+        self.known_hashes.insert(header.height, hash);
         self.canonical.push(block.clone());
         self.tip = hash;
+        // M7a: slide the bounded RAM window. Real eviction — blocks
+        // below both the window and the finality floor leave RAM
+        // (and the hash index) immediately; the node store owns the
+        // durable copies.
+        self.evict_below_window();
         // Anti-replay index: record each transaction's inclusion
         // height, then prune deterministically — beyond the window the
         // TXID leaves the index (identical decision on any node that
@@ -1501,5 +1630,209 @@ mod tests {
             chain.state().clone(),
         );
         assert!(!restored.is_tx_included(&id));
+    }
+
+    // ---- bounded RAM window (M7a) ----
+
+    /// The four test owner keys: after claiming `uip` (seed 1) and
+    /// registering one domain per key (seeds 2-4), the eligibility
+    /// pool holds exactly these 4 keys — the full testnet committee
+    /// (committee_size 4, top-4 of 4, quorum 3).
+    fn committee_keys() -> Vec<SigningKey> {
+        (1..=4u8).map(|i| SigningKey::from_bytes([i; 32])).collect()
+    }
+
+    /// Chain whose PoS pool holds 4 distinct live owners: finality is
+    /// available (committee ≥ MIN_FINALITY_COMMITTEE_SIZE).
+    fn chain_with_committee() -> Blockchain {
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        for (name, seed) in [("a.uip", 2u8), ("b.uip", 3), ("c.uip", 4)] {
+            chain
+                .push_block(&child(&chain, vec![register_domain_tx(name, seed)]))
+                .unwrap();
+        }
+        chain
+    }
+
+    /// Finalizes a checkpoint on the current tip, signed by the full
+    /// committee (all 4 pool keys).
+    fn finalize_tip(chain: &mut Blockchain) {
+        let data = chain.checkpoint_data(0).unwrap();
+        let committee = chain.committee(0);
+        assert!(
+            committee.len() >= scone_core::MIN_FINALITY_COMMITTEE_SIZE,
+            "test fixture must reach the BFT floor"
+        );
+        let keys = committee_keys();
+        let sigs: Vec<_> = keys
+            .iter()
+            .map(|sk| (sk.public_key(), sk.sign(&data.signing_hash())))
+            .collect();
+        let cp = scone_core::checkpoint::Checkpoint {
+            data,
+            signatures: sigs,
+        };
+        chain.accept_checkpoint(cp).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_without_finality_never_evicts() {
+        // Before the first finalized checkpoint, NOTHING leaves RAM
+        // (a reorg anywhere must stay possible): bounded RAM starts
+        // with finality. Pinned deliberately — this is the M7a rule,
+        // not an oversight.
+        let mut chain = chain_with_committee();
+        advance(&mut chain, RAM_WINDOW_BLOCKS + 20);
+        assert_eq!(chain.base_height, 0);
+        assert_eq!(chain.canonical.len() as u64, chain.height() + 1);
+        assert!(chain.finality_floor().is_none());
+    }
+
+    #[test]
+    fn ram_window_bounds_block_footprint() {
+        // > 512 blocks with finality advancing as the chain grows
+        // (a checkpoint every 100 blocks, like a live network): the
+        // RAM footprint stays bounded by the window — blocks AND the
+        // hash index — while the chain keeps pushing and validating.
+        let mut chain = chain_with_committee();
+        let step = 100u64;
+        while chain.height() < RAM_WINDOW_BLOCKS + 200 {
+            advance(&mut chain, step);
+            finalize_tip(&mut chain);
+        }
+        let tip = chain.height();
+        assert!(tip > RAM_WINDOW_BLOCKS + 100);
+        // Window: genesis + the last RAM_WINDOW_BLOCKS heights.
+        assert_eq!(
+            chain.canonical.len() as u64,
+            RAM_WINDOW_BLOCKS + 1,
+            "genesis + window of canonical blocks in RAM"
+        );
+        assert_eq!(chain.known_hashes.len(), RAM_WINDOW_BLOCKS as usize + 1);
+        // The eviction is real: heights below the window are gone…
+        let base = chain.base_height;
+        assert_eq!(base, tip - RAM_WINDOW_BLOCKS + 1);
+        assert!(chain.block(base - 1).is_none());
+        assert_eq!(
+            chain.block_result(base - 1),
+            Err(BlockchainError::BlockPruned { height: base - 1 })
+        );
+        // …the window itself is served…
+        assert!(chain.block(base).is_some());
+        assert!(chain.block(tip).is_some());
+        // …and genesis never leaves RAM.
+        assert_eq!(chain.block(0), Some(&genesis()));
+
+        // The chain still validates real transactions after the
+        // window slid: a fresh registration applies and reaches the
+        // state.
+        chain
+            .push_block(&child(&chain, vec![register_domain_tx("fresh.uip", 1)]))
+            .unwrap();
+        assert!(chain.state().domain(&domain_id("fresh.uip")).is_some());
+    }
+
+    #[test]
+    fn finality_floor_locks_eviction_above_it() {
+        // ONE early checkpoint (height 12), then a long chain: the
+        // floor pins every block above it in RAM — eviction NEVER
+        // crosses the finality floor, even far outside the window
+        // (a reorg down to the floor must stay possible).
+        let mut chain = chain_with_committee();
+        let to_go = 12 - chain.height();
+        advance(&mut chain, to_go);
+        assert_eq!(chain.height(), 12);
+        finalize_tip(&mut chain);
+        let floor = chain.finality_floor().unwrap();
+        assert_eq!(floor, 12);
+        advance(&mut chain, RAM_WINDOW_BLOCKS + 100);
+        let tip = chain.height();
+        assert!(tip - floor > RAM_WINDOW_BLOCKS, "window far past the floor");
+        assert_eq!(chain.base_height, floor, "eviction stops at the floor");
+        // Blocks below the floor left RAM (typed pruned)…
+        assert!(chain.block(floor - 1).is_none());
+        assert_eq!(
+            chain.block_result(floor - 1),
+            Err(BlockchainError::BlockPruned { height: floor - 1 })
+        );
+        // …the floor block and everything above stayed — the
+        // footprint exceeds the window by design, finality is the
+        // only eviction authority above it.
+        assert!(chain.block(floor).is_some());
+        assert_eq!(
+            chain.canonical.len() as u64,
+            1 + (tip - floor) + 1,
+            "genesis + floor..=tip retained"
+        );
+        // The pinned window is still internally consistent: every
+        // retained height serves its block and its hash.
+        for h in [floor, floor + 1, tip - 1, tip] {
+            let b = chain.block(h).expect("retained height");
+            assert_eq!(
+                chain.block_hash_at(h),
+                Some(crate::block_hash::block_hash(&b.header).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_parent_is_a_typed_error_on_every_path() {
+        // With the window slid past height 50, a block building on
+        // the evicted block at 50 is rejected with the TYPED
+        // BlockPruned error — on the linear push path, on
+        // try_attach, and on full branch adoption — telling the
+        // relay to reload the segment from the node store (or fall
+        // back to a full sync) instead of just dropping the block.
+        let mut chain = chain_with_committee();
+        let to_go = 60 - chain.height();
+        advance(&mut chain, to_go);
+        let hash50 = crate::block_hash::block_hash(&chain.block(50).unwrap().header).unwrap();
+        finalize_tip(&mut chain); // floor 60
+        advance(&mut chain, RAM_WINDOW_BLOCKS + 100);
+        assert!(chain.base_height > 50, "height 50 evicted");
+
+        let orphan = make_block(hash50, 51, vec![]);
+        assert_eq!(
+            chain.push_block(&orphan),
+            Err(BlockchainError::BlockPruned { height: 50 })
+        );
+        assert_eq!(
+            chain.try_attach(&orphan).map(|_| ()),
+            Err(BlockchainError::BlockPruned { height: 50 })
+        );
+        // Full branch adoption: same typed error (the fork point
+        // itself is below the window).
+        let second = make_block(
+            crate::block_hash::block_hash(&orphan.header).unwrap(),
+            52,
+            vec![],
+        );
+        assert_eq!(
+            chain.adopt_branch(&[orphan, second]),
+            Err(BlockchainError::BlockPruned { height: 50 })
+        );
+        // The chain itself is untouched by the attempts.
+        assert!(chain.height() > RAM_WINDOW_BLOCKS + 100);
+    }
+
+    #[test]
+    fn restored_chain_reports_pruned_below_base() {
+        // The restored-chain window (M3) reports the same typed
+        // error as the eviction path: historical heights are the
+        // node store's job.
+        let mut chain = chain_with_committee();
+        advance(&mut chain, 10);
+        let restored = Blockchain::restore(
+            chain.height(),
+            chain.tip_hash(),
+            chain.block(chain.height()).unwrap().clone(),
+            chain.state().clone(),
+        );
+        assert_eq!(
+            restored.block_result(1),
+            Err(BlockchainError::BlockPruned { height: 1 })
+        );
+        assert!(restored.block_result(restored.height()).is_ok());
     }
 }

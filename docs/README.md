@@ -29,7 +29,7 @@ Deux volets :
 | [keystore.md](technical/keystore.md) | Format keyfile `.sconekey` (Argon2id + XChaCha20-Poly1305), API `scone-keystore`, commandes `identity` |
 | [storage.md](technical/storage.md) | Persistance locale redb : schéma des tables, deltas atomiques, politique mémoire, modèle de confiance, bornes DoS |
 | [relay.md](technical/relay.md) | Relay réseau (`scone-network`) : protocoles libp2p, mempool, sync, DHT Kademlia, RPC de contrôle, CLI complet |
-| [dns.md](technical/dns.md) | Serveur DNS UDP (M6) : chemin de résolution vérifié contre la chaîne, codec RFC 1035, fallback récursif, bornes |
+| [dns.md](technical/dns.md) | Serveur DNS UDP + TCP (M6/M7b) : chemin de résolution vérifié contre la chaîne, codec RFC 1035, TCP RFC 7766 (budget 512 o UDP / 64 KiB TCP, bit TC), fallback récursif, bornes |
 | [cli.md](technical/cli.md) | Logging et verbosité du binaire `scone` : stdout/stderr, niveaux `-v`, `RUST_LOG` |
 
 ## Conventions de renvoi

@@ -18,12 +18,15 @@
 //!
 //! # Restriction vs the .bak
 //!
-//! The current `Blockchain` keeps its full canonical history in RAM
-//! (`canonical: Vec<Block>`); there is no segmented adoption yet
-//! (`.bak`'s `adopt_extension` streams the shared prefix from disk).
-//! The port therefore implements whole-branch adoption over the RAM
-//! window — same rules, simpler data path. Segmented adoption lands
-//! with the history-window port.
+//! The current `Blockchain` keeps a bounded RAM window (M7a:
+//! [`crate::RAM_WINDOW_BLOCKS`] blocks above the finality floor);
+//! there is no segmented adoption yet (`.bak`'s `adopt_extension`
+//! streams the shared prefix from disk). The port implements
+//! whole-branch adoption over the RAM window — same rules, simpler
+//! data path. When the fork point or the replay prefix sits below
+//! the window, the paths return the typed
+//! `BlockPruned` error: the relay reloads the segment from the node
+//! store or falls back to a full sync.
 
 use crate::chain::Blockchain;
 use crate::error::{BlockchainError, Result};
@@ -48,7 +51,9 @@ impl Blockchain {
             return self.push_block_with_gc(block);
         }
         if !self.known_parent(header.prev_hash) {
-            return Err(BlockchainError::UnknownParent);
+            // M7a: typed miss when the parent height left the RAM
+            // window (reload from the node store / full sync).
+            return Err(self.classify_parent_miss(header.height));
         }
         // Known non-tip parent: a sister block. It can only win the
         // tie-break (same height as our tip, lower hash). Adopting a
@@ -75,9 +80,11 @@ impl Blockchain {
         self.reorg_to_height(ancestor_height, std::slice::from_ref(block))
     }
 
-    /// Whether `prev` is a block this chain has ever seen.
+    /// Whether `prev` is a block this chain has seen within its RAM
+    /// window (M7a: a pruned parent classifies as unknown — the
+    /// relay falls back to the node store / full sync).
     fn known_parent(&self, prev: scone_protocol::BlockHash) -> bool {
-        self.block_hashes().contains(&prev)
+        self.known_hashes.values().any(|h| *h == prev)
     }
 
     /// Adopts a full competing branch `blocks` (each chaining onto
@@ -100,7 +107,15 @@ impl Blockchain {
         }
         let base_height = first.header.height - 1;
         let Some(base) = self.block(base_height) else {
-            return Err(BlockchainError::UnknownParent);
+            // M7a: the fork point left the RAM window (below the
+            // finality floor — anything evictable is). The relay
+            // must reload the segment from the node store
+            // (scone-storage) or fall back to a full sync; the
+            // chain layer reports the typed pruned error with the
+            // exact height it needs.
+            return Err(BlockchainError::BlockPruned {
+                height: base_height,
+            });
         };
         let base_hash = crate::block_hash::block_hash(&base.header)?;
         if first.header.prev_hash != base_hash {
@@ -110,8 +125,21 @@ impl Blockchain {
         // must sit on the candidate branch at its height.
         for cp in &self.checkpoints {
             let h = cp.data.height;
-            let candidate_at_h = if h <= base_height {
-                self.block(h)
+            if h < base_height {
+                // M7a: this checkpoint's block left the RAM window
+                // (only blocks below the finality floor are ever
+                // evicted). No disk access needed: the branch
+                // hash-chains onto our canonical block at
+                // `base_height` (verified above), which sits ABOVE
+                // this checkpoint — so the branch's ancestry at `h`
+                // IS our canonical block at `h`, and that block
+                // matched the checkpoint when accepted (checkpoints
+                // are immutable: every reorg since passed this same
+                // rule). Evicting it changed nothing.
+                continue;
+            }
+            let candidate_at_h = if h == base_height {
+                Some(base)
             } else {
                 let off = h - base_height - 1;
                 blocks.get(off as usize)
@@ -152,14 +180,19 @@ impl Blockchain {
         height: u64,
         extension: &[Block],
     ) -> Result<crate::chain::AppliedBlock> {
-        // Snapshot the surviving prefix, rebuild state, replay.
+        // Snapshot the surviving prefix, rebuild state, replay. A
+        // prefix block evicted from the RAM window (below the
+        // finality floor) aborts with the typed pruned error — the
+        // relay reloads the segment from the node store or falls
+        // back to a full sync (documented M7a limitation: no
+        // segmented adoption yet).
         let network = self.network();
         let mut prefix: Vec<Block> = Vec::with_capacity(height as usize + 1);
         for h in 0..=height {
             let b = self
                 .block(h)
                 .cloned()
-                .ok_or(BlockchainError::UnknownParent)?;
+                .ok_or(BlockchainError::BlockPruned { height: h })?;
             prefix.push(b);
         }
         let mut fresh = crate::chain::Blockchain::with_consensus_for_network(

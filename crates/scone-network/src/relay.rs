@@ -240,16 +240,28 @@ impl Relay {
         // RPC → relay command channel.
         let (command_tx, mut command_rx) = mpsc::channel::<RelayCommand>(64);
 
-        // ---- UDP DNS surface (M6), optional -------------------------
+        // ---- UDP + TCP DNS surface (M6/M7b), optional --------------
         // The DNS server talks to the relay core through the same
         // local RPC as the CLI (`ResolveLocal`: one round trip,
         // verified, no parked DHT waiter) — the verified path stays
-        // single and identical for every consumer.
+        // single and identical for every consumer. TCP (RFC 7766)
+        // shares the UDP port: answers cut at 512 B over UDP (TC=1)
+        // are served in full over TCP.
         let dns_task: Option<tokio::task::JoinHandle<()>> = match self.config.dns_addr {
             Some(dns_addr) => {
                 let upstreams = crate::dns::parse_upstreams(&self.config.dns_upstreams)?;
                 let socket = Arc::new(tokio::net::UdpSocket::bind(dns_addr).await?);
                 let dns_listen = socket.local_addr()?;
+                // Same address, TCP: a second bind on the port the
+                // UDP socket just took (best-effort — a failure is
+                // logged and the UDP surface keeps serving).
+                let tcp_listener = match tokio::net::TcpListener::bind(dns_listen).await {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        warn!(%dns_listen, "dns tcp bind failed (udp only): {e}");
+                        None
+                    }
+                };
                 info!(
                     peer = %self.peer_id(),
                     dns_addr = %dns_listen,
@@ -295,6 +307,19 @@ impl Relay {
                     })
                 });
                 let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::Cache::new()));
+                let tcp_resolver = resolver.clone();
+                let tcp_upstreams = upstreams.clone();
+                let tcp_cache = cache.clone();
+                if let Some(listener) = tcp_listener {
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::dns::run_tcp(listener, tcp_resolver, tcp_upstreams, tcp_cache)
+                                .await
+                        {
+                            warn!("dns tcp server ended: {e}");
+                        }
+                    });
+                }
                 Some(tokio::spawn(async move {
                     if let Err(e) = crate::dns::run_udp(socket, resolver, upstreams, cache).await {
                         warn!("dns server ended: {e}");
