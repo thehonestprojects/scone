@@ -134,4 +134,10 @@ pub enum BlockchainError {
     /// transaction fields, e.g. oversized proof).
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    /// The signer guard (checkpoint crash safety) refused an operation:
+    /// conflicting or past-epoch checkpoint, unreadable (sealed) signer
+    /// state, or persistence failure — the signature was withheld and
+    /// must not be broadcast.
+    #[error("signer guard: {0}")]
+    Signer(String),
 }

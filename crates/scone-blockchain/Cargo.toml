@@ -8,3 +8,4 @@ scone-core.workspace = true
 scone-crypto.workspace = true
 scone-protocol.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

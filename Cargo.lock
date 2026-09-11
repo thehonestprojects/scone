@@ -5593,6 +5593,7 @@ dependencies = [
  "scone-crypto",
  "scone-protocol",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
