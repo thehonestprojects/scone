@@ -1,0 +1,8 @@
+[application]
+name = "scone-gui"
+
+[web.app]
+title = "Scone"
+
+[web.resource]
+style = ["assets/main.css"]

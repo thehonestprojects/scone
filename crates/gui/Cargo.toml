@@ -1,0 +1,30 @@
+[package]
+name = "gui"
+version.workspace = true
+edition.workspace = true
+description = "Scone GUI v1: single read-only page (relay connection, active identity, name/OwnerId explorer with DNS records, identity management)."
+
+[dependencies]
+scone-core.workspace = true
+scone-crypto.workspace = true
+scone-keystore.workspace = true
+scone-network.workspace = true
+scone-protocol.workspace = true
+scone-storage.workspace = true
+redb.workspace = true
+dioxus = { version = "0.7", features = ["desktop"] }
+dioxus-free-icons = { version = "0.10", features = ["font-awesome-solid"] }
+tokio.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+scone-blockchain.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "scone-gui"
+path = "src/main.rs"
