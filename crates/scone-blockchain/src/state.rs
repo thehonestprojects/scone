@@ -542,20 +542,25 @@ impl ChainState {
     ///
     /// Journaled: a rolled-back block restores the exact pre-GC
     /// registry bit for bit.
-    pub(crate) fn gc_expired_journaled(&mut self, now: u64, journal: &mut UndoLog) {
+    pub(crate) fn gc_expired_journaled(
+        &mut self,
+        now: u64,
+        journal: &mut UndoLog,
+    ) -> Vec<DomainId> {
         let expired: Vec<DomainId> = self
             .domains
             .iter()
             .filter(|(_, state)| state.valid_until <= now)
             .map(|(id, _)| *id)
             .collect();
-        for id in expired {
+        for id in expired.clone() {
             let prior = self.domains.remove(&id).expect("checked present");
             self.grace.insert(id, (prior.valid_until, prior.owner));
             journal
                 .entries
                 .push(UndoEntry::ExpireDomain { domain: id, prior });
         }
+        expired
     }
 
     /// Undoes every journaled change, most recent first, restoring

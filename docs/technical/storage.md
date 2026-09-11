@@ -209,7 +209,9 @@ complet reste possible et sert de contrôle/repair.
   dédupliqués, ordre du bloc (M8b).
 - `store_block_with_removals(...)` : variante de `store_block`
   recevant aussi les domaines retirés par le GC du bloc (M8b) pour
-  l'écriture atomique décrite ci-dessus.
+  l'écriture atomique décrite ci-dessus. Le relay alimente cette
+  liste depuis `Blockchain::push_block_with_gc` (l'issue
+  d'application expose `gc_removed_domains`).
 
 Le relay (M4) utilisera : `load_chain` au démarrage, puis pour chaque
 bloc accepté `push_block` (RAM) puis `store_block` (disque).

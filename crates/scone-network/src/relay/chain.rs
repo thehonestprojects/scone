@@ -44,8 +44,14 @@ impl Relay {
         {
             return Ok(hash); // already canonical: no store, no relay
         }
-        let hash = self.chain.push_block(&block)?;
-        store_integration::store_block(&mut self.store, &self.chain, &block, hash)?;
+        let applied = self.chain.push_block_with_gc(&block)?;
+        store_integration::store_block_with_removals(
+            &mut self.store,
+            &self.chain,
+            &block,
+            applied.hash,
+            &applied.gc_removed_domains,
+        )?;
         info!(
             hash = hex(hash.as_bytes()),
             height = block.header.height,
@@ -274,14 +280,21 @@ impl Relay {
                     }
                     builder.build()?
                 };
-                match self.chain.push_block(&block) {
-                    Ok(hash) => {
+                match self.chain.push_block_with_gc(&block) {
+                    Ok(applied) => {
                         // Same treatment as accept_block, minus the
                         // now-redundant re-validation: the block was
-                        // just pushed; store it and relay it.
-                        store_integration::store_block(&mut self.store, &self.chain, &block, hash)?;
+                        // just pushed; store it (GC removals
+                        // included) and relay it.
+                        store_integration::store_block_with_removals(
+                            &mut self.store,
+                            &self.chain,
+                            &block,
+                            applied.hash,
+                            &applied.gc_removed_domains,
+                        )?;
                         info!(
-                            hash = hex(hash.as_bytes()),
+                            hash = hex(applied.hash.as_bytes()),
                             height = block.header.height,
                             txs = block.transactions.len(),
                             "produced block"

@@ -425,4 +425,154 @@ mod tests {
         let b = DomainId::from_name(&DomainName::new("b.uip").unwrap());
         assert_eq!(touched_domains(&block), vec![&a, &b]);
     }
+
+    // --- M8b regression: expired domains stay dead across a restart ---
+
+    fn mined_proof(prefix: &[u8], name: &str, difficulty: u32) -> Proof {
+        let mut challenge = Vec::new();
+        challenge.extend_from_slice(prefix);
+        challenge.extend_from_slice(name.as_bytes());
+        let checked = scone_core::pow::mine(scone_core::TESTNET.network_id, &challenge, difficulty);
+        Proof::from_bytes(scone_core::pow::encode_proof(&checked))
+    }
+
+    fn signed_claim_tld(sk: &SigningKey, tld: &str) -> Transaction {
+        sign(
+            Transaction::RegisterTld(scone_core::RegisterTld::register_tld_signed(
+                scone_core::TldName::new(tld).unwrap(),
+                1,
+                mined_proof(
+                    scone_core::id::TLD_ID_VERSION,
+                    tld,
+                    scone_core::TESTNET.tld_pow_difficulty,
+                ),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            sk,
+        )
+    }
+
+    fn signed_open_tld(sk: &SigningKey, tld: &str) -> Transaction {
+        sign(
+            Transaction::SetTldOpen(scone_core::SetTldOpen::set_tld_open_signed(
+                scone_core::TldId::from_tld(&scone_core::TldName::new(tld).unwrap()),
+                true,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            sk,
+        )
+    }
+
+    fn signed_register(sk: &SigningKey, name: &str) -> Transaction {
+        sign(
+            Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(name).unwrap(),
+                1,
+                mined_proof(
+                    scone_core::id::DOMAIN_ID_VERSION,
+                    name,
+                    scone_core::TESTNET.domain_pow_difficulty,
+                ),
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            )),
+            sk,
+        )
+    }
+
+    #[test]
+    fn gc_removals_are_persisted_no_resurrection_on_restart() {
+        // The M8b GC regression, end to end through the real paths:
+        // a domain registered at t=1000 expires at t=1000+TERM; the
+        // next block (timestamp past expiry) GCs it; the store write
+        // carries the removal; a reload of the same store serves an
+        // EMPTY domain registry.
+        use scone_blockchain::{BlockBuilder, DOMAIN_TERM_SECS};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::RedbStore::open(dir.path().join("chain.redb")).unwrap();
+        let mut chain = scone_blockchain::Blockchain::new();
+        let sk = SigningKey::from_bytes([0xab; 32]);
+
+        // Block 1 (t=1000): claim + open + register, one block, one
+        // atomic store append.
+        let block1 = {
+            let mut b = BlockBuilder::after(0, chain.tip_hash()).with_timestamp(1000);
+            b.push_tx(signed_claim_tld(&sk, "uip")).unwrap();
+            b.push_tx(signed_open_tld(&sk, "uip")).unwrap();
+            b.push_tx(signed_register(&sk, "ghost.uip")).unwrap();
+            b.build().unwrap()
+        };
+        let applied1 = chain.push_block_with_gc(&block1).unwrap();
+        assert!(applied1.gc_removed_domains.is_empty());
+        store_block(&mut store, &chain, &block1, applied1.hash).unwrap();
+
+        let ghost = DomainId::from_name(&DomainName::new("ghost.uip").unwrap());
+        assert!(chain.state().domain(&ghost).is_some());
+        assert_eq!(store.domain_count().unwrap(), 1);
+
+        // Block 2 (timestamp past expiry, e.g. +2 terms): the GC runs
+        // at the PARENT timestamp (block 1, t=1000) — the expiry
+        // (1000 + TERM) is not reached yet, nothing is removed. The
+        // block still lands (empty).
+        let block2 = BlockBuilder::after(1, chain.tip_hash())
+            .with_timestamp(1000 + 2 * DOMAIN_TERM_SECS)
+            .build()
+            .unwrap();
+        let applied2 = chain.push_block_with_gc(&block2).unwrap();
+        assert!(
+            applied2.gc_removed_domains.is_empty(),
+            "GC at parent t=1000 does not see an expiry at 1000+TERM"
+        );
+        store_block_with_removals(
+            &mut store,
+            &chain,
+            &block2,
+            applied2.hash,
+            &applied2.gc_removed_domains,
+        )
+        .unwrap();
+
+        // Block 3: now the parent IS block 2 (t past the expiry) —
+        // the GC removes ghost.uip and the removal reaches the store.
+        let block3 = BlockBuilder::after(2, chain.tip_hash())
+            .with_timestamp(1000 + 3 * DOMAIN_TERM_SECS)
+            .build()
+            .unwrap();
+        let applied3 = chain.push_block_with_gc(&block3).unwrap();
+        assert_eq!(
+            applied3.gc_removed_domains,
+            vec![ghost],
+            "the GC ran at the parent timestamp and reports the removal"
+        );
+        store_block_with_removals(
+            &mut store,
+            &chain,
+            &block3,
+            applied3.hash,
+            &applied3.gc_removed_domains,
+        )
+        .unwrap();
+        assert!(chain.state().domain(&ghost).is_none());
+        assert_eq!(
+            store.domain_count().unwrap(),
+            0,
+            "the expired state left the store in the same append"
+        );
+
+        // Restart: reload from the store — the expired domain is NOT
+        // resurrected (the pre-fix bug).
+        let reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert!(
+            reloaded.state().domain(&ghost).is_none(),
+            "an expired registration must stay dead across a restart"
+        );
+        assert_eq!(reloaded.height(), 3);
+
+        // And the replay path agrees bit for bit.
+        let replayed = load_chain_replay(&store).unwrap();
+        assert_eq!(replayed.state().domain(&ghost), None);
+        assert_eq!(reloaded.tip_hash(), replayed.tip_hash());
+    }
 }

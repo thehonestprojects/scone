@@ -114,9 +114,12 @@ borné : jamais plus d'un bloc en vol par pair.
 1. `push_block` : validation totale existante (parent = tip canonique,
    hauteur, Merkle recalculée, chaque transaction validée puis
    appliquée — atomique par bloc) ;
-2. si accepté : `store_block` (append delta atomique : bloc + tip +
-   états modifiés — upserts ET retraits : domaines expirés par le GC
-   déterministe, TLDs révoqués) ;
+2. si accepté : le relay lit l'issue d'application
+   (`push_block_with_gc` → hash + domaines retirés par le GC
+   déterministe) et persiste via `store_block_with_removals` (append
+   delta atomique : bloc + tip + états modifiés — upserts ET
+   retraits : domaines expirés, TLDs révoqués). Un redémarrage ne
+   peut donc jamais ressusciter un enregistrement expiré ;
 3. réconciliation du mempool (les tx incluses sont retirées) ;
 4. broadcast aux pairs (sauf l'émetteur).
 

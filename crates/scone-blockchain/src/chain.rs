@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use scone_protocol::limits::MAX_TXS_PER_BLOCK;
 use scone_protocol::{Block, BlockHash, PROTOCOL_VERSION};
 
-use scone_core::{NetworkParams, TESTNET};
+use scone_core::{DomainId, NetworkParams, TESTNET};
 
 use crate::block_hash::block_hash;
 use crate::consensus::{Consensus, PermissiveConsensus};
@@ -55,6 +55,20 @@ pub struct Blockchain<C: Consensus = PermissiveConsensus> {
     network: NetworkParams,
     state: ChainState,
     consensus: C,
+}
+
+/// What `push_block` actually changed (M8b): the accepted block's
+/// hash plus the state side-effects the caller must persist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedBlock {
+    /// Recomputed hash of the accepted block (new canonical tip).
+    pub hash: BlockHash,
+    /// Domains removed by the deterministic expiry-GC while applying
+    /// the block (evaluated at the parent block timestamp). The
+    /// storage layer deletes their persisted states in the same
+    /// atomic append — without this, a restart would reload expired
+    /// registrations until the next block lands.
+    pub gc_removed_domains: Vec<DomainId>,
 }
 
 impl Blockchain<PermissiveConsensus> {
@@ -217,6 +231,20 @@ impl<C: Consensus> Blockchain<C> {
     ///
     /// See [`BlockchainError`]; never panics.
     pub fn push_block(&mut self, block: &Block) -> Result<BlockHash> {
+        self.push_block_with_gc(block).map(|outcome| outcome.hash)
+    }
+
+    /// [`Blockchain::push_block`] returning the full application
+    /// outcome (M8b): the block hash **and the domains the
+    /// deterministic expiry-GC removed** while applying this block —
+    /// the caller persists those removals so a restart can never
+    /// resurrect an expired registration (see
+    /// `scone-storage::store_block_with_removals`).
+    ///
+    /// # Errors
+    ///
+    /// See [`BlockchainError`]; never panics.
+    pub fn push_block_with_gc(&mut self, block: &Block) -> Result<AppliedBlock> {
         let header = &block.header;
 
         // Parent: must extend the canonical tip.
@@ -277,7 +305,7 @@ impl<C: Consensus> Blockchain<C> {
         // transactions apply.
         let parent_time = self.tip().header.timestamp;
         let mut journal = crate::state::UndoLog::default();
-        self.state.gc_expired_journaled(parent_time, &mut journal);
+        let gc_removed_domains = self.state.gc_expired_journaled(parent_time, &mut journal);
         let apply = (|| {
             for tx in &block.transactions {
                 validate_transaction(tx)?;
@@ -299,7 +327,10 @@ impl<C: Consensus> Blockchain<C> {
         self.known_hashes.insert(hash);
         self.canonical.push(block.clone());
         self.tip = hash;
-        Ok(hash)
+        Ok(AppliedBlock {
+            hash,
+            gc_removed_domains,
+        })
     }
 }
 
@@ -967,6 +998,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn push_block_with_gc_reports_expired_domains() {
+        // M8b: the application outcome exposes the GC removals so the
+        // storage layer can delete them atomically with the block.
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        // claim_open_uip's block has timestamp height(1): register
+        // the domain in a block at t=1000.
+        chain
+            .push_block(
+                &child(&chain, vec![register_domain_tx("ghost.uip", 1)])
+                    .header
+                    .timestamp
+                    .checked_add(0)
+                    .map(|_| {
+                        let mut b = child(&chain, vec![register_domain_tx("ghost.uip", 1)]);
+                        b.header.timestamp = 1000;
+                        b.header.tx_root = tx_root(&b.transactions).unwrap();
+                        b
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let ghost = domain_id("ghost.uip");
+        assert!(chain.state().domain(&ghost).is_some());
+        // Next block at t past expiry: parent = the t=1000 block, so
+        // the GC at parent time does NOT see it yet (one-block lag,
+        // documented). Block after that: parent IS past expiry.
+        let far = 1000 + 2 * crate::state::DOMAIN_TERM_SECS;
+        let mut lag = child(&chain, vec![]);
+        lag.header.timestamp = far;
+        let applied_lag = chain.push_block_with_gc(&lag).unwrap();
+        assert!(applied_lag.gc_removed_domains.is_empty());
+        let mut after = child(&chain, vec![]);
+        after.header.timestamp = far + 1;
+        let applied = chain.push_block_with_gc(&after).unwrap();
+        assert_eq!(applied.gc_removed_domains, vec![ghost]);
+        assert!(chain.state().domain(&ghost).is_none());
+        // Plain push_block keeps its contract: returns the hash.
+        let mut empty = child(&chain, vec![]);
+        empty.header.timestamp = far + 2;
+        assert_eq!(chain.push_block(&empty).unwrap(), {
+            let mut probe = empty.clone();
+            probe.header.timestamp = far + 2;
+            crate::block_hash::block_hash(&probe.header).unwrap()
+        });
     }
 
     #[test]
