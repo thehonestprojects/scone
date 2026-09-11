@@ -45,6 +45,7 @@ pub mod consensus;
 pub mod error;
 pub mod genesis;
 pub mod merkle;
+pub mod smt;
 pub mod state;
 pub mod txid;
 pub mod validate;

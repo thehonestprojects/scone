@@ -12,7 +12,9 @@
 //! Concrete cryptography lives in `scone-crypto`; the core only calls it
 //! for hashing.
 
+pub mod checkpoint;
 pub mod error;
+pub mod icann_tlds;
 pub mod id;
 pub mod name;
 pub mod network;
@@ -21,6 +23,10 @@ pub mod pow;
 pub mod record;
 pub mod transaction;
 
+pub use checkpoint::{
+    CHECKPOINT_TAG, COMMITTEE_TAG, Checkpoint, CheckpointData, GENESIS_CHECKPOINT_HASH, Hash,
+    RECOVERY_TAG, SEED_TAG,
+};
 pub use error::{Result, SconeError};
 pub use id::{DomainId, TldId};
 pub use name::{DomainName, TldName};

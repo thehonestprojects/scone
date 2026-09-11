@@ -48,4 +48,8 @@ pub enum SconeError {
     /// A proof of work does not solve its challenge (see `pow`).
     #[error("invalid proof of work: {0}")]
     InvalidProof(String),
+
+    /// A checkpoint violates protocol invariants (see `checkpoint`).
+    #[error("invalid checkpoint: {0}")]
+    InvalidCheckpoint(String),
 }
