@@ -309,6 +309,48 @@ impl<C: Consensus> Blockchain<C> {
         self.included.contains_key(id)
     }
 
+    /// Rebuilds the anti-replay TXID index after a restore (M8).
+    ///
+    /// A restored chain starts with an empty `included` map — the
+    /// index is a pure function of the canonical chain, never
+    /// persisted as such. The storage layer reconstructs it at boot
+    /// by re-scanning the persisted window tail: every transaction
+    /// of the last [`REPLAY_WINDOW_BLOCKS`] blocks (at most — fewer
+    /// on a young chain) is re-inserted at its **original inclusion
+    /// height**, exactly as `push_block` would have recorded it.
+    /// A node that reboots and a node that never stopped therefore
+    /// hold identical indices and reject the same replays
+    /// (deterministic, same decisions at every height).
+    ///
+    /// Entries at or below `tip_height - REPLAY_WINDOW_BLOCKS` are
+    /// pruned by the same rule as `push_block` (`h > cutoff`):
+    /// callers feeding the full history converge too, and a caller
+    /// passing only the window tail pays no pruning at all. An entry
+    /// whose height exceeds the current tip is ignored (it cannot
+    /// exist on the canonical chain — caller error, not untrusted
+    /// data: heights come from the node store, already validated).
+    ///
+    /// No direct field access: this is the single sanctioned way to
+    /// mutate the index outside `push_block`.
+    pub fn rebuild_replay_index<I: Iterator<Item = (TxId, u64)>>(&mut self, entries: I) {
+        let tip = self.height();
+        let cutoff = tip.saturating_sub(REPLAY_WINDOW_BLOCKS);
+        for (id, height) in entries {
+            if height > tip || height <= cutoff {
+                continue;
+            }
+            self.included.insert(id, height);
+        }
+    }
+
+    /// Number of TXIDs currently held in the anti-replay index
+    /// (diagnostics and boot-reconstruction tests — the live bound
+    /// is `REPLAY_WINDOW_BLOCKS × txs/block`).
+    #[must_use]
+    pub fn replay_index_len(&self) -> usize {
+        self.included.len()
+    }
+
     /// Hash of the canonical block at `height`, if it is in the RAM
     /// window (fork classification, M7a: evicted heights answer
     /// `None` — the relay then goes through the node store).
@@ -639,6 +681,10 @@ mod tests {
             Transaction::RenewDomain(mut r) => {
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
+            }
+            Transaction::Slash(mut s) => {
+                s.signature = sk.sign(&payload);
+                Transaction::Slash(s)
             }
         }
     }
@@ -1611,25 +1657,114 @@ mod tests {
     }
 
     #[test]
-    fn restored_chain_starts_with_an_empty_replay_index() {
-        // `restore` does not replay blocks: the index starts empty
-        // (documented limitation, same as the RAM block window). The
-        // relay-side is_tx_included check is then permissive after a
-        // restart — the state rules remain the backstop, exactly like
-        // a tx whose window has expired.
+    fn restored_chain_rebuilds_replay_index_from_window_entries() {
+        // M8: `restore` itself still does not replay blocks (the
+        // index starts empty), but the storage layer now rebuilds it
+        // at boot through the public `rebuild_replay_index` API —
+        // the same entries, at their original inclusion heights.
         let mut chain = Blockchain::new();
         claim_open_uip(&mut chain, 1);
         let tx = register_domain_tx("example.uip", 1);
         let id = transaction_id(&tx).unwrap();
         chain.push_block(&child(&chain, vec![tx])).unwrap();
         assert!(chain.is_tx_included(&id));
-        let restored = Blockchain::restore(
+        let mut restored = Blockchain::restore(
             chain.height(),
             chain.tip_hash(),
             chain.block(chain.height()).unwrap().clone(),
             chain.state().clone(),
         );
-        assert!(!restored.is_tx_included(&id));
+        assert!(
+            !restored.is_tx_included(&id),
+            "restore alone still starts empty"
+        );
+        restored.rebuild_replay_index(std::iter::once((id, 2)));
+        assert!(restored.is_tx_included(&id));
+        assert_eq!(restored.replay_index_len(), 1);
+    }
+
+    #[test]
+    fn rebuild_replay_index_prunes_like_push_block() {
+        // Same pure rule as push_block: an entry survives while its
+        // inclusion height stays above tip - REPLAY_WINDOW_BLOCKS.
+        // Feeding entries from outside the window is a no-op, so a
+        // caller scanning the full history converges on the same
+        // index as one scanning only the tail.
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        chain
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .unwrap();
+        let extra = REPLAY_WINDOW_BLOCKS + 8;
+        for i in 0..extra {
+            chain
+                .push_block(&child(
+                    &chain,
+                    vec![update_domain_tx("example.uip", 1, i + 1)],
+                ))
+                .unwrap();
+        }
+        let tip = chain.height();
+        let cutoff = tip - REPLAY_WINDOW_BLOCKS;
+
+        let mut restored = Blockchain::restore(
+            tip,
+            chain.tip_hash(),
+            chain.block(tip).unwrap().clone(),
+            chain.state().clone(),
+        );
+        // Outside the window: ignored. At the boundary: kept.
+        // Intra-window duplicates: one entry per distinct TxId.
+        let old = transaction_id(&update_domain_tx("example.uip", 1, 1)).unwrap();
+        let boundary = transaction_id(&update_domain_tx("example.uip", 1, extra - 1)).unwrap();
+        let last = transaction_id(&update_domain_tx("example.uip", 1, extra)).unwrap();
+        restored.rebuild_replay_index(
+            [
+                (old, cutoff),          // == cutoff: pruned
+                (boundary, cutoff + 1), // first live height
+                (last, tip),
+                (last, tip), // duplicate: collapses
+            ]
+            .into_iter(),
+        );
+        assert!(!restored.is_tx_included(&old));
+        assert!(restored.is_tx_included(&boundary));
+        assert!(restored.is_tx_included(&last));
+        assert_eq!(restored.replay_index_len(), 2);
+        // An entry above the tip cannot exist canonically: ignored.
+        restored.rebuild_replay_index(std::iter::once((old, tip + 1)));
+        assert!(!restored.is_tx_included(&old));
+    }
+
+    #[test]
+    fn rebuilt_index_rejects_replay_after_restore() {
+        // The point of M8: a tx re-included within the window is
+        // rejected on a restored chain too — TxReplay, exactly like
+        // a live node, not the state-rule backstop.
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        let tx = update_domain_tx("example.uip", 1, 1);
+        chain
+            .push_block(&child(&chain, vec![register_domain_tx("example.uip", 1)]))
+            .unwrap();
+        let tx_h = chain.height() + 1;
+        chain.push_block(&child(&chain, vec![tx.clone()])).unwrap();
+        advance(&mut chain, REPLAY_WINDOW_BLOCKS - 1);
+
+        let tip = chain.height();
+        let mut restored = Blockchain::restore(
+            tip,
+            chain.tip_hash(),
+            chain.block(tip).unwrap().clone(),
+            chain.state().clone(),
+        );
+        restored.rebuild_replay_index(std::iter::once((transaction_id(&tx).unwrap(), tx_h)));
+        // The original block bytes replayed at tip+1: TxReplay.
+        let replay_block = child(&restored, vec![tx]);
+        assert_eq!(
+            restored.push_block(&replay_block),
+            Err(BlockchainError::TxReplay)
+        );
     }
 
     // ---- bounded RAM window (M7a) ----

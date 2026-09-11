@@ -357,9 +357,10 @@ pub(crate) fn tld_leaf_v2(id: &scone_core::TldId, st: &crate::state::TldState) -
 impl ChainState {
     /// PoS eligibility pool: public keys of owners of LIVE domains
     /// (`valid_until > now`) and owners of LIVE TLDs (a claim cost a
-    /// PoW — the TLD owner is a stakeholder), deduplicated by key.
-    /// One key with a hundred domains = one seat (economic
-    /// anti-Sybil is per identity, linear).
+    /// PoW — the TLD owner is a stakeholder), deduplicated by key —
+    /// **minus banned keys** (M9: a slashed equivocator is out of the
+    /// pool for life). One key with a hundred domains = one seat
+    /// (economic anti-Sybil is per identity, linear).
     #[must_use]
     pub fn eligible_validators(&self, now: u64) -> Vec<PublicKey> {
         let mut seen = HashSet::new();
@@ -368,6 +369,7 @@ impl ChainState {
             if state.valid_until > now
                 && seen.insert(state.owner)
                 && let Some(pk) = self.owner_public_key(state.owner)
+                && !self.banned.contains(&pk)
             {
                 out.push(pk);
             }
@@ -378,6 +380,7 @@ impl ChainState {
             // its owner is a stakeholder.
             if seen.insert(state.owner)
                 && let Some(pk) = self.owner_public_key(state.owner)
+                && !self.banned.contains(&pk)
             {
                 out.push(pk);
             }
@@ -386,16 +389,23 @@ impl ChainState {
     }
 
     /// Recomputes the state root: BLAKE3 over the domain-root, the
-    /// TLD-root and the owner-pool root (domain separation
-    /// `SCONE-STATE-V2`). Deterministic: two nodes with the same
-    /// logical state compute the same root.
+    /// TLD-root, the owner-pool root and the banned-root (domain
+    /// separation `SCONE-STATE-V2`). Deterministic: two nodes with the
+    /// same logical state compute the same root.
     ///
     /// This V2 direct fold is the **canonical commitment of the
-    /// current protocol version** — its format is frozen. The
-    /// incremental SMT engagement lives beside it
-    /// ([`ChainState::state_root_smt`]) and commits the exact same
-    /// leaves (see [`domain_leaf_v2`]/[`tld_leaf_v2`]), so the two
-    /// can never diverge on the logical state.
+    /// current protocol version**. The incremental SMT engagement
+    /// lives beside it ([`ChainState::state_root_smt`]) and commits
+    /// the exact same domain/TLD leaves (see
+    /// [`domain_leaf_v2`]/[`tld_leaf_v2`]), so the two can never
+    /// diverge on the logical state.
+    ///
+    /// M9: the ban list is part of the committed state — the leaf
+    /// per banned key is `BLAKE3("SCONE-LEAF-BAN-V1" || pk)` and the
+    /// banned-root folds them in key order (empty list = zero hash).
+    /// A checkpoint that finalizes a state without the ban would
+    /// contradict the state every honest node computes after the
+    /// SlashTx.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
         use std::collections::BTreeMap;
@@ -417,6 +427,7 @@ impl ChainState {
         let folded = fold_hashes(&leaves);
         top.extend_from_slice(&folded);
         top.extend_from_slice(&self.owner_pool_root());
+        top.extend_from_slice(&self.banned_root());
         scone_crypto::hash256(&[&top])
     }
 
@@ -430,6 +441,23 @@ impl ChainState {
                 let mut buf = Vec::with_capacity(16 + 32);
                 buf.extend_from_slice(b"SCONE-LEAF-OWN-V2");
                 buf.extend_from_slice(o.as_bytes());
+                scone_crypto::hash256(&[&buf])
+            })
+            .collect();
+        fold_hashes(&leaves)
+    }
+
+    /// Root of the ban list (M9): one `SCONE-LEAF-BAN-V1` leaf per
+    /// banned key, folded in ascending key order (deterministic).
+    fn banned_root(&self) -> [u8; 32] {
+        use std::collections::BTreeSet;
+        let banned: BTreeSet<_> = self.banned.iter().map(|pk| pk.to_bytes()).collect();
+        let leaves: Vec<[u8; 32]> = banned
+            .iter()
+            .map(|pk| {
+                let mut buf = Vec::with_capacity(16 + 32);
+                buf.extend_from_slice(b"SCONE-LEAF-BAN-V1");
+                buf.extend_from_slice(pk);
                 scone_crypto::hash256(&[&buf])
             })
             .collect();

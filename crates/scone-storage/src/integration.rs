@@ -25,7 +25,9 @@
 //! store_block(&mut store, &chain, &block, hash)?; // atomic delta persist
 //! ```
 
-use scone_blockchain::{Blockchain, DomainState, TldState, block_hash};
+use scone_blockchain::{
+    Blockchain, DomainState, REPLAY_WINDOW_BLOCKS, TldState, block_hash, transaction_id,
+};
 use scone_core::{DomainId, TldId, Transaction};
 use scone_protocol::{Block, BlockHash, decode_complete, encode_to_vec};
 
@@ -82,7 +84,8 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
             Transaction::RegisterTld(_)
             | Transaction::TransferTld(_)
             | Transaction::RevokeTld(_)
-            | Transaction::SetTldOpen(_) => None,
+            | Transaction::SetTldOpen(_)
+            | Transaction::Slash(_) => None,
         })
         .collect()
 }
@@ -246,11 +249,74 @@ pub fn load_chain(
             "meta tip hash {stored} != recomputed tip hash {actual}"
         )));
     }
-    if let Some(chain) = try_load_from_snapshot(store, network, tip_height, &tip_block, recomputed)
+    if let Some(mut chain) =
+        try_load_from_snapshot(store, network, tip_height, &tip_block, recomputed)
     {
+        rebuild_replay_index_from_store(store, &mut chain, tip_height)?;
         return Ok(chain);
     }
-    load_from_full_state(store, network, tip_height, &tip_block, recomputed)
+    let mut chain = load_from_full_state(store, network, tip_height, &tip_block, recomputed)?;
+    rebuild_replay_index_from_store(store, &mut chain, tip_height)?;
+    Ok(chain)
+}
+
+/// Rebuilds the anti-replay TXID index of a restored chain by
+/// re-scanning the persisted window tail (M8).
+///
+/// `load_chain` does not replay history, so the RAM index a
+/// `Blockchain::restore` starts with is empty — before M8 a
+/// restarted node accepted the re-inclusion of any transaction still
+/// inside its replay window (the state rules remained the only
+/// backstop). This closes that window: the last
+/// `min(REPLAY_WINDOW_BLOCKS, tip_height)` stored blocks are read
+/// one by one (memory-bounded — one block in RAM at a time) and
+/// every transaction is re-inserted in the index at its **original
+/// inclusion height** via the public
+/// [`Blockchain::rebuild_replay_index`] API (no private field
+/// access). The result is bit-identical to the index a live node
+/// holds: same entries, same prune rule.
+///
+/// The suffix-replay path (`try_load_from_snapshot`) reconstructs
+/// the index for the blocks it replays; this scan adds the part of
+/// the window BELOW the snapshot height — the snapshot never froze
+/// the index (same contract as owner keys / grace windows:
+/// non-consensus RAM structures are rebuilt, never persisted).
+///
+/// # Errors
+///
+/// [`StorageError::Corrupted`] if a window block is missing below
+/// the tip or fails canonical decoding — the window blocks are the
+/// same bytes the chain was built from, a failure means the store
+/// is damaged.
+pub fn rebuild_replay_index_from_store(
+    store: &impl NodeStore,
+    chain: &mut Blockchain,
+    tip_height: u64,
+) -> Result<()> {
+    let start = tip_height.saturating_sub(REPLAY_WINDOW_BLOCKS - 1).max(1);
+    let mut entries: Vec<(scone_blockchain::TxId, u64)> = Vec::new();
+    for height in start..=tip_height {
+        let Some(bytes) = store.block_at_height(height)? else {
+            return Err(StorageError::Corrupted(format!(
+                "blocks_by_height[{height}]: missing inside the replay window"
+            )));
+        };
+        let block: Block = decode_complete(&bytes)
+            .map_err(|e| StorageError::Corrupted(format!("block {height}: {e}")))?;
+        if block.header.height != height {
+            return Err(StorageError::Corrupted(format!(
+                "blocks_by_height[{height}]: block announces height {}",
+                block.header.height
+            )));
+        }
+        for tx in &block.transactions {
+            if let Ok(id) = transaction_id(tx) {
+                entries.push((id, height));
+            }
+        }
+    }
+    chain.rebuild_replay_index(entries.into_iter());
+    Ok(())
 }
 
 /// Snapshot boot path (M6b): restore the frozen state and replay only
@@ -510,6 +576,10 @@ mod tests {
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
             }
+            Transaction::Slash(mut x) => {
+                x.signature = sk.sign(&payload);
+                Transaction::Slash(x)
+            }
         }
     }
 
@@ -714,5 +784,241 @@ mod tests {
         let replayed = load_chain_replay(&store).unwrap();
         assert_eq!(replayed.state().domain(&ghost), None);
         assert_eq!(reloaded.tip_hash(), replayed.tip_hash());
+    }
+
+    // --- M8: persistent anti-replay TXID index (window rebuilt at boot) ---
+
+    /// Block height → deterministic increasing timestamp (no expiry
+    /// anywhere near: registrations last a year).
+    fn ts(height: u64) -> u64 {
+        1_000_000 + height * 60
+    }
+
+    /// Builds, pushes and atomically persists one block of `txs`.
+    fn push_and_store(
+        chain: &mut Blockchain,
+        store: &mut crate::RedbStore,
+        sk: &SigningKey,
+        txs: Vec<Transaction>,
+    ) {
+        let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash())
+            .with_timestamp(ts(chain.height() + 1))
+            .with_producer(sk);
+        for tx in txs {
+            builder.push_tx(tx).unwrap();
+        }
+        let block = builder.build().unwrap();
+        let hash = chain.push_block(&block).unwrap();
+        store_block(store, chain, &block, hash).unwrap();
+    }
+
+    /// Live chain with `uip` claimed+open, `ghost.uip` registered at
+    /// height 1, then one update per block up to `tip`. The store
+    /// holds the same chain.
+    fn window_chain(
+        tip: u64,
+    ) -> (
+        Blockchain,
+        crate::RedbStore,
+        tempfile::TempDir,
+        SigningKey,
+        Transaction,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::RedbStore::open(dir.path().join("chain.redb")).unwrap();
+        let mut chain = Blockchain::new();
+        let sk = SigningKey::from_bytes([0xcd; 32]);
+        let register = signed_register(&sk, "ghost.uip");
+        push_and_store(
+            &mut chain,
+            &mut store,
+            &sk,
+            vec![
+                signed_claim_tld(&sk, "uip"),
+                signed_open_tld(&sk, "uip"),
+                register.clone(),
+            ],
+        );
+        for sequence in 1..tip {
+            push_and_store(
+                &mut chain,
+                &mut store,
+                &sk,
+                vec![signed_update_domain(&sk, "ghost.uip", sequence)],
+            );
+        }
+        assert_eq!(chain.height(), tip);
+        (chain, store, dir, sk, register)
+    }
+
+    #[test]
+    fn boot_rebuilds_replay_index_rejects_in_window_replay() {
+        // Restart on a 65-block chain: the window tail (65 < 256 →
+        // everything) is re-scanned, and a tx re-included within the
+        // window is rejected as TxReplay — same decision as the live
+        // node, which was NOT the case before M8.
+        let tip = 65;
+        let (chain, store, _dir, sk, _register) = window_chain(tip);
+
+        // Sanity on the live side: the last update is protected.
+        let last_update = signed_update_domain(&sk, "ghost.uip", tip - 1);
+        let id = scone_blockchain::transaction_id(&last_update).unwrap();
+        assert!(chain.is_tx_included(&id));
+
+        // Re-including the tx at tip+1: TxReplay, not a state rule.
+        let mut reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert_eq!(reloaded.height(), tip);
+        assert!(
+            reloaded.is_tx_included(&id),
+            "M8: the replay index survives the restart"
+        );
+        let mut builder =
+            scone_blockchain::BlockBuilder::after(reloaded.height(), reloaded.tip_hash())
+                .with_timestamp(ts(tip + 1))
+                .with_producer(&sk);
+        builder.push_tx(last_update).unwrap();
+        let replay_block = builder.build().unwrap();
+        assert_eq!(
+            reloaded.push_block(&replay_block).unwrap_err(),
+            scone_blockchain::BlockchainError::TxReplay
+        );
+    }
+
+    #[test]
+    fn boot_rebuilt_index_lets_older_than_window_txs_back_in() {
+        // ghost.uip was registered at height 1, far outside the
+        // window of the 65-block tip? No — 65 < 256 keeps it IN the
+        // window; the scan protects it. The prune semantics stay
+        // unchanged: only what left the live index is accepted, so
+        // this test uses the live chain's own decisions as oracle.
+        let tip = 65;
+        let (chain, store, _dir, _sk, register) = window_chain(tip);
+        let register_id = scone_blockchain::transaction_id(&register).unwrap();
+        // Both nodes agree the registration is still protected.
+        assert!(chain.is_tx_included(&register_id));
+        let reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert!(reloaded.is_tx_included(&register_id));
+
+        // Now push past the window boundary on the LIVE chain: at
+        // tip = 1 + 256 the entry is pruned (retain(h > cutoff)).
+        // A store restarted THERE rebuilds without it — and the very
+        // same signed bytes are admissible again (state rules then
+        // reject the duplicate registration: prune semantics
+        // unchanged, exactly like a node that never stopped).
+        let mut live = chain;
+        let mut store = store;
+        let sk = SigningKey::from_bytes([0xcd; 32]);
+        let mut sequence = tip - 1;
+        while live.height() < 1 + scone_blockchain::REPLAY_WINDOW_BLOCKS {
+            sequence += 1;
+            push_and_store(
+                &mut live,
+                &mut store,
+                &sk,
+                vec![signed_update_domain(&sk, "ghost.uip", sequence)],
+            );
+        }
+        assert!(!live.is_tx_included(&register_id));
+
+        let mut reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert!(
+            !reloaded.is_tx_included(&register_id),
+            "older than the window: the rebuilt index pruned it too"
+        );
+        let mut builder =
+            scone_blockchain::BlockBuilder::after(reloaded.height(), reloaded.tip_hash())
+                .with_timestamp(ts(reloaded.height() + 1))
+                .with_producer(&sk);
+        builder.push_tx(register).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(
+            reloaded.push_block(&block).unwrap_err(),
+            scone_blockchain::BlockchainError::DomainAlreadyRegistered,
+            "outside the window the state rules decide again, not TxReplay"
+        );
+    }
+
+    #[test]
+    fn boot_replay_index_counts_exactly_min_window_height_blocks() {
+        // 65 < REPLAY_WINDOW_BLOCKS: the scan covers the whole
+        // chain — 3 txs at height 1 (claim+open+register) + 1 update
+        // at each height 2..=65 — and the reloaded index counts
+        // EXACTLY like the live one (3 + 64 = 67 entries, no more).
+        let tip = 65;
+        let (chain, store, _dir, _sk, _register) = window_chain(tip);
+        let reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert_eq!(reloaded.replay_index_len(), 3 + 64);
+        assert_eq!(reloaded.replay_index_len(), chain.replay_index_len());
+
+        // And load_chain_replay (zero-trust) holds the same index.
+        let replayed = load_chain_replay(&store).unwrap();
+        assert_eq!(replayed.replay_index_len(), 3 + 64);
+    }
+
+    #[test]
+    fn boot_replay_index_scan_is_capped_at_the_window() {
+        // A store with FEWER blocks than the window reconstitutes
+        // everything (previous test); a store with MORE scans only
+        // the last WINDOW blocks: the reloaded index equals the live
+        // pruned index bit for bit (the updates of heights
+        // 2..=WINDOW-7 fall outside and are absent on both sides).
+        let tip = scone_blockchain::REPLAY_WINDOW_BLOCKS + 12;
+        let (chain, store, _dir, _sk, _register) = window_chain(tip);
+        let reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert_eq!(
+            reloaded.replay_index_len(),
+            chain.replay_index_len(),
+            "rebuilt index == live pruned index"
+        );
+        // The window tail is protected on both sides identically.
+        let sk = SigningKey::from_bytes([0xcd; 32]);
+        for sequence in (tip - 3)..tip {
+            let tx = signed_update_domain(&sk, "ghost.uip", sequence);
+            let id = scone_blockchain::transaction_id(&tx).unwrap();
+            assert_eq!(reloaded.is_tx_included(&id), chain.is_tx_included(&id));
+            assert!(reloaded.is_tx_included(&id));
+        }
+    }
+
+    #[test]
+    fn snapshot_boot_also_rebuilds_the_replay_index() {
+        // M6b snapshot at height 64 (append of block 65 = 64+1
+        // triggers the freeze), suffix replay of block 65 alone —
+        // the snapshot never froze the anti-replay index (same
+        // contract as owner keys / grace windows). The boot scan
+        // adds the part of the window BELOW the snapshot: the
+        // ghost.uip registration of height 1 is protected again.
+        let tip = 65;
+        let (chain, store, _dir, sk, register) = window_chain(tip);
+
+        // The snapshot exists and sits strictly below the tip.
+        let meta = store.snapshot_meta().unwrap().unwrap();
+        assert_eq!(meta.height, 64);
+        assert!(meta.height < tip);
+
+        let mut reloaded = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert_eq!(reloaded.tip_hash(), chain.tip_hash());
+        let register_id = scone_blockchain::transaction_id(&register).unwrap();
+        assert!(
+            reloaded.is_tx_included(&register_id),
+            "height-1 tx re-protected across a snapshot boot (below H)"
+        );
+        // …and the replayed-suffix part (block 65) too, plus the
+        // exact count: 3 (block 1) + 64 (updates 2..=65) = 67.
+        assert_eq!(reloaded.replay_index_len(), 3 + 64);
+        assert_eq!(reloaded.replay_index_len(), chain.replay_index_len());
+
+        // End to end: re-including the height-1 registration inside
+        // the window is a TxReplay on the snapshot-booted chain.
+        let mut builder =
+            scone_blockchain::BlockBuilder::after(reloaded.height(), reloaded.tip_hash())
+                .with_timestamp(ts(tip + 1))
+                .with_producer(&sk);
+        builder.push_tx(register).unwrap();
+        let replay_block = builder.build().unwrap();
+        assert_eq!(
+            reloaded.push_block(&replay_block).unwrap_err(),
+            scone_blockchain::BlockchainError::TxReplay
+        );
     }
 }

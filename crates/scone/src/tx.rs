@@ -69,6 +69,7 @@ pub(crate) fn run_tx(command: TxCommand) -> Result<Vec<String>, CliError> {
                     ]);
                 }
                 scone_core::Transaction::UpdateDomain(_) => "update",
+                scone_core::Transaction::Slash(_) => "slash",
                 scone_core::Transaction::RegisterTld(_) => "register-tld",
                 scone_core::Transaction::TransferTld(_) => "transfer-tld",
                 scone_core::Transaction::RevokeTld(_) => "revoke-tld",
@@ -222,6 +223,24 @@ fn unsigned_into_transaction(
             network,
             domain_id,
             valid_until,
+            public_key,
+            scone_crypto::Signature::from_bytes([0; 64]),
+        )),
+        U::Slash {
+            network,
+            offender,
+            evidence_a,
+            sig_a,
+            evidence_b,
+            sig_b,
+            public_key,
+        } => scone_core::Transaction::Slash(scone_core::SlashTx::slash_on(
+            network,
+            offender,
+            evidence_a,
+            sig_a,
+            evidence_b,
+            sig_b,
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
@@ -464,6 +483,18 @@ fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transact
                 Signature::from_bytes([0; 64]),
             ))
         }
+        scone_core::Transaction::Slash(x) => {
+            scone_core::Transaction::Slash(scone_core::SlashTx::slash_on(
+                x.network,
+                x.offender,
+                x.evidence_a.clone(),
+                x.sig_a,
+                x.evidence_b.clone(),
+                x.sig_b,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ))
+        }
     }
 }
 
@@ -504,6 +535,10 @@ fn attach_signature(
         scone_core::Transaction::RenewDomain(mut r) => {
             r.signature = signature;
             scone_core::Transaction::RenewDomain(r)
+        }
+        scone_core::Transaction::Slash(mut x) => {
+            x.signature = signature;
+            scone_core::Transaction::Slash(x)
         }
     }
 }

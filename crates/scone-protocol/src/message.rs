@@ -46,6 +46,7 @@ pub mod msg_type {
 
 /// A P2P message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     /// Handshake. Direction: both ways. Payload: `version.v`.
     /// Expected response: `Hello`.

@@ -319,6 +319,17 @@ pour argent comptant :
 4. nombre de transactions ≤ `MAX_TXS_PER_BLOCK` (4096) ;
 5. `tx_root` recalculé sur les transactions dans l'ordre du bloc ;
 6. crochets du consensus (`validate_header`, `validate_tx`) ;
+6ter. **anti-replay TXID fenêtré (port .bak)** : une transaction dont
+   le `TxId` figure dans l'index des inclusions de la fenêtre
+   `REPLAY_WINDOW_BLOCKS = 256` derniers blocs est rejetée
+   (`TxReplay`). L'index (TxId → hauteur d'inclusion) est une
+   fonction pure de la chaîne canonique, élaguée du même pas ;
+   l'index est reconstruit au boot par le stockage (rescan des
+   derniers `min(256, hauteur)` blocs persistés — M8, voir
+   `/docs/technical/storage.md`) : un nœud redémarré rejette les
+   mêmes rejeux qu'un nœud vivant. Au-delà de la fenêtre, une
+   ré-inclusion reste soumise aux règles d'état (double claim,
+   replay de séquence).
 6bis. **producteur signé (M5, port .bak)** : le payload `consensus`
    doit décoder comme un payload producteur
    (`SCONE-BLOCK-V2 ‖ pk[32] ‖ sig[64]`, borné) ; la signature porte

@@ -259,6 +259,10 @@ impl Relay {
                 }
                 Ok(())
             }
+            // M9: slash evidence is self-contained — the cryptographic
+            // proof was checked by `validate_transaction`; the pool
+            // membership rule is enforced at application time.
+            Transaction::Slash(_) => Ok(()),
         }
     }
 

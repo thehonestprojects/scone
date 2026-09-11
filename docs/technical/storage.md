@@ -204,10 +204,19 @@ complet reste possible et sert de contrôle/repair.
   `RegisterDomain` sous ce TLD en `UnknownTld`, alors même que son
   disque détenait l'état complet). La chaîne RAM ne retient que
   genèse + tip ; les blocs historiques restent dans le store et sont
-  servis depuis lui.
+  servis depuis lui. Depuis M8, `load_chain` reconstruit ensuite
+  **l'index anti-replay TXID** (voir ci-dessous).
 - `load_chain_replay(store)` : rejoue tous les blocs stockés un par un
   (jamais tous en RAM) avec la validation complète ; le tip obtenu
   doit égaler le tip stocké, sinon `Corrupted`.
+- `rebuild_replay_index_from_store(store, chain, tip_height)` (M8) :
+  rescanne les derniers `min(REPLAY_WINDOW_BLOCKS, tip_height)`
+  blocs persistés (un bloc en RAM à la fois) et réinsère chaque TxId
+  dans l'index de la chaîne **à sa hauteur d'inclusion d'origine**,
+  via l'API publique `Blockchain::rebuild_replay_index` (aucun accès
+  aux champs privés). Bloc manquant sous le tip ou indécodable dans
+  la fenêtre → `Corrupted` (ces octets ont déjà servi à bâtir la
+  chaîne : une défaillance ici signale un store endommagé).
 - `touched_domains(block)` : ids des domaines modifiés par les
   transactions du bloc, dédupliqués, ordre du bloc.
 - `touched_tlds(block)` : ids des TLDs mutés par le bloc
@@ -282,14 +291,57 @@ Le suffixe rejoué est borné par `SNAPSHOT_INTERVAL` (au plus 64
 blocs au moment du déclenchement + les blocs minés depuis) : le boot
 est O(tip − H) avec H garanti récent.
 
+## Index anti-replay TXID reconstruit au boot (M8)
+
+L'index anti-replay (`included`, TxId → hauteur d'inclusion, fenêtre
+`REPLAY_WINDOW_BLOCKS = 256` — voir `/docs/technical/blockchain.md`)
+est une **fonction pure de la chaîne canonique** : il n'est jamais
+persisté. `load_chain` ne rejouant pas l'historique, une chaîne
+restaurée démarrait avant M8 avec un index **vide** — un nœud
+redémarré acceptait la ré-inclusion de toute transaction encore dans
+sa fenêtre de rejeu (limitation documentée ; les règles d'état
+demeuraient le seul garde-fou).
+
+M8 ferme cette fenêtre : après la restauration (chemin complet OU
+snapshot + rejeu de suffixe), `load_chain` appelle
+`rebuild_replay_index_from_store`, qui relit les derniers
+`min(REPLAY_WINDOW_BLOCKS, tip_height)` blocs persistés — un bloc en
+RAM à la fois, borné mémoire comme partout — et réinsère chaque TxId
+à sa **hauteur d'origine**. Un store de moins de 256 blocs
+reconstitue donc tout son index.
+
+Propriétés :
+
+- **Décisions identiques au nœud vivant** : mêmes entrées, même règle
+  d'élagage (`h > tip − 256`) — un nœud qui redémarre et un nœud qui
+  n'a jamais arrêté rejettent les mêmes rejeux (testé : comptage
+  exact de l'index et égalité avec l'index vivant élagué).
+- **Sémantique d'élagage inchangée** : une transaction plus vieille
+  que la fenêtre reste admise par l'index (et échoue ensuite sur les
+  règles d'état si applicable) — exactement comme avant.
+- **Le snapshot ne gèle PAS l'index** : le rejeu de suffixe du
+  snapshot reconstruit les entrées au-dessus de H, le rescan M8
+  ajoute la partie de la fenêtre SOUS H (même contrat que
+  owner_keys/grace : reconstruits, jamais persistés).
+- **Coût** : ≤ 256 lectures bloc ponctuelles au boot, O(fenêtre) —
+  indépendant de l'âge de la chaîne.
+- Un bloc manquant ou indécodable **dans la fenêtre** fait échouer le
+  boot en `Corrupted` (ces octets ont déjà servi à bâtir la chaîne) ;
+  en dehors de la fenêtre, les blocs historiques ne sont pas touchés.
+
+`load_chain_replay` (confiance zéro) reconstruit l'index de la même
+manière par son rejeu complet — les deux chemins convergent.
+
 ### Ce que le snapshot n'engage PAS
 
 L'état RAM `ChainState` porte des structures internes non engagées
 par la consensus (clés d'owners, fenêtres de grâce). Elles ne sont
 PAS gelées : le rejeu du suffixe les reconstruit par application des
 transactions (déterministe, même contenu que le rejeu complet pour
-la fenêtre concernée). L'égalité bit à bit avec `load_chain_replay`
-est vérifiée par test sur l'état canonique (state_root V2 + SMT).
+la fenêtre concernée). L'index anti-replay TXID suit le même contrat
+(M8, voir section précédente) : reconstruit au boot, jamais gelé.
+L'égalité bit à bit avec `load_chain_replay` est vérifiée par test
+sur l'état canonique (state_root V2 + SMT).
 
 ## Politique mémoire
 
@@ -387,7 +439,15 @@ Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
   corrompu, état indécodable, hauteur > pointe, méta de mauvaise
   longueur) → repli silencieux sur le chargement complet, même
   chaîne finale ; suffixe rejoué < intervalle ; remplacement (pas
-  accumulation) du snapshot au franchissement de l'intervalle ;
-  store pré-M6b sans tables snapshot charge à l'identique.
+  d'accumulation) du snapshot au franchissement de l'intervalle ;
+  store pré-M6b sans tables snapshot charge à l'identique ;
+- M8 : index anti-replay reconstruit au boot — une tx ré-incluse
+  dans la fenêtre est rejetée (`TxReplay`) après restore ; une tx
+  plus vieille que la fenêtre est admise (élagage inchangé, les
+  règles d'état décident) ; comptage exact == index vivant (==
+  `load_chain_replay`) pour un store plus court ET plus long que la
+  fenêtre ; boot snapshot : la partie de la fenêtre sous H est
+  reconstituée par le rescan, la partie au-dessus par le rejeu de
+  suffixe.
 
 [`ChainState`]: ../../../crates/scone-blockchain/src/state.rs

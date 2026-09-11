@@ -10,6 +10,7 @@
 //!   0xB8 SetTldOpen       (M8a)
 //!   0xD4 AssignDomain     (M8a)
 //!   0x3C RenewDomain      (M8a)
+//!   0x15 Slash            (M9 — checkpoint equivocation evidence)
 //! ```
 //!
 //! The `version` byte after the discriminator must be exactly
@@ -26,8 +27,9 @@
 //! **without** the signature. See `/docs/technical/transactions.md` (normative).
 
 use scone_core::{
-    AssignDomain, DomainId, DomainName, OwnerId, Proof, RecordHash, RegisterDomain, RegisterTld,
-    RenewDomain, RevokeTld, SetTldOpen, Transaction, TransferTld, UpdateDomain,
+    AssignDomain, CheckpointData, DomainId, DomainName, OwnerId, Proof, RecordHash, RegisterDomain,
+    RegisterTld, RenewDomain, RevokeTld, SetTldOpen, SlashTx, Transaction, TransferTld,
+    UpdateDomain,
 };
 use scone_crypto::{PublicKey, Signature};
 
@@ -60,6 +62,8 @@ pub mod tx_type {
     pub const ASSIGN_DOMAIN: u8 = 0xD4;
     /// Extends a domain registration (M8a).
     pub const RENEW_DOMAIN: u8 = 0x3C;
+    /// Equivocation evidence against a checkpoint anchor (M9).
+    pub const SLASH: u8 = 0x15;
 }
 
 /// Version byte of the signed transaction format.
@@ -410,6 +414,48 @@ impl Decode for RenewDomain {
     }
 }
 
+// Slash (M9) = network(str ≤ 16) || offender[32]
+//        || evidence_a (116 fixed) || sig_a[64]
+//        || evidence_b (116 fixed) || sig_b[64]
+//        || public_key[32] || signature[64]
+//
+// The evidence bodies reuse the canonical 116-byte `CheckpointData`
+// encoding of `scone-protocol::checkpoint` (fixed size, no length
+// prefix: a checkpoint is a fixed-size commitment). Validation at
+// encode AND decode re-runs the pure cryptographic evidence check —
+// an invalid proof is never a valid wire transaction.
+
+impl Encode for SlashTx {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
+        self.offender.encode(out)?;
+        self.evidence_a.encode(out)?;
+        self.sig_a.encode(out)?;
+        self.evidence_b.encode(out)?;
+        self.sig_b.encode(out)?;
+        self.public_key.encode(out)?;
+        self.signature.encode(out)
+    }
+}
+
+impl Decode for SlashTx {
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let slash = Self {
+            network: scone_core::NetworkId::decode(input)?,
+            offender: PublicKey::decode(input)?,
+            evidence_a: CheckpointData::decode(input)?,
+            sig_a: Signature::decode(input)?,
+            evidence_b: CheckpointData::decode(input)?,
+            sig_b: Signature::decode(input)?,
+            public_key: PublicKey::decode(input)?,
+            signature: Signature::decode(input)?,
+        };
+        slash.validate().map_err(ProtocolError::Validation)?;
+        Ok(slash)
+    }
+}
+
 impl Encode for Transaction {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
@@ -453,6 +499,11 @@ impl Encode for Transaction {
                 out.push(TX_FORMAT_VERSION);
                 tx.encode(out)
             }
+            Self::Slash(tx) => {
+                out.push(tx_type::SLASH);
+                out.push(TX_FORMAT_VERSION);
+                tx.encode(out)
+            }
         }
     }
 }
@@ -473,6 +524,7 @@ impl Decode for Transaction {
             tx_type::SET_TLD_OPEN => Self::SetTldOpen(SetTldOpen::decode(input)?),
             tx_type::ASSIGN_DOMAIN => Self::AssignDomain(AssignDomain::decode(input)?),
             tx_type::RENEW_DOMAIN => Self::RenewDomain(RenewDomain::decode(input)?),
+            tx_type::SLASH => Self::Slash(SlashTx::decode(input)?),
             value => {
                 return Err(ProtocolError::UnknownDiscriminant {
                     kind: "transaction",
@@ -486,6 +538,7 @@ impl Decode for Transaction {
 /// The unsigned view of a transaction, used to build the signing
 /// payload.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum UnsignedTransaction {
     /// See [`scone_core::RegisterDomain`].
     RegisterDomain {
@@ -601,6 +654,24 @@ pub enum UnsignedTransaction {
         /// Signer public key.
         public_key: PublicKey,
     },
+    /// See [`scone_core::SlashTx`] (M9 — equivocation evidence). The
+    /// reporter signs everything except their own signature.
+    Slash {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
+        /// The accused anchor's key.
+        offender: PublicKey,
+        /// First signed checkpoint of the conflicting pair.
+        evidence_a: scone_core::CheckpointData,
+        /// Offender's signature over `evidence_a`.
+        sig_a: Signature,
+        /// Second signed checkpoint of the conflicting pair.
+        evidence_b: scone_core::CheckpointData,
+        /// Offender's signature over `evidence_b`.
+        sig_b: Signature,
+        /// Reporter's public key.
+        public_key: PublicKey,
+    },
 }
 
 impl From<&Transaction> for UnsignedTransaction {
@@ -665,6 +736,15 @@ impl From<&Transaction> for UnsignedTransaction {
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 valid_until: tx.valid_until,
+                public_key: tx.public_key,
+            },
+            Transaction::Slash(tx) => Self::Slash {
+                network: tx.network,
+                offender: tx.offender,
+                evidence_a: tx.evidence_a.clone(),
+                sig_a: tx.sig_a,
+                evidence_b: tx.evidence_b.clone(),
+                sig_b: tx.sig_b,
                 public_key: tx.public_key,
             },
         }
@@ -804,6 +884,25 @@ impl Encode for UnsignedTransaction {
                 varint::put_u64(*valid_until, out);
                 public_key.encode(out)
             }
+            Self::Slash {
+                network,
+                offender,
+                evidence_a,
+                sig_a,
+                evidence_b,
+                sig_b,
+                public_key,
+            } => {
+                out.push(tx_type::SLASH);
+                out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
+                offender.encode(out)?;
+                evidence_a.encode(out)?;
+                sig_a.encode(out)?;
+                evidence_b.encode(out)?;
+                sig_b.encode(out)?;
+                public_key.encode(out)
+            }
         }
     }
 }
@@ -875,6 +974,15 @@ impl Decode for UnsignedTransaction {
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 valid_until: u64::decode(input)?,
+                public_key: PublicKey::decode(input)?,
+            },
+            tx_type::SLASH => Self::Slash {
+                network: scone_core::NetworkId::decode(input)?,
+                offender: PublicKey::decode(input)?,
+                evidence_a: CheckpointData::decode(input)?,
+                sig_a: Signature::decode(input)?,
+                evidence_b: CheckpointData::decode(input)?,
+                sig_b: Signature::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             value => {
@@ -1196,6 +1304,138 @@ mod tests {
             decode_complete::<Transaction>(&bytes).unwrap(),
             Transaction::RenewDomain(signed_renew_domain())
         );
+    }
+
+    // --- M9: Slash (equivocation evidence) ---
+
+    fn evidence(epoch: u64, height: u64, root: u8) -> scone_core::CheckpointData {
+        scone_core::CheckpointData {
+            epoch,
+            height,
+            block_hash: [root; 32],
+            prev_checkpoint_hash: [0x42; 32],
+            state_root: [root; 32],
+            recovery: 0,
+        }
+    }
+
+    /// Valid slash: key 1 double-signed epoch 7 (same prev, distinct
+    /// roots), reporter key 9 signs the tx properly.
+    fn signed_slash() -> SlashTx {
+        let offender = key(1);
+        let a = evidence(7, 10, 1);
+        let b = evidence(7, 11, 2);
+        let unsigned = Transaction::Slash(SlashTx::slash_signed(
+            offender.public_key(),
+            a.clone(),
+            offender.sign(&a.signing_hash()),
+            b.clone(),
+            offender.sign(&b.signing_hash()),
+            key(9).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = signing_payload(&unsigned).unwrap();
+        match unsigned {
+            Transaction::Slash(mut tx) => {
+                tx.signature = key(9).sign(&payload);
+                tx
+            }
+            _ => unreachable!("just built a Slash"),
+        }
+    }
+
+    #[test]
+    fn slash_roundtrip_and_layout() {
+        let bytes = encode_to_vec(&Transaction::Slash(signed_slash())).unwrap();
+        assert_eq!(bytes[0], 0x15);
+        assert_eq!(bytes[1], TX_FORMAT_VERSION);
+        // disc + version + network (1 + 14) + offender 32
+        // + evidence 116 + sig 64 + evidence 116 + sig 64
+        // + pk 32 + signature 64.
+        assert_eq!(bytes.len(), 1 + 1 + 14 + 32 + 116 + 64 + 116 + 64 + 32 + 64);
+        assert_eq!(
+            decode_complete::<Transaction>(&bytes).unwrap(),
+            Transaction::Slash(signed_slash())
+        );
+    }
+
+    #[test]
+    fn slash_signing_payload_is_what_the_reporter_signs() {
+        let tx = Transaction::Slash(signed_slash());
+        let payload = signing_payload(&tx).unwrap();
+        // The reporter's key verifies over the payload…
+        assert!(key(9).public_key().verify(&payload, tx.signature()));
+        // …the offender's key does NOT (they never signed the report).
+        assert!(!key(1).public_key().verify(&payload, tx.signature()));
+        // Tampering the payload breaks the reporter's signature.
+        let mut tampered = payload.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(!key(9).public_key().verify(&tampered, tx.signature()));
+        // The evidence signatures cover the checkpoint hashes, which
+        // are part of the signed payload too — a moved evidence byte
+        // breaks BOTH the report signature and the proof.
+        let mut moved = tx.clone();
+        if let Transaction::Slash(slash) = &mut moved {
+            slash.evidence_a.state_root = [0xee; 32];
+        }
+        assert_ne!(signing_payload(&moved).unwrap(), payload);
+        assert!(!moved.validate().is_ok());
+    }
+
+    #[test]
+    fn slash_invalid_evidence_is_rejected_on_encode_and_decode() {
+        // Same checkpoint twice: not an equivocation — the tx is
+        // invalid as a whole, encode refuses it.
+        let offender = key(1);
+        let a = evidence(7, 10, 1);
+        let _b = a.clone(); // same data twice: NOT an equivocation
+        let sig = offender.sign(&a.signing_hash());
+        let bad = Transaction::Slash(SlashTx::slash_signed(
+            offender.public_key(),
+            a.clone(),
+            sig,
+            a.clone(),
+            sig,
+            key(9).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        assert!(encode_to_vec(&bad).is_err());
+        // And hand-built wire bytes with invalid evidence are
+        // rejected on decode (validation runs at decode).
+        let mut bytes = Vec::new();
+        bytes.push(tx_type::SLASH);
+        bytes.push(TX_FORMAT_VERSION);
+        scone_core::TESTNET.network_id.encode(&mut bytes).unwrap();
+        offender.public_key().encode(&mut bytes).unwrap();
+        a.clone().encode(&mut bytes).unwrap();
+        sig.clone().encode(&mut bytes).unwrap();
+        a.encode(&mut bytes).unwrap();
+        sig.encode(&mut bytes).unwrap();
+        key(9).public_key().encode(&mut bytes).unwrap();
+        Signature::from_bytes([0; 64]).encode(&mut bytes).unwrap();
+        assert!(decode_complete::<Transaction>(&bytes).is_err());
+    }
+
+    #[test]
+    fn slash_truncated_and_corrupted_never_panics() {
+        let bytes = encode_to_vec(&Transaction::Slash(signed_slash())).unwrap();
+        for end in 0..bytes.len() {
+            assert!(decode_complete::<Transaction>(&bytes[..end]).is_err());
+        }
+        for i in 0..bytes.len() {
+            for mask in [0x01u8, 0x80, 0xff] {
+                let mut corrupted = bytes.clone();
+                corrupted[i] ^= mask;
+                let _ = decode_complete::<Transaction>(&corrupted);
+            }
+        }
+    }
+
+    #[test]
+    fn slash_encoding_is_deterministic() {
+        let tx = Transaction::Slash(signed_slash());
+        assert_eq!(encode_to_vec(&tx).unwrap(), encode_to_vec(&tx).unwrap());
     }
 
     #[test]

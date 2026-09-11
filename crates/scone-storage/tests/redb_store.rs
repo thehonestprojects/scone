@@ -110,6 +110,10 @@ fn build_block(
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
             }
+            Transaction::Slash(mut x) => {
+                x.signature = sk.sign(&payload);
+                Transaction::Slash(x)
+            }
         }
     };
     let mut builder = scone_blockchain::BlockBuilder::after(chain.height(), chain.tip_hash())
@@ -356,6 +360,10 @@ fn stored_domain_states_match_replayed_state() {
                 Transaction::RenewDomain(mut r) => {
                     r.signature = sk.sign(&payload);
                     Transaction::RenewDomain(r)
+                }
+                Transaction::Slash(mut x) => {
+                    x.signature = sk.sign(&payload);
+                    Transaction::Slash(x)
                 }
             }
         };

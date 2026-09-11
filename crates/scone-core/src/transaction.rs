@@ -29,6 +29,7 @@
 
 use scone_crypto::{PublicKey, Signature};
 
+use crate::checkpoint::CheckpointData;
 use crate::error::{Result, SconeError};
 use crate::id::{DomainId, TldId};
 use crate::name::{DomainName, TldName};
@@ -760,8 +761,148 @@ impl RenewDomain {
     }
 }
 
+/// Self-contained proof of checkpoint **equivocation** (M9, §9 of
+/// the security model): the accused anchor signed TWO CONFLICTING
+/// checkpoints at the SAME epoch, and anyone holding both signatures
+/// can submit the proof on-chain (a "fraction fault proof" — one
+/// honest witness suffices).
+///
+/// The cryptographic evidence is checked **without any chain
+/// context** by [`SlashTx::verify_evidence`]: same epoch AND same
+/// `prev_checkpoint_hash` (the conflicting context), distinct signing
+/// hashes, and both signatures verifying under the SAME embedded
+/// `offender` key. A signature over an abandoned branch remains a
+/// valid proof forever.
+///
+/// The transaction itself is signed by an unrelated **reporter**
+/// (standard transaction signature over the canonical signing
+/// payload): they are only the messenger — the evidence speaks for
+/// itself, and an eventual reporter incentive would be a state rule,
+/// not a change here. The reporter pays nothing and gains nothing
+/// today; their signature merely makes the tx a well-formed signed
+/// transaction of the network (uniform validation) and gives the
+/// anti-replay `TxId` a stable signer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SlashTx {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
+    /// The accused anchor's key (dedup/state target — redundant with
+    /// the evidence, recomputed against it by `verify_evidence`).
+    pub offender: PublicKey,
+    /// First signed checkpoint of the conflicting pair.
+    pub evidence_a: CheckpointData,
+    /// Offender's signature over `evidence_a.signing_hash()`.
+    pub sig_a: Signature,
+    /// Second signed checkpoint of the conflicting pair.
+    pub evidence_b: CheckpointData,
+    /// Offender's signature over `evidence_b.signing_hash()`.
+    pub sig_b: Signature,
+    /// Reporter's Ed25519 public key (signs the tx itself).
+    pub public_key: PublicKey,
+    /// Reporter's signature over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl SlashTx {
+    /// Builds a `SlashTx` for the **testnet** from raw evidence (the
+    /// reporter's signature must be produced over
+    /// `scone_protocol::signing_payload` of the result).
+    #[must_use]
+    pub fn slash_signed(
+        offender: PublicKey,
+        evidence_a: CheckpointData,
+        sig_a: Signature,
+        evidence_b: CheckpointData,
+        sig_b: Signature,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self::slash_on(
+            TESTNET.network_id,
+            offender,
+            evidence_a,
+            sig_a,
+            evidence_b,
+            sig_b,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a `SlashTx` for `network` (see
+    /// [`SlashTx::slash_signed`]).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn slash_on(
+        network: NetworkId,
+        offender: PublicKey,
+        evidence_a: CheckpointData,
+        sig_a: Signature,
+        evidence_b: CheckpointData,
+        sig_b: Signature,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            network,
+            offender,
+            evidence_a,
+            sig_a,
+            evidence_b,
+            sig_b,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Verifies the **cryptographic** evidence, with no chain state:
+    ///
+    /// - both checkpoints are at the SAME epoch AND chain the SAME
+    ///   `prev_checkpoint_hash` (the conflicting context — the height
+    ///   may differ: two checkpoints chaining the same parent at the
+    ///   same epoch are contradictory regardless);
+    /// - their signing hashes are DISTINCT (signing the same
+    ///   checkpoint twice is not an equivocation);
+    /// - `sig_a` / `sig_b` verify under the SAME `offender` key over
+    ///   the respective signing hashes (`verify_strict`).
+    #[must_use]
+    pub fn verify_evidence(&self) -> bool {
+        let (a, b) = (&self.evidence_a, &self.evidence_b);
+        if a.epoch != b.epoch || a.prev_checkpoint_hash != b.prev_checkpoint_hash {
+            return false; // different contexts: not an equivocation
+        }
+        let msg_a = a.signing_hash();
+        let msg_b = b.signing_hash();
+        if msg_a == msg_b {
+            return false; // identical checkpoints: no contradiction
+        }
+        self.offender.verify(&msg_a, &self.sig_a) && self.offender.verify(&msg_b, &self.sig_b)
+    }
+
+    /// Checks protocol invariants: the reporter's key must be on the
+    /// curve (decode-checked on the wire) and the evidence must be
+    /// cryptographically self-consistent (the proof is the payload —
+    /// a structurally invalid proof is an invalid transaction, not a
+    /// state failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidCheckpoint`] when the evidence
+    /// does not verify (different epochs, different parents, same
+    /// checkpoint twice, or a signature that fails under `offender`).
+    pub fn validate(&self) -> Result<()> {
+        if !self.verify_evidence() {
+            return Err(SconeError::InvalidCheckpoint(
+                "slash evidence is not a valid equivocation proof".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A signed blockchain transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub enum Transaction {
     /// See [`RegisterDomain`].
     RegisterDomain(RegisterDomain),
@@ -779,6 +920,8 @@ pub enum Transaction {
     AssignDomain(AssignDomain),
     /// See [`RenewDomain`] (domain registry, M8a).
     RenewDomain(RenewDomain),
+    /// See [`SlashTx`] (checkpoint equivocation proof, M9).
+    Slash(SlashTx),
 }
 
 impl Transaction {
@@ -794,6 +937,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.network,
             Self::AssignDomain(tx) => tx.network,
             Self::RenewDomain(tx) => tx.network,
+            Self::Slash(tx) => tx.network,
         }
     }
 
@@ -809,6 +953,10 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.owner,
             Self::AssignDomain(tx) => tx.owner,
             Self::RenewDomain(tx) => tx.owner,
+            // M9: the reporter is NOT the (only) owner of the tx — the
+            // accused is. Expose the reporter's identity: it is the
+            // derivation of the embedded key, like every owner.
+            Self::Slash(tx) => owner_of(&tx.public_key),
         }
     }
 
@@ -823,6 +971,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => &tx.public_key,
             Self::AssignDomain(tx) => &tx.public_key,
             Self::RenewDomain(tx) => &tx.public_key,
+            Self::Slash(tx) => &tx.public_key,
         }
     }
 
@@ -837,6 +986,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => &tx.signature,
             Self::AssignDomain(tx) => &tx.signature,
             Self::RenewDomain(tx) => &tx.signature,
+            Self::Slash(tx) => &tx.signature,
         }
     }
 
@@ -865,6 +1015,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.validate(),
             Self::AssignDomain(tx) => tx.validate(),
             Self::RenewDomain(tx) => tx.validate(),
+            Self::Slash(tx) => tx.validate(),
         }
     }
 }
@@ -1328,5 +1479,147 @@ mod tests {
             placeholder_signature(),
         );
         assert_eq!(renew.network, TESTNET.network_id);
+    }
+
+    // --- M9: SlashTx (equivocation evidence) ---
+
+    use crate::checkpoint::CheckpointData;
+
+    fn evidence(epoch: u64, height: u64, root: u8) -> CheckpointData {
+        CheckpointData {
+            epoch,
+            height,
+            block_hash: [root; 32],
+            prev_checkpoint_hash: [0x42; 32],
+            state_root: [root; 32],
+            recovery: 0,
+        }
+    }
+
+    /// A valid SlashTx: key 1 double-signed two conflicting
+    /// checkpoints at epoch 7 (same prev, distinct roots), reporter
+    /// key 9.
+    fn valid_slash() -> SlashTx {
+        let offender = key(1);
+        let a = evidence(7, 10, 1);
+        let b = evidence(7, 11, 2);
+        let sig_a = offender.sign(&a.signing_hash());
+        let sig_b = offender.sign(&b.signing_hash());
+        SlashTx::slash_signed(
+            offender.public_key(),
+            a,
+            sig_a,
+            b,
+            sig_b,
+            key(9).public_key(),
+            placeholder_signature(),
+        )
+    }
+
+    #[test]
+    fn slash_valid_evidence_verifies() {
+        let tx = valid_slash();
+        assert!(tx.verify_evidence());
+        assert!(tx.validate().is_ok());
+        assert!(Transaction::Slash(tx).validate().is_ok());
+    }
+
+    #[test]
+    fn slash_same_checkpoint_twice_is_not_an_equivocation() {
+        let offender = key(1);
+        let a = evidence(7, 10, 1);
+        let sig = offender.sign(&a.signing_hash());
+        let tx = SlashTx::slash_signed(
+            offender.public_key(),
+            a.clone(),
+            sig,
+            a,
+            sig,
+            key(9).public_key(),
+            placeholder_signature(),
+        );
+        assert!(!tx.verify_evidence());
+        assert!(matches!(
+            tx.validate(),
+            Err(SconeError::InvalidCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn slash_different_epoch_is_not_an_equivocation() {
+        let offender = key(1);
+        let a = evidence(7, 10, 1);
+        let b = evidence(8, 11, 2);
+        let tx = SlashTx::slash_signed(
+            offender.public_key(),
+            a.clone(),
+            offender.sign(&a.signing_hash()),
+            b.clone(),
+            offender.sign(&b.signing_hash()),
+            key(9).public_key(),
+            placeholder_signature(),
+        );
+        assert!(!tx.verify_evidence());
+    }
+
+    #[test]
+    fn slash_different_parent_is_not_an_equivocation() {
+        let offender = key(1);
+        let mut a = evidence(7, 10, 1);
+        let mut b = evidence(7, 11, 2);
+        b.prev_checkpoint_hash = [0x99; 32];
+        a.prev_checkpoint_hash = [0x42; 32];
+        let tx = SlashTx::slash_signed(
+            offender.public_key(),
+            a.clone(),
+            offender.sign(&a.signing_hash()),
+            b.clone(),
+            offender.sign(&b.signing_hash()),
+            key(9).public_key(),
+            placeholder_signature(),
+        );
+        assert!(!tx.verify_evidence());
+    }
+
+    #[test]
+    fn slash_forged_signature_is_rejected() {
+        // A signature produced by ANOTHER key does not verify under
+        // the offender.
+        let mut tx = valid_slash();
+        tx.sig_b = key(2).sign(&tx.evidence_b.signing_hash());
+        assert!(!tx.verify_evidence());
+        // Tampered bytes as well.
+        let mut tx = valid_slash();
+        let mut raw = tx.sig_a.to_bytes();
+        raw[0] ^= 0x01;
+        tx.sig_a = Signature::from_bytes(raw);
+        assert!(!tx.verify_evidence());
+    }
+
+    #[test]
+    fn slash_wrong_offender_key_is_rejected() {
+        // Evidence signed by key 1, but key 2 is accused.
+        let mut tx = valid_slash();
+        tx.offender = key(2).public_key();
+        assert!(!tx.verify_evidence());
+    }
+
+    #[test]
+    fn slash_different_heights_same_context_still_equivocation() {
+        // Two checkpoints chaining the SAME parent at the SAME epoch
+        // conflict even at different heights (documented rule).
+        let tx = valid_slash();
+        assert_ne!(tx.evidence_a.height, tx.evidence_b.height);
+        assert!(tx.verify_evidence());
+    }
+
+    #[test]
+    fn slash_accessors() {
+        let tx = valid_slash();
+        let wrapped = Transaction::Slash(tx);
+        assert_eq!(wrapped.network(), TESTNET.network_id);
+        assert_eq!(wrapped.owner(), owner_of(&key(9).public_key()));
+        assert_eq!(wrapped.public_key(), &key(9).public_key());
+        assert_eq!(wrapped.signature(), &placeholder_signature());
     }
 }

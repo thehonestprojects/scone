@@ -50,10 +50,37 @@ non utilisée, documentée une fois pour toutes dans cette table.
 | `0xB8` | `SetTldOpen` | ouverture/fermeture d'un TLD à l'auto-enregistrement (M8a) |
 | `0xD4` | `AssignDomain` | assignation directe d'un domaine par l'owner du TLD (M8a) |
 | `0x3C` | `RenewDomain` | prolongation de l'enregistrement d'un domaine (M8a) |
+| `0x15` | `SlashTx` | preuve d'équivocation d'un anchor + bannissement (M9) |
 
 Tout octet de version autre que `0x01` est rejeté explicitement
 (`UnsupportedVersion(valeur reçue)`) : un format inconnu ou obsolète
 n'est jamais analysé par accident.
+
+## SLASH_TX (0x15, M9)
+
+Preuve on-chain qu'un anchor a signé deux checkpoints
+**conflictuels à la même epoch** (équivocation). Chacun peut la
+soumettre — la preuve est cryptographique et autonome :
+
+```text
+network | offender[32] | evidence_a (CheckpointData 116 o)
+  | sig_a[64] | evidence_b (CheckpointData) | sig_b[64]
+  | reporter_pk[32] | reporter_signature[64]
+```
+
+- `validate()` vérifie la structure : même epoch, `signing_hash`
+  distincts, deux signatures distinctes, signatures du reporter sur
+  le payload canonique ;
+- règles d'état (journalisées, annulables au reorg) : les DEUX
+  signatures de l'accusé doivent vérifier sur les DEUX signing hashes
+  distincts à la même epoch ; l'accusé doit être dans le pool
+  éligible (`SlashOffenderNotInPool` sinon) ; puis **bannissement**
+  — la clé est retirée du pool PoS de façon persistante (liste noire
+  dans l'état) ;
+- sanction minimale : les domaines/TLD de l'accusé ne sont PAS saisis
+  (décision M9 documentée) ;
+- même checkpoint deux fois = pas une équivocation (rejet) ; epochs
+  différentes = rejet ; signature forgée = rejet.
 
 ## REGISTER_DOMAIN (0x21)
 

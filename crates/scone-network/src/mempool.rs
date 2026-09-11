@@ -39,6 +39,9 @@ pub fn domain_key(tx: &scone_core::Transaction) -> Option<[u8; 32]> {
         Transaction::TransferTld(t) => Some(*t.tld_id.as_bytes()),
         Transaction::RevokeTld(r) => Some(*r.tld_id.as_bytes()),
         Transaction::SetTldOpen(s) => Some(*s.tld_id.as_bytes()),
+        // M9: a slash targets an anchor key, not a namespace — no
+        // per-domain cap (bounded by MAX_TXS_PER_BLOCK like any tx).
+        Transaction::Slash(_) => None,
     }
 }
 

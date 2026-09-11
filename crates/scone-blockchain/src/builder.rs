@@ -232,6 +232,10 @@ mod tests {
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
             }
+            Transaction::Slash(mut s) => {
+                s.signature = sk.sign(&payload);
+                Transaction::Slash(s)
+            }
         }
     }
 

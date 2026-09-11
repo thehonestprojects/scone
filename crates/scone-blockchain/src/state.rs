@@ -14,7 +14,7 @@
 //! ancestor and replays a different branch converges to the exact
 //! bytes every node computes for that branch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use scone_core::id::{DOMAIN_ID_VERSION, TLD_ID_VERSION};
 use scone_core::pow;
@@ -126,6 +126,14 @@ pub struct ChainState {
     /// distributed and disjoint in the 40-bit key space (collisions
     /// fall into the SMT's sorted buckets and remain deterministic).
     smt: Smt,
+    /// Banned anchor keys (M9 slashing): proven checkpoint
+    /// equivocators, removed from the PoS eligibility pool for life
+    /// (a `SlashTx` ban is never lifted). Keyed by the raw public
+    /// key: the ban follows the KEY, not the owner identity — a
+    /// banned anchor cannot re-enter the pool by moving its domains
+    /// around. Journaled (a reorg un-bans), engaged in the canonical
+    /// state root and pruned-restored like every other state piece.
+    pub(crate) banned: HashSet<scone_crypto::PublicKey>,
 }
 
 impl Default for ChainState {
@@ -176,6 +184,14 @@ enum UndoEntry {
     /// A self-signed tx taught the state an owner's public key
     /// (M3 of the .bak port): rolling back forgets it.
     LearnOwnerKey(OwnerId),
+    /// A `SlashTx` banned the offender (M9): rolling back un-bans.
+    /// The flag distinguishes "this tx inserted the ban" from
+    /// "the key was already banned" (idempotent re-slash: nothing
+    /// journaled, nothing undone).
+    BanAnchor {
+        /// The banned key.
+        offender: scone_crypto::PublicKey,
+    },
 }
 
 /// Revert journal of a block application (see
@@ -208,6 +224,7 @@ impl ChainState {
             owner_keys: HashMap::new(),
             grace: HashMap::new(),
             smt: Smt::new(),
+            banned: HashSet::new(),
         }
     }
 
@@ -252,6 +269,13 @@ impl ChainState {
     #[must_use]
     pub fn tld_is_empty(&self) -> bool {
         self.tlds.is_empty()
+    }
+
+    /// Whether `key` is banned from the PoS eligibility pool (M9
+    /// slashing: proven checkpoint equivocation, lifetime ban).
+    #[must_use]
+    pub fn is_banned(&self, key: &scone_crypto::PublicKey) -> bool {
+        self.banned.contains(key)
     }
 
     // ——— SMT engagement (M6a) ———
@@ -690,6 +714,42 @@ impl ChainState {
                 self.smt_put_domain(&domain, Some(&prior), &next);
                 self.domains.insert(domain, next);
             }
+            Transaction::Slash(slash) => {
+                // M9 — equivocation evidence. The cryptographic proof
+                // was already re-verified by `tx.validate()` above
+                // (defence in depth: same pure check runs at
+                // encode/decode/validate). Two state rules remain:
+                //
+                // 1. the offender must be in the eligibility pool AT
+                //    APPLICATION TIME — the pool of the current state
+                //    (live-domain/TLD owners, the same snapshot
+                //    `eligible_validators` computes). The committee of
+                //    the evidence's epoch is NOT reconstructible from
+                //    a bare ChainState (it depends on the finalized
+                //    checkpoint history), so the check is anchored to
+                //    the live pool: an equivocator loses their stake
+                //    seat by definition, and a key that already left
+                //    the pool (expired domains) has nothing left to
+                //    ban — documented limitation, cf. .bak §9.
+                // 2. BAN: the offender's key leaves the pool for life
+                //    (idempotent — an already-banned key changes
+                //    nothing, the tx is still valid and its evidence
+                //    permanent). The offender's DOMAINS and TLDs are
+                //    deliberately NOT seized: the minimal sanction is
+                //    the loss of the anchor seat, not the property
+                //    (documented decision — the domains keep
+                //    resolving and renewing; only the PoS privileges
+                //    die).
+                let pool = self.eligible_validators(now);
+                if !pool.contains(&slash.offender) {
+                    return Err(BlockchainError::SlashOffenderNotInPool);
+                }
+                if self.banned.insert(slash.offender) {
+                    journal.entries.push(UndoEntry::BanAnchor {
+                        offender: slash.offender,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -795,6 +855,9 @@ impl ChainState {
                 }
                 UndoEntry::LearnOwnerKey(owner) => {
                     self.owner_keys.remove(&owner);
+                }
+                UndoEntry::BanAnchor { offender } => {
+                    self.banned.remove(&offender);
                 }
             }
         }

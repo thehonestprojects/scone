@@ -164,4 +164,11 @@ pub enum BlockchainError {
     /// chain (nor a mempool) twice (ported from the .bak).
     #[error("transaction already included in the chain (replay)")]
     TxReplay,
+    /// A `SlashTx` names an `offender` that is not part of the
+    /// eligibility pool at application time: the evidence may be
+    /// cryptographically sound (the double signature is real) but the
+    /// accused key holds no live stake — there is nothing to ban and
+    /// no anchor seat to revoke (M9).
+    #[error("slash offender is not in the eligibility pool")]
+    SlashOffenderNotInPool,
 }
