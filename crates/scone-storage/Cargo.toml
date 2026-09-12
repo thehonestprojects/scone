@@ -7,6 +7,7 @@ edition.workspace = true
 scone-core.workspace = true
 scone-blockchain.workspace = true
 scone-protocol.workspace = true
+scone-crypto.workspace = true
 thiserror.workspace = true
 redb.workspace = true
 

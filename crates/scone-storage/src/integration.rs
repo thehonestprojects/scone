@@ -176,11 +176,50 @@ pub fn store_block_with_removals(
         .copied()
         .filter(|id| chain.state().tld(id).is_none())
         .collect();
+    // P0.2 name-index deltas, derived from the SAME transactions:
+    // RegisterDomain/AssignDomain bind (canonical name, DomainId),
+    // RegisterTld binds (tld name, TldId). The tx invariants
+    // guarantee `domain_id == DomainId::from_name(name)` — the
+    // binding re-states what the block already proves.
+    let mut name_upserts: Vec<crate::NameBinding> = Vec::new();
+    for tx in &block.transactions {
+        match tx {
+            Transaction::RegisterDomain(r) => {
+                name_upserts.push(crate::NameBinding {
+                    is_tld: false,
+                    name: r.name.canonical().to_owned(),
+                    target: *r.domain_id.as_bytes(),
+                });
+            }
+            Transaction::AssignDomain(a) => {
+                name_upserts.push(crate::NameBinding {
+                    is_tld: false,
+                    name: a.name.canonical().to_owned(),
+                    target: *a.domain_id.as_bytes(),
+                });
+            }
+            Transaction::RegisterTld(t) => {
+                name_upserts.push(crate::NameBinding {
+                    is_tld: true,
+                    name: t.name.as_str().to_owned(),
+                    target: *t.tld_id.as_bytes(),
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut name_removals: Vec<(bool, [u8; 32])> = removed_domains
+        .iter()
+        .map(|id| (false, *id.as_bytes()))
+        .collect();
+    name_removals.extend(tld_removals.iter().map(|id| (true, *id.as_bytes())));
     let delta = crate::StateDelta {
         domains: deltas,
         tlds: tld_upserts,
         removed_domains: removed_domains.to_vec(),
         removed_tlds: tld_removals,
+        name_upserts,
+        name_removals,
     };
     store.append_block_with_state(block.header.height, hash.as_bytes(), &bytes, &delta)
 }

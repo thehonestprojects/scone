@@ -8,6 +8,8 @@
 //! | `blocks_by_hash` | block hash (`32`) | canonical block bytes |
 //! | `domains` | `DomainId` (`32`, ordered) | [`DomainStateBytes`] |
 //! | `tlds` | `TldId` (`32`, ordered) | [`TldStateBytes`] (M7d) |
+//! | `names_v3` (P0.2) | name-index key (`32`, ordered) | target id (`32`) |
+//! | `name_reverse_v3` (P0.2) | target id (`32`, ordered) | `tag(1) ‖ canonical name` |
 //! | `dht_cache` | `DomainId` (`32`) | encoded `SignedDnsRecord` |
 //! | `meta` | `&[u8]` | `&[u8]` (tip, tip height, format version, domain counter, TLD counter) |
 //! | `snapshot_v3_meta` | `0` (single slot) | `height(8 BE) + tip_hash(32)` (M6b boot snapshot) |
@@ -56,6 +58,10 @@ type BlocksByHash = TableDefinition<'static, &'static [u8], &'static [u8]>;
 type Domains = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `TldId(32) -> TldStateBytes` (M7d).
 type Tlds = TableDefinition<'static, &'static [u8], &'static [u8]>;
+/// name-index key(32) -> target id(32) (P0.2).
+type Names = TableDefinition<'static, &'static [u8], &'static [u8]>;
+/// target id(32) -> `tag(1) || canonical name` (P0.2).
+type NameReverse = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `DomainId(32) -> encoded SignedDnsRecord`.
 type DhtCache = TableDefinition<'static, &'static [u8], &'static [u8]>;
 /// `meta key -> meta value`.
@@ -123,6 +129,10 @@ const BLOCKS_BY_HEIGHT: BlocksByHeight = TableDefinition::new("blocks_by_height"
 const BLOCKS_BY_HASH: BlocksByHash = TableDefinition::new("blocks_by_hash");
 const DOMAINS: Domains = TableDefinition::new("domains");
 const TLDS: Tlds = TableDefinition::new("tlds");
+// P0.2 name index (v3 names so a pre-P0.2 store simply has no
+// entries and resolves nothing until rebuilt).
+const NAMES: Names = TableDefinition::new("names_v3");
+const NAME_REVERSE: NameReverse = TableDefinition::new("name_reverse_v3");
 const DHT_CACHE: DhtCache = TableDefinition::new("dht_cache");
 const META: Meta = TableDefinition::new("meta");
 // M6b snapshot tables: NEW names (v3 prefix), never written by a
@@ -137,6 +147,124 @@ const SNAPSHOT_TLDS: SnapshotTlds = TableDefinition::new("snapshot_v3_tlds");
 /// Value layout of `snapshot_v3_meta`: `height(8 BE) || tip_hash(32)`
 /// (40 bytes exactly, strict decode).
 const SNAPSHOT_META_LEN: usize = 8 + 32;
+
+// ------------------------------------------------------------- P0.2 name index
+
+/// Domain-separation prefix of the `names_v3` key hash.
+pub const NAME_INDEX_VERSION: &[u8] = b"SCONE-NAME-IDX-V1";
+
+/// Tag of a domain entry in `name_reverse_v3` values.
+const NAME_TAG_DOMAIN: u8 = 0x01;
+/// Tag of a TLD entry in `name_reverse_v3` values.
+const NAME_TAG_TLD: u8 = 0x02;
+
+/// Key of `names_v3`: `BLAKE3-256("SCONE-NAME-IDX-V1" || canonical_name)`.
+///
+/// The canonical name is deliberately NOT stored in clear in the
+/// keyed table: the key is a pure function of the name, so the index
+/// is reconstructible from the chain at any time
+/// ([`RedbStore::rebuild_name_index`]) without any extra persisted
+/// metadata. The name itself is stored once, in the companion
+/// `name_reverse_v3` table (needed by the GC/removal path, which
+/// only receives ids).
+#[must_use]
+pub fn name_index_key(canonical: &str) -> [u8; 32] {
+    scone_crypto::hash256(&[NAME_INDEX_VERSION, canonical.as_bytes()])
+}
+
+/// `name_reverse_v3` value: `tag(1) || canonical name`.
+#[must_use]
+fn name_reverse_value(is_tld: bool, canonical: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + canonical.len());
+    out.push(if is_tld {
+        NAME_TAG_TLD
+    } else {
+        NAME_TAG_DOMAIN
+    });
+    out.extend_from_slice(canonical.as_bytes());
+    out
+}
+
+/// Strictly decodes a `name_reverse_v3` value into `(is_tld, name)`.
+fn decode_name_reverse(bytes: &[u8]) -> Result<(bool, String)> {
+    let tag = *bytes
+        .first()
+        .ok_or_else(|| StorageError::Corrupted("name_reverse_v3: empty value".into()))?;
+    let is_tld = match tag {
+        NAME_TAG_DOMAIN => false,
+        NAME_TAG_TLD => true,
+        other => {
+            return Err(StorageError::Corrupted(format!(
+                "name_reverse_v3: unknown tag {other:#04x}"
+            )));
+        }
+    };
+    let name = std::str::from_utf8(&bytes[1..])
+        .map_err(|_| StorageError::Corrupted("name_reverse_v3: name not UTF-8".into()))?;
+    if name.is_empty() {
+        return Err(StorageError::Corrupted(
+            "name_reverse_v3: empty name".into(),
+        ));
+    }
+    Ok((is_tld, name.to_owned()))
+}
+
+/// One P0.2 name-index binding: `(is_tld, canonical name, target id)`.
+/// Re-exported alias — see [`crate::NameBinding`].
+pub use crate::NameBinding;
+
+/// Applies the P0.2 name-index deltas of one block inside the
+/// caller's write transaction: upserts then removals, in both the
+/// keyed index and the reverse table, so the pair stays consistent
+/// atomically.
+fn apply_name_deltas(
+    names_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    reverse_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    upserts: &[NameBinding],
+    removals: &[(bool, [u8; 32])],
+) -> Result<()> {
+    for binding in upserts {
+        let key = name_index_key(&binding.name);
+        names_t.insert(&key[..], &binding.target[..])?;
+        reverse_t.insert(
+            &binding.target[..],
+            &name_reverse_value(binding.is_tld, &binding.name)[..],
+        )?;
+    }
+    // Removals arrive as bare ids (the GC reports DomainIds, the TLD
+    // revoke path TldIds): the canonical name is recovered from the
+    // reverse table — still inside this transaction — to locate the
+    // keyed entry, then both rows go together. The namespace tag is
+    // informational here (the reverse row already carries it).
+    for &(_is_tld, id) in removals {
+        let Some(previous) = reverse_t.get(&id[..])? else {
+            continue; // already absent: idempotent removal
+        };
+        let value = previous.value().to_vec();
+        drop(previous);
+        let (_, name) = decode_name_reverse(&value)?;
+        names_t.remove(&name_index_key(&name)[..])?;
+        reverse_t.remove(&id[..])?;
+    }
+    Ok(())
+}
+
+/// Removes one name-index entry by id inside the caller's write
+/// transaction (P0.2). No-op when absent.
+fn remove_name_entry(
+    names_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    reverse_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    id: &[u8; 32],
+) -> Result<()> {
+    let value = match reverse_t.get(&id[..])? {
+        Some(guard) => guard.value().to_vec(),
+        None => return Ok(()), // already absent: idempotent removal
+    };
+    let (_, name) = decode_name_reverse(&value)?;
+    names_t.remove(&name_index_key(&name)[..])?;
+    reverse_t.remove(&id[..])?;
+    Ok(())
+}
 
 /// `redb`-backed [`NodeStore`].
 ///
@@ -217,6 +345,8 @@ impl RedbStore {
             let _ = wtxn.open_table(BLOCKS_BY_HASH)?;
             let _ = wtxn.open_table(DOMAINS)?;
             let _ = wtxn.open_table(TLDS)?;
+            let _ = wtxn.open_table(NAMES)?;
+            let _ = wtxn.open_table(NAME_REVERSE)?;
             let _ = wtxn.open_table(DHT_CACHE)?;
             let _ = wtxn.open_table(SNAPSHOT_META)?;
             let _ = wtxn.open_table(SNAPSHOT_DOMAINS)?;
@@ -281,6 +411,208 @@ impl RedbStore {
         let table = rtxn.open_table(META)?;
         meta_u64(&table, META_TLD_COUNT, "tld_count")
     }
+
+    /// Persists one domain state AND its name-index binding in a
+    /// single transaction (P0.2 name-aware variant of
+    /// [`NodeStore::put_domain_state`] — repair tools, snapshot
+    /// restore paths that know the name).
+    ///
+    /// # Errors
+    ///
+    /// On I/O errors.
+    pub fn put_domain_state_with_name(
+        &mut self,
+        domain: DomainId,
+        state: DomainStateBytes,
+        canonical_name: &str,
+    ) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut domains_t = wtxn.open_table(DOMAINS)?;
+            let existed = domains_t.insert(&domain.as_bytes()[..], state.as_encoded())?;
+            if existed.is_none() {
+                let mut meta_t = wtxn.open_table(META)?;
+                let current = meta_u64(&meta_t, META_DOMAIN_COUNT, "domain_count")?;
+                meta_t.insert(META_DOMAIN_COUNT, &(current + 1).to_be_bytes()[..])?;
+            }
+            let mut names_t = wtxn.open_table(NAMES)?;
+            let mut reverse_t = wtxn.open_table(NAME_REVERSE)?;
+            apply_name_deltas(
+                &mut names_t,
+                &mut reverse_t,
+                &[NameBinding {
+                    is_tld: false,
+                    name: canonical_name.to_owned(),
+                    target: *domain.as_bytes(),
+                }],
+                &[],
+            )?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Persists one TLD state AND its name-index binding in a single
+    /// transaction (P0.2 name-aware variant of
+    /// [`NodeStore::put_tld_state`]).
+    ///
+    /// # Errors
+    ///
+    /// On I/O errors.
+    pub fn put_tld_state_with_name(
+        &mut self,
+        tld: TldId,
+        state: TldStateBytes,
+        tld_name: &str,
+    ) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut tlds_t = wtxn.open_table(TLDS)?;
+            let existed = tlds_t.insert(&tld.as_bytes()[..], state.as_encoded())?;
+            if existed.is_none() {
+                let mut meta_t = wtxn.open_table(META)?;
+                let current = meta_u64(&meta_t, META_TLD_COUNT, "tld_count")?;
+                meta_t.insert(META_TLD_COUNT, &(current + 1).to_be_bytes()[..])?;
+            }
+            let mut names_t = wtxn.open_table(NAMES)?;
+            let mut reverse_t = wtxn.open_table(NAME_REVERSE)?;
+            apply_name_deltas(
+                &mut names_t,
+                &mut reverse_t,
+                &[NameBinding {
+                    is_tld: true,
+                    name: tld_name.to_owned(),
+                    target: *tld.as_bytes(),
+                }],
+                &[],
+            )?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Deletes one domain state AND its name-index entry in a single
+    /// transaction (P0.2 — repair tools).
+    ///
+    /// # Errors
+    ///
+    /// On I/O errors or corrupted reverse-index bytes.
+    pub fn remove_domain_state(&mut self, domain: &DomainId) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut domains_t = wtxn.open_table(DOMAINS)?;
+            if domains_t.remove(&domain.as_bytes()[..])?.is_some() {
+                let mut meta_t = wtxn.open_table(META)?;
+                let current = meta_u64(&meta_t, META_DOMAIN_COUNT, "domain_count")?;
+                let current = current
+                    .checked_sub(1)
+                    .ok_or_else(|| StorageError::Corrupted("domain_count underflow".into()))?;
+                meta_t.insert(META_DOMAIN_COUNT, &current.to_be_bytes()[..])?;
+            }
+            let mut names_t = wtxn.open_table(NAMES)?;
+            let mut reverse_t = wtxn.open_table(NAME_REVERSE)?;
+            remove_name_entry(&mut names_t, &mut reverse_t, domain.as_bytes())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Rebuilds the P0.2 name index from the persisted blocks (P0.2).
+    ///
+    /// The index is a pure function of the canonical chain: every
+    /// `RegisterDomain`/`AssignDomain` transaction carries the
+    /// canonical name in clear, so the whole index is reconstructed
+    /// by scanning `blocks_by_height` from genesis to tip and
+    /// replaying the bind/unbind decisions of each block — the same
+    /// "rebuild from the chain" contract as
+    /// [`rebuild_replay_index_from_store`](crate::integration::rebuild_replay_index_from_store).
+    /// Names registered then GC'd (expired) or revoked are handled by
+    /// applying, per block, the removals visible in the final state:
+    /// a name is bound iff its target domain is still live at the
+    /// end, or is a live TLD.
+    ///
+    /// Simple by design: one pass, one block in RAM at a time,
+    /// memory bounded by the final index size written incrementally.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if a stored block is missing or
+    /// fails canonical decoding — the same bytes the chain was built
+    /// from, a failure means the store is damaged.
+    pub fn rebuild_name_index(&mut self) -> Result<()> {
+        use scone_protocol::decode_complete;
+        let (tip_height, _) = self.tip_inner()?;
+        // Pass 1 (streamed): collect every (name → id) bind and every
+        // id ever REMOVED from the live state (a registration followed
+        // by GC/revoke). Names are small (≤ 253 bytes); the working
+        // set is bounded by the number of distinct names ever seen.
+        let mut binds: std::collections::HashMap<[u8; 32], (bool, String)> =
+            std::collections::HashMap::new();
+        for height in 1..=tip_height {
+            let Some(bytes) = self.block_at_height(height)? else {
+                return Err(StorageError::Corrupted(format!(
+                    "blocks_by_height[{height}]: missing below tip"
+                )));
+            };
+            let block: scone_protocol::Block = decode_complete(&bytes)
+                .map_err(|e| StorageError::Corrupted(format!("block {height}: {e}")))?;
+            for tx in &block.transactions {
+                match tx {
+                    scone_core::Transaction::RegisterDomain(r) => {
+                        binds.insert(
+                            *r.domain_id.as_bytes(),
+                            (false, r.name.canonical().to_owned()),
+                        );
+                    }
+                    scone_core::Transaction::AssignDomain(a) => {
+                        binds.insert(
+                            *a.domain_id.as_bytes(),
+                            (false, a.name.canonical().to_owned()),
+                        );
+                    }
+                    scone_core::Transaction::RegisterTld(t) => {
+                        binds.insert(*t.tld_id.as_bytes(), (true, t.name.as_str().to_owned()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Pass 2: keep only live targets — the index must never point
+        // at an absent domain (ghost-free invariant).
+        let mut upserts = Vec::with_capacity(binds.len());
+        {
+            let rtxn = self.db.begin_read()?;
+            let domains_ro = rtxn.open_table(DOMAINS)?;
+            let tlds_ro = rtxn.open_table(TLDS)?;
+            for (id, (is_tld, name)) in binds {
+                let live = if is_tld {
+                    tlds_ro.get(&id[..])?.is_some()
+                } else {
+                    domains_ro.get(&id[..])?.is_some()
+                };
+                if live {
+                    upserts.push(NameBinding {
+                        is_tld,
+                        name,
+                        target: id,
+                    });
+                }
+            }
+        }
+        // Pass 3 (atomic): wipe and rewrite both tables in ONE
+        // transaction — a crash leaves either the old or the new
+        // complete index.
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut names_t = wtxn.open_table(NAMES)?;
+            let mut reverse_t = wtxn.open_table(NAME_REVERSE)?;
+            names_t.retain(|_, _| false)?;
+            reverse_t.retain(|_, _| false)?;
+            apply_name_deltas(&mut names_t, &mut reverse_t, &upserts, &[])?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
 }
 
 /// Shared core of both append entry points: everything below runs in
@@ -303,6 +635,8 @@ fn append_core(
         let mut by_hash = wtxn.open_table(BLOCKS_BY_HASH)?;
         let mut domains_t = wtxn.open_table(DOMAINS)?;
         let mut tlds_t = wtxn.open_table(TLDS)?;
+        let mut names_t = wtxn.open_table(NAMES)?;
+        let mut name_reverse_t = wtxn.open_table(NAME_REVERSE)?;
         let mut meta_t = wtxn.open_table(META)?;
 
         // M6b state snapshot, BEFORE any delta of this block lands:
@@ -337,6 +671,8 @@ fn append_core(
                     ))
                 })?;
             drop(meta_t);
+            drop(name_reverse_t);
+            drop(names_t);
             drop(tlds_t);
             drop(domains_t);
             drop(by_hash);
@@ -346,12 +682,16 @@ fn append_core(
             let mut by_hash = wtxn.open_table(BLOCKS_BY_HASH)?;
             let mut domains_t = wtxn.open_table(DOMAINS)?;
             let mut tlds_t = wtxn.open_table(TLDS)?;
+            let mut names_t = wtxn.open_table(NAMES)?;
+            let mut name_reverse_t = wtxn.open_table(NAME_REVERSE)?;
             let mut meta_t = wtxn.open_table(META)?;
             append_deltas(
                 &mut by_height,
                 &mut by_hash,
                 &mut domains_t,
                 &mut tlds_t,
+                &mut names_t,
+                &mut name_reverse_t,
                 &mut meta_t,
                 height,
                 hash,
@@ -367,6 +707,8 @@ fn append_core(
             &mut by_hash,
             &mut domains_t,
             &mut tlds_t,
+            &mut names_t,
+            &mut name_reverse_t,
             &mut meta_t,
             height,
             hash,
@@ -385,6 +727,8 @@ fn append_deltas(
     by_hash: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     domains_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     tlds_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    names_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
+    name_reverse_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     meta_t: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     height: u64,
     hash: &[u8; 32],
@@ -469,6 +813,18 @@ fn append_deltas(
                 .ok_or_else(|| StorageError::Corrupted("tld_count underflow".into()))?;
             meta_t.insert(META_TLD_COUNT, &current.to_be_bytes()[..])?;
         }
+
+        // P0.2 name index: upserts (register/assign paths, name known
+        // from the tx) and removals (GC'd domains, revoked TLDs — bare
+        // ids) land in the SAME transaction as the state writes above.
+        // A crash can therefore never leave an index entry pointing
+        // at an absent domain, nor a domain without its index entry.
+        apply_name_deltas(
+            names_t,
+            name_reverse_t,
+            &deltas.name_upserts,
+            &deltas.name_removals,
+        )?;
 
         write_tip(meta_t, height, hash)?;
     }
@@ -783,6 +1139,52 @@ impl NodeStore for RedbStore {
 
     fn snapshot_tlds(&self, after: Option<TldId>, max: usize) -> Result<crate::TldPage> {
         self.snapshot_tlds_inner(after, max)
+    }
+
+    fn resolve_name(&self, canonical: &str) -> Result<Option<DomainId>> {
+        let rtxn = self.db.begin_read()?;
+        let names = rtxn.open_table(NAMES)?;
+        let reverse = rtxn.open_table(NAME_REVERSE)?;
+        let Some(id) = names
+            .get(name_index_key(canonical).as_slice())?
+            .and_then(|g| <[u8; 32]>::try_from(g.value()).ok())
+        else {
+            return Ok(None);
+        };
+        // Namespace check (strict): the entry must be a DOMAIN, not a
+        // TLD — `resolve_tld` owns that half of the keyspace.
+        let Some(previous) = reverse.get(&id[..])? else {
+            return Err(StorageError::Corrupted(
+                "name_reverse_v3: missing entry for resolved id".to_string(),
+            ));
+        };
+        let (is_tld, _) = decode_name_reverse(previous.value())?;
+        if is_tld {
+            return Ok(None);
+        }
+        Ok(Some(DomainId::from_bytes(id)))
+    }
+
+    fn resolve_tld(&self, tld: &str) -> Result<Option<TldId>> {
+        let rtxn = self.db.begin_read()?;
+        let names = rtxn.open_table(NAMES)?;
+        let reverse = rtxn.open_table(NAME_REVERSE)?;
+        let Some(id) = names
+            .get(name_index_key(tld).as_slice())?
+            .and_then(|g| <[u8; 32]>::try_from(g.value()).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(previous) = reverse.get(&id[..])? else {
+            return Err(StorageError::Corrupted(
+                "name_reverse_v3: missing entry for resolved id".into(),
+            ));
+        };
+        let (is_tld, _) = decode_name_reverse(previous.value())?;
+        if !is_tld {
+            return Ok(None);
+        }
+        Ok(Some(TldId::from_bytes(id)))
     }
 }
 

@@ -36,6 +36,10 @@ reste du code (blockchain, futur relay M4) :
   mêmes contrats pour le registre TLD (`tld_count` maintenu,
   curseur borné) (M7d) ;
 - `put_dht_cache` / `dht_cache` — octets `SignedDnsRecord` opaques ;
+- `resolve_name(canonical)` / `resolve_tld(tld)` — index Name→Id
+  persistant (P0.2), lookup ponctuel O(1), sans itération des
+  domaines (défaut `None` = backend sans index, l'appelant retombe
+  sur `iterate_domains` ou l'état chaîne) ;
 - `meta_get` / `meta_set` ;
 - `snapshot_meta` / `snapshot_domains` / `snapshot_tlds` — lecture du
   snapshot d'état de boot (M6b ; défauts vides = backend sans
@@ -61,6 +65,8 @@ Règles :
 | `domains` | `DomainId` (32 o, ordre octet) | `DomainStateBytes` (ci-dessous) |
 | `tlds` | `TldId` (32 o, ordre octet) | `TldStateBytes` (ci-dessous, M7d) |
 | `dht_cache` | `DomainId` (32 o) | octets `SignedDnsRecord` (opaques) |
+| `names_v3` (P0.2) | clé d'index (32 o, ordre octet) | id cible (32 o) |
+| `name_reverse_v3` (P0.2) | id cible (32 o, ordre octet) | `tag(1) ‖ nom canonique` |
 | `meta` | `&[u8]` | `&[u8]` |
 | `snapshot_v3_meta` (M6b) | `u64` = 0 (slot unique) | `height(8 BE) ‖ tip_hash(32)` = 40 o exactement |
 | `snapshot_v3_domains` (M6b) | `DomainId` (32 o, ordre octet) | `DomainStateBytes` (même format que `domains`) |
@@ -161,7 +167,10 @@ redb :
    (`removed_domains`) et TLDs révoqués (`removed_tlds`) quittent le
    store dans la même transaction, compteurs décrémentés — un
    redémarrage ne peut jamais ressusciter un enregistrement expiré ;
-8. `tip` et `tip_height`.
+8. les deltas de l'**index de noms** P0.2 (upserts et retraits, voir
+   ci-dessous) — mêmes garanties : un crash ne laisse jamais une
+   entrée d'index pointant vers un domaine absent ;
+9. `tip` et `tip_height`.
 
 redb commite en style WAL : un crash en pleine écriture laisse l'état
 cohérent **précédent**. **Un bloc écrit sans son état est donc
@@ -332,6 +341,93 @@ Propriétés :
 `load_chain_replay` (confiance zéro) reconstruit l'index de la même
 manière par son rejeu complet — les deux chemins convergent.
 
+## Index Name → Id persistant (P0.2)
+
+`DomainId = BLAKE3-256(DOMAIN_ID_VERSION ‖ nom canonique)` n'est pas
+inversible : résoudre un nom (relay/DNS) exige un index persistant.
+P0.2 l'ajoute au store, avec la même discipline transactionnelle que
+le reste.
+
+### Schéma
+
+Deux tables compagnes, écrites et effacées ensemble :
+
+```text
+names_v3        clé  = BLAKE3-256("SCONE-NAME-IDX-V1" ‖ nom canonique)  (32 o)
+                val  = id cible (32 o : DomainId ou TldId)
+
+name_reverse_v3 clé  = id cible (32 o)
+                val  = tag(0x01 domaine | 0x02 TLD) ‖ nom canonique
+```
+
+- La clé de `names_v3` est un **hash du nom, pas le nom en clair**
+  (tables d'index compactes, pas de gossip de noms par dump). La clé
+  est une **fonction pure du nom** : l'index est reconstructible à
+  tout moment depuis la chaîne (`rebuild_name_index`), aucune
+  métadonnée supplémentaire n'est persistée pour lui.
+- `name_reverse_v3` stocke le nom (une seule fois) parce que les
+  chemins de retrait (GC des domaines expirés, `RevokeTld`) ne
+  connaissent que des **ids** : il faut bien retrouver la clé hachée
+  à effacer. Le tag distingue les deux espaces de noms.
+- Séparation stricte : `resolve_name` ne répond JAMAIS une entrée
+  TLD et `resolve_tld` jamais une entrée domaine (le tag de la table
+  reverse tranche ; un `DomainName` a ≥ 2 labels, un TLD en a 1 —
+  les deux dérivations de clé partagent l'espace `names_v3` mais pas
+  les résultats).
+- Le `DomainId` reste 32 octets, jamais réduit (règle dure du
+  projet : identité consensus, résistance aux collisions).
+
+### Cohérence transactionnelle
+
+Les upserts (`RegisterDomain`, `AssignDomain`, `RegisterTld` — noms
+portés en clair par les transactions) et les retraits (GC,
+révocations — ids nus) sont portés par le `StateDelta` du bloc
+(`name_upserts` / `name_removals`) et appliqués dans la **même
+transaction redb** que l'écriture du bloc et des états. Un crash ne
+peut donc laisser ni une entrée d'index vers un domaine absent (pas
+de fantômes), ni un domaine enregistré sans son entrée. Un append
+échoué n'écrit rien (testé). Les variantes nommées
+`put_domain_state_with_name` / `put_tld_state_with_name` /
+`remove_domain_state` offrent la même atomicité aux outils de
+réparation.
+
+`store_block` / `store_block_with_removals` dérivent les deltas de
+noms des MÊMES transactions du bloc — aucun paramètre supplémentaire
+à l'interface du relay.
+
+### Reconstruction (`RedbStore::rebuild_name_index`)
+
+L'index est une fonction pure de la chaîne canonique, comme l'index
+anti-replay M8. `rebuild_name_index` le reconstruit depuis les
+**blocs persistés** (les `DomainStateBytes` ne contiennent PAS le
+nom — owner/séquence/expiration uniquement — donc la source de
+vérité est le flux des transactions, où `RegisterDomain` et
+`AssignDomain` portent le nom canonique en clair) :
+
+1. passe 1 : scan `blocks_by_height` genèse→tip, un bloc en RAM à la
+   fois ; collecte des liaisons `nom → id` vues dans les
+   `RegisterDomain`/`AssignDomain`/`RegisterTld` ;
+2. passe 2 : filtrage des cibles **vivantes** uniquement (l'état
+   persisté fait foi) — un domaine enregistré puis GC'd/expiré n'est
+   pas réindexé ;
+3. passe 3 : effacement + réécriture complète des deux tables dans
+   UNE transaction (crash → ancien ou nouvel index complet).
+
+Un bloc manquant ou indécodable → `Corrupted` (mêmes octets qui ont
+bâti la chaîne). Le coût est O(nom distincts vus) en RAM (≤ 253 o
+par nom) et O(blocs) en lectures — outil de réparation, pas un chemin
+de boot.
+
+### Ce que l'index n'est PAS
+
+- Pas une autorité : l'état chaîne en RAM reste la seule autorité ;
+  l'index est un cache reconstructible (une divergence est un bug de
+  transactionnalité, détectable par `rebuild_name_index` comparé).
+- Pas gelé dans le snapshot M6b : les tables `names_v3`/`name_reverse_v3`
+  sont vivantes et suivent les deltas de chaque bloc ; le snapshot
+  d'état ne les embarque pas (reconstruction par deltas à la reprise,
+  ou `rebuild_name_index` en réparation).
+
 ### Ce que le snapshot n'engage PAS
 
 L'état RAM `ChainState` porte des structures internes non engagées
@@ -448,6 +544,13 @@ Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
   `load_chain_replay`) pour un store plus court ET plus long que la
   fenêtre ; boot snapshot : la partie de la fenêtre sous H est
   reconstituée par le rescan, la partie au-dessus par le rejeu de
-  suffixe.
+  suffixe ;
+- P0.2 : index de noms — `resolve_name == DomainId::from_name` pour
+  120 domaines (vivant, après restart, après wipe + rebuild),
+  `resolve_tld` pour le TLD claimé ; le GC d'un domaine expiré
+  supprime l'entrée (pas de fantômes), avant et après rebuild ;
+  séparation stricte des espaces de noms domaine/TLD ; un append
+  échoué ne laisse aucune entrée d'index ; la clé d'index est la
+  dérivation BLAKE3 documentée.
 
 [`ChainState`]: ../../../crates/scone-blockchain/src/state.rs

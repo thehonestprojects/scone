@@ -32,7 +32,10 @@ pub mod redb;
 pub mod state_bytes;
 
 pub use error::{Result, StorageError};
-pub use redb::{MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, MAX_TLD_PAGE, RedbStore, SNAPSHOT_INTERVAL};
+pub use redb::{
+    MAX_DHT_CACHE_ENTRY, MAX_DOMAIN_PAGE, MAX_TLD_PAGE, NAME_INDEX_VERSION, RedbStore,
+    SNAPSHOT_INTERVAL, name_index_key,
+};
 pub use state_bytes::{DomainStateBytes, TldStateBytes};
 
 use scone_core::{DomainId, TldId};
@@ -78,6 +81,22 @@ pub struct SnapshotMeta {
 /// returned id.
 pub type DomainPage = (Vec<(DomainId, DomainStateBytes)>, Option<DomainId>);
 
+/// One P0.2 name-index binding carried in a [`StateDelta`].
+///
+/// `(is_tld, canonical name, target id bytes)`: the name→id mapping
+/// is a pure function of the chain (the register/assign transactions
+/// carry the canonical name), so the delta just re-states what the
+/// block already proves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameBinding {
+    /// `true` = TLD namespace, `false` = domain namespace.
+    pub is_tld: bool,
+    /// Canonical name bound to `target`.
+    pub name: String,
+    /// The derived id (`DomainId`/`TldId` bytes — both 32).
+    pub target: [u8; 32],
+}
+
 /// The state changes of one block (M8b): upserts and removals for
 /// both registries, applied atomically with the block bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -90,6 +109,11 @@ pub struct StateDelta {
     pub removed_domains: Vec<DomainId>,
     /// TLD states to delete (M8b RevokeTld).
     pub removed_tlds: Vec<TldId>,
+    /// Name-index upserts (P0.2): names bound by this block.
+    pub name_upserts: Vec<NameBinding>,
+    /// Name-index removals (P0.2): `(is_tld, id)` pairs unbound by
+    /// this block (GC'd domains, revoked TLDs).
+    pub name_removals: Vec<(bool, [u8; 32])>,
 }
 
 impl StateDelta {
@@ -323,5 +347,37 @@ pub trait NodeStore {
     fn snapshot_tlds(&self, after: Option<TldId>, max: usize) -> Result<TldPage> {
         let _ = (after, max);
         Ok((Vec::new(), None))
+    }
+
+    /// Resolves a canonical domain name to its [`DomainId`] via the
+    /// persistent name index (P0.2) — O(1) point lookup, no domain
+    /// iteration. `canonical` MUST already be the canonical form
+    /// (callers validate names with [`scone_core::DomainName`]).
+    ///
+    /// Default: `None` (backend without a name index — callers fall
+    /// back to [`NodeStore::iterate_domains`] or the chain state).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if the stored index entry is
+    /// malformed; on I/O errors.
+    fn resolve_name(&self, canonical: &str) -> Result<Option<DomainId>> {
+        let _ = canonical;
+        Ok(None)
+    }
+
+    /// Resolves a canonical TLD name to its [`TldId`] via the
+    /// persistent name index (P0.2) — TLD variant of
+    /// [`NodeStore::resolve_name`].
+    ///
+    /// Default: `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if the stored index entry is
+    /// malformed; on I/O errors.
+    fn resolve_tld(&self, tld: &str) -> Result<Option<TldId>> {
+        let _ = tld;
+        Ok(None)
     }
 }

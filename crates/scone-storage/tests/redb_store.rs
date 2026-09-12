@@ -1308,3 +1308,278 @@ fn snapshot_meta_type_exposes_height_and_hash() {
     assert_eq!(meta.height, 7);
     assert_eq!(meta.tip_hash, [9; 32]);
 }
+
+// ------------------------------------------------- P0.2 name index
+
+/// THE P0.2 non-regression test: register 120 domains through the real
+/// block path, then `resolve_name` must return exactly
+/// `DomainId::from_name` for every one of them — on the live store,
+/// after a restart (load_chain) with the index persisted, and after a
+/// full `rebuild_name_index` from the blocks alone.
+#[test]
+fn name_index_resolves_120_domains_live_restart_and_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.redb");
+    {
+        let mut store = RedbStore::open(&path).unwrap();
+        let mut chain = scone_blockchain::Blockchain::new();
+        let sk = scone_crypto::SigningKey::from_bytes([0x42; 32]);
+        for i in 0..120 {
+            let name = format!("n{i}.uip");
+            let (block, hash) = build_block(&mut chain, &sk, &name);
+            store_block(&mut store, &chain, &block, hash).unwrap();
+        }
+        assert_eq!(store.domain_count().unwrap(), 120);
+        // Live resolution == pure derivation, for domains AND the TLD.
+        for i in 0..120 {
+            let name = format!("n{i}.uip");
+            assert_eq!(
+                store.resolve_name(&name).unwrap(),
+                Some(domain_id(&name)),
+                "live resolve mismatch for {name}"
+            );
+        }
+        assert_eq!(
+            store.resolve_tld("uip").unwrap(),
+            Some(tld_id("uip")),
+            "the claimed TLD resolves too"
+        );
+    }
+    // Restart: the index is persisted, resolution survives as-is.
+    {
+        let store = RedbStore::open(&path).unwrap();
+        let chain = load_chain(&store, scone_core::TESTNET).unwrap();
+        assert_eq!(chain.height(), 120);
+        for i in 0..120 {
+            let name = format!("n{i}.uip");
+            assert_eq!(
+                store.resolve_name(&name).unwrap(),
+                Some(domain_id(&name)),
+                "post-restart resolve mismatch for {name}"
+            );
+        }
+    }
+    // Wiped then rebuilt from the blocks alone (repair path): the
+    // index is a pure function of the chain, so it comes back whole.
+    {
+        // redb allows one Database handle per file: wipe via a raw
+        // handle BEFORE re-opening the store.
+        {
+            let db = redb::Database::open(&path).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            {
+                type Names = redb::TableDefinition<'static, &'static [u8], &'static [u8]>;
+                let mut names = wtxn.open_table(Names::new("names_v3")).unwrap();
+                let mut reverse = wtxn.open_table(Names::new("name_reverse_v3")).unwrap();
+                names.retain(|_, _| false).unwrap();
+                reverse.retain(|_, _| false).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        let mut store = RedbStore::open(&path).unwrap();
+        assert!(store.resolve_name("n0.uip").unwrap().is_none());
+        store.rebuild_name_index().unwrap();
+        for i in 0..120 {
+            let name = format!("n{i}.uip");
+            assert_eq!(
+                store.resolve_name(&name).unwrap(),
+                Some(domain_id(&name)),
+                "rebuilt resolve mismatch for {name}"
+            );
+        }
+        assert_eq!(store.resolve_tld("uip").unwrap(), Some(tld_id("uip")));
+    }
+}
+
+/// GC coherence: after a domain expires and the deterministic GC
+/// removes it, `resolve_name` returns None — the index follows the
+/// removals, no ghost entries.
+#[test]
+fn name_index_gc_removes_the_entry_no_ghosts() {
+    use scone_blockchain::{BlockBuilder, DOMAIN_TERM_SECS};
+    use scone_storage::integration::store_block_with_removals;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RedbStore::open(dir.path().join("chain.redb")).unwrap();
+    let mut chain = scone_blockchain::Blockchain::new();
+    let sk = scone_crypto::SigningKey::from_bytes([0x77; 32]);
+
+    // Block 1 (t=1000): claim + open + register ghost.uip.
+    let block1 = {
+        let tld_name = scone_core::TldName::new("uip").unwrap();
+        let mut b = BlockBuilder::after(0, chain.tip_hash())
+            .with_timestamp(1000)
+            .with_producer(&sk);
+        let sign = |mut unsigned: scone_core::Transaction| {
+            let payload = scone_protocol::signing_payload(&unsigned).unwrap();
+            match &mut unsigned {
+                scone_core::Transaction::RegisterTld(t) => t.signature = sk.sign(&payload),
+                scone_core::Transaction::SetTldOpen(s) => s.signature = sk.sign(&payload),
+                scone_core::Transaction::RegisterDomain(r) => r.signature = sk.sign(&payload),
+                _ => unreachable!("only the three txs above are pushed"),
+            }
+            unsigned
+        };
+        b.push_tx(sign(scone_core::Transaction::RegisterTld(
+            scone_core::RegisterTld::register_tld_signed(
+                tld_name.clone(),
+                1,
+                {
+                    let mut challenge =
+                        Vec::with_capacity(scone_core::id::TLD_ID_VERSION.len() + 3);
+                    challenge.extend_from_slice(scone_core::id::TLD_ID_VERSION);
+                    challenge.extend_from_slice(tld_name.as_str().as_bytes());
+                    scone_core::Proof::from_bytes(scone_core::pow::encode_proof(
+                        &scone_core::pow::mine(
+                            scone_core::TESTNET.network_id,
+                            &challenge,
+                            scone_core::TESTNET.tld_pow_difficulty,
+                        ),
+                    ))
+                },
+                sk.public_key(),
+                scone_crypto::Signature::from_bytes([0; 64]),
+            ),
+        )))
+        .unwrap();
+        b.push_tx(sign(scone_core::Transaction::SetTldOpen(
+            scone_core::SetTldOpen::set_tld_open_signed(
+                scone_core::TldId::from_tld(&tld_name),
+                true,
+                sk.public_key(),
+                scone_crypto::Signature::from_bytes([0; 64]),
+            ),
+        )))
+        .unwrap();
+        let name = "ghost.uip";
+        b.push_tx(sign(scone_core::Transaction::RegisterDomain(
+            scone_core::RegisterDomain::register_domain_signed(
+                scone_core::DomainName::new(name).unwrap(),
+                1,
+                {
+                    let mut challenge =
+                        Vec::with_capacity(scone_core::id::DOMAIN_ID_VERSION.len() + 9);
+                    challenge.extend_from_slice(scone_core::id::DOMAIN_ID_VERSION);
+                    challenge.extend_from_slice(name.as_bytes());
+                    scone_core::Proof::from_bytes(scone_core::pow::encode_proof(
+                        &scone_core::pow::mine(
+                            scone_core::TESTNET.network_id,
+                            &challenge,
+                            scone_core::TESTNET.domain_pow_difficulty,
+                        ),
+                    ))
+                },
+                sk.public_key(),
+                scone_crypto::Signature::from_bytes([0; 64]),
+            ),
+        )))
+        .unwrap();
+        b.build().unwrap()
+    };
+    let applied1 = chain.push_block_with_gc(&block1).unwrap();
+    store_block_with_removals(&mut store, &chain, &block1, applied1.hash, &[]).unwrap();
+    assert_eq!(
+        store.resolve_name("ghost.uip").unwrap(),
+        Some(domain_id("ghost.uip"))
+    );
+
+    // Block 3 (parent past expiry): the GC removes ghost.uip and the
+    // SAME transaction unbinds the name.
+    let block2 = BlockBuilder::after(1, chain.tip_hash())
+        .with_timestamp(1000 + 2 * DOMAIN_TERM_SECS)
+        .with_producer(&sk)
+        .build()
+        .unwrap();
+    let applied2 = chain.push_block_with_gc(&block2).unwrap();
+    store_block_with_removals(
+        &mut store,
+        &chain,
+        &block2,
+        applied2.hash,
+        &applied2.gc_removed_domains,
+    )
+    .unwrap();
+    let block3 = BlockBuilder::after(2, chain.tip_hash())
+        .with_timestamp(1000 + 3 * DOMAIN_TERM_SECS)
+        .with_producer(&sk)
+        .build()
+        .unwrap();
+    let applied3 = chain.push_block_with_gc(&block3).unwrap();
+    assert_eq!(applied3.gc_removed_domains, vec![domain_id("ghost.uip")]);
+    store_block_with_removals(
+        &mut store,
+        &chain,
+        &block3,
+        applied3.hash,
+        &applied3.gc_removed_domains,
+    )
+    .unwrap();
+
+    // No ghost: the name no longer resolves, the TLD still does.
+    assert_eq!(store.resolve_name("ghost.uip").unwrap(), None);
+    assert_eq!(store.resolve_tld("uip").unwrap(), Some(tld_id("uip")));
+
+    // And the rebuilt index agrees (the rebuild drops dead targets).
+    store.rebuild_name_index().unwrap();
+    assert_eq!(store.resolve_name("ghost.uip").unwrap(), None);
+    assert_eq!(store.resolve_tld("uip").unwrap(), Some(tld_id("uip")));
+}
+
+/// Namespace separation: `resolve_name` never answers a TLD entry and
+/// `resolve_tld` never answers a domain entry (both namespaces share
+/// the `names_v3` keyspace but not the results).
+#[test]
+fn name_index_separates_domain_and_tld_namespaces() {
+    let (_dir, mut store) = tmp_store();
+    let mut chain = scone_blockchain::Blockchain::new();
+    let sk = scone_crypto::SigningKey::from_bytes([0x11; 32]);
+    let (block, hash) = build_block(&mut chain, &sk, "example.uip");
+    store_block(&mut store, &chain, &block, hash).unwrap();
+    assert_eq!(
+        store.resolve_name("example.uip").unwrap(),
+        Some(domain_id("example.uip"))
+    );
+    // "uip" alone is a TLD name: only resolve_tld answers it.
+    assert_eq!(store.resolve_name("uip").unwrap(), None);
+    assert_eq!(store.resolve_tld("uip").unwrap(), Some(tld_id("uip")));
+    // And the domain name is not a TLD.
+    assert_eq!(store.resolve_tld("example.uip").unwrap(), None);
+    // An unregistered name resolves to nothing.
+    assert_eq!(store.resolve_name("nothing.uip").unwrap(), None);
+}
+
+/// A failed append leaves no index entry behind (same ACID contract
+/// as the state tables).
+#[test]
+fn failed_append_leaves_no_name_entry() {
+    let (_dir, mut store) = tmp_store();
+    let binding = scone_storage::NameBinding {
+        is_tld: false,
+        name: "x.uip".to_owned(),
+        target: *domain_id("x.uip").as_bytes(),
+    };
+    let err = store
+        .append_block_with_state(
+            9,
+            &[2; 32],
+            b"bad",
+            &scone_storage::StateDelta {
+                name_upserts: vec![binding],
+                ..scone_storage::StateDelta::empty()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StorageError::NonMonotonicHeight { .. }));
+    assert_eq!(store.resolve_name("x.uip").unwrap(), None);
+}
+
+/// The index key is a documented pure function of the name.
+#[test]
+fn name_index_key_is_the_documented_blake3_derivation() {
+    let key = scone_storage::name_index_key("example.uip");
+    let expected =
+        scone_crypto::hash256(&[scone_storage::NAME_INDEX_VERSION, b"example.uip".as_slice()]);
+    assert_eq!(key, expected);
+    // Namespaced away from DomainId/TldId derivations.
+    assert_ne!(key.as_slice(), domain_id("example.uip").as_bytes());
+}
