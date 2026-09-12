@@ -1069,7 +1069,7 @@ fn boot_from_snapshot_equals_full_replay_bit_exact() {
     assert!(fast.state().domain(&domain_id("s10.uip")).is_some());
     // Canonical state root (SCONE-STATE-V2) equality — the strongest
     // bit-exact check available.
-    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(fast.state().state_root_v2(), replay.state().state_root_v2());
     assert_eq!(
         fast.state().state_root_smt(),
         replay.state().state_root_smt()
@@ -1138,7 +1138,7 @@ fn tampered_snapshot_tip_hash_falls_back_to_full_load() {
     assert_eq!(*fast.tip_hash().as_bytes(), tip_hash);
     // Same state as the full replay (the fallback path ran).
     let replay = load_chain_replay(&store).unwrap();
-    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(fast.state().state_root_v2(), replay.state().state_root_v2());
     assert_ne!(
         meta.tip_hash, tip_hash,
         "sanity: the snapshot really was corrupted"
@@ -1182,7 +1182,7 @@ fn corrupted_snapshot_state_falls_back_to_full_load() {
     let fast = load_chain(&store, scone_core::TESTNET).unwrap();
     let replay = load_chain_replay(&store).unwrap();
     assert_eq!(fast.tip_hash(), replay.tip_hash());
-    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(fast.state().state_root_v2(), replay.state().state_root_v2());
 }
 
 #[test]
@@ -1214,7 +1214,7 @@ fn snapshot_above_tip_is_ignored() {
     let fast = load_chain(&store, scone_core::TESTNET).unwrap();
     assert_eq!(fast.height(), tip_height);
     let replay = load_chain_replay(&store).unwrap();
-    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(fast.state().state_root_v2(), replay.state().state_root_v2());
 }
 
 #[test]
@@ -1269,7 +1269,7 @@ fn snapshot_is_replaced_not_accumulated() {
     let fast = load_chain(&store, scone_core::TESTNET).unwrap();
     let replay = load_chain_replay(&store).unwrap();
     assert_eq!(fast.tip_hash(), replay.tip_hash());
-    assert_eq!(fast.state().state_root(), replay.state().state_root());
+    assert_eq!(fast.state().state_root_v2(), replay.state().state_root_v2());
 }
 
 const MAX_DOMAIN_PAGE_USIZE: usize = 10_000;

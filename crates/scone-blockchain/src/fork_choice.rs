@@ -482,7 +482,7 @@ mod tests {
             left.state().state_root_smt(),
             right.state().state_root_smt()
         );
-        assert_eq!(left.state().state_root(), right.state().state_root());
+        assert_eq!(left.state().state_root_v2(), right.state().state_root_v2());
         assert_eq!(left.state, right.state);
     }
 

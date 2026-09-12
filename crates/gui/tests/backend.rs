@@ -133,7 +133,7 @@ fn build_store(dir: &std::path::Path, sk: &SigningKey, names: &[&str]) {
         .map(|n| {
             let id = DomainId::from_name(&DomainName::new(n).unwrap());
             let state = chain.state().domain(&id).unwrap();
-            (id, DomainStateBytes::from(state))
+            (id, DomainStateBytes::from(&state))
         })
         .collect();
     let _ = &owner;

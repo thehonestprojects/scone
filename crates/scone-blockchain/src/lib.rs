@@ -51,6 +51,7 @@ pub mod producer;
 pub mod signer;
 pub mod smt;
 pub mod state;
+pub mod state_backend;
 pub mod txid;
 pub mod validate;
 

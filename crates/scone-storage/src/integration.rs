@@ -157,7 +157,7 @@ pub fn store_block_with_removals(
             chain
                 .state()
                 .domain(id)
-                .map(|state| (*id, DomainStateBytes::from(state)))
+                .map(|state| (*id, DomainStateBytes::from(&state)))
         })
         .collect();
     // TLD deltas: present states are upserted; absent ones (revoked)
@@ -168,7 +168,7 @@ pub fn store_block_with_removals(
             chain
                 .state()
                 .tld(id)
-                .map(|state| (*id, TldStateBytes::from(state)))
+                .map(|state| (*id, TldStateBytes::from(&state)))
         })
         .collect();
     let tld_removals: Vec<TldId> = touched_tlds(block)

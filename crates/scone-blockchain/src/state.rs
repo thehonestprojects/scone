@@ -1,20 +1,41 @@
 //! Canonical chain state and transaction application rules (M8b).
 //!
-//! # SMT engagement (M6a)
+//! # SMT engagement (M6a) — canonical since the scalable-state pivot
 //!
-//! Besides the canonical direct-fold [`ChainState::state_root`]
-//! (`SCONE-STATE-V2` — format frozen), the state carries an
-//! **incremental sparse Merkle engagement** ([`crate::smt::Smt`]) of
-//! its domain and TLD maps, maintained O(40 hashes) per journaled
-//! mutation (apply / deterministic GC / rollback — see
-//! [`ChainState::state_root_smt`]). Rollback replays the undo
-//! entries in reverse order and re-inserts the exact prior leaf, so
-//! the restored tree is **bit-identical** (physical shape and root),
-//! never merely equivalent — a reorg that rewinds to the common
-//! ancestor and replays a different branch converges to the exact
-//! bytes every node computes for that branch.
+//! The state carries an **incremental sparse Merkle engagement**
+//! ([`crate::smt::Smt`]) of its domain and TLD entries, maintained
+//! O(40 hashes) per journaled mutation (apply / deterministic GC /
+//! rollback — see [`ChainState::state_root_smt`]). Rollback replays
+//! the undo entries in reverse order and re-inserts the exact prior
+//! leaf, so the restored tree is **bit-identical** (physical shape
+//! and root), never merely equivalent.
+//!
+//! [`ChainState::state_root_smt`] (O(1), cached root) is the
+//! **canonical state root of the current protocol version**: it is
+//! what checkpoints commit ([`crate::finality`]) — computing it never
+//! requires walking the domain set. The older `SCONE-STATE-V2`
+//! direct fold survives as [`ChainState::state_root_v2`], documented
+//! O(N) archive/verification path.
+//!
+//! # Scalable state (backend KV)
+//!
+//! Domain and TLD entries live in a [`StateBackend`] keyed by the
+//! raw 32-byte ids (one ordered key space, disjoint by derivation
+//! prefix) — see [`crate::state_backend`]. The hot structures kept
+//! in RAM are bounded independently of the domain count:
+//!
+//! - `domain_count` / `tld_count`: O(1) counters;
+//! - `owner_refcounts`: one entry per DISTINCT live owner — O(owners),
+//!   the PoS pool is a set of keys, not of domains;
+//! - `expirations`: one entry per PENDING expiry instant — bounded by
+//!   the number of live domains expiring, amortized O(1) per GC;
+//! - `grace`: one entry per lapsed domain inside its 30-day grace
+//!   window (strictly fewer than the live set, in-flight only).
+//!
+//! All of them are maintained by the same undo journal as the KV
+//! entries, so a rollback restores the exact pre-block state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use scone_core::id::{DOMAIN_ID_VERSION, TLD_ID_VERSION};
 use scone_core::pow;
@@ -22,6 +43,7 @@ use scone_core::{DomainId, NetworkParams, OwnerId, RecordHash, TESTNET, TldId, T
 
 use crate::error::{BlockchainError, Result};
 use crate::smt::{Smt, smt_key};
+use crate::state_backend::{MemoryBackend, StateBackend, domain_key, tld_key};
 
 /// Registration term of a domain: 1 year (M8b).
 pub const DOMAIN_TERM_SECS: u64 = 365 * 24 * 3600;
@@ -71,6 +93,66 @@ pub struct TldState {
     pub open: bool,
 }
 
+/// Wire encoding of a [`DomainState`] entry (`SCONE-ENTRY-DOM-V1`):
+/// owner(32) + sequence(8) + record_hash(32, zeroed when `None`) +
+/// registered_at(8) + valid_until(8), little-endian, fixed 88 bytes.
+/// Written and read only by [`ChainState`] — never trusted raw from
+/// a peer (the storage layer validates before restore).
+const DOMAIN_ENTRY_LEN: usize = 32 + 8 + 32 + 8 + 8;
+
+fn encode_domain_entry(st: &DomainState) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DOMAIN_ENTRY_LEN);
+    buf.extend_from_slice(st.owner.as_bytes());
+    buf.extend_from_slice(&st.sequence.to_le_bytes());
+    match st.record_hash {
+        Some(rh) => buf.extend_from_slice(rh.as_bytes()),
+        None => buf.extend_from_slice(&[0u8; 32]),
+    }
+    buf.extend_from_slice(&st.registered_at.to_le_bytes());
+    buf.extend_from_slice(&st.valid_until.to_le_bytes());
+    buf
+}
+
+pub(crate) fn decode_domain_entry(bytes: &[u8]) -> Option<DomainState> {
+    if bytes.len() != DOMAIN_ENTRY_LEN {
+        return None;
+    }
+    let owner = OwnerId::from_bytes(bytes[0..32].try_into().expect("sliced to 32"));
+    let sequence = u64::from_le_bytes(bytes[32..40].try_into().expect("sliced to 8"));
+    let record_hash = RecordHash::from_bytes(bytes[40..72].try_into().expect("sliced to 32"));
+    let all_zero = bytes[40..72].iter().all(|&b| b == 0);
+    let registered_at = u64::from_le_bytes(bytes[72..80].try_into().expect("sliced to 8"));
+    let valid_until = u64::from_le_bytes(bytes[80..88].try_into().expect("sliced to 8"));
+    Some(DomainState {
+        owner,
+        sequence,
+        record_hash: if all_zero { None } else { Some(record_hash) },
+        registered_at,
+        valid_until,
+    })
+}
+
+/// Wire encoding of a [`TldState`] entry (`SCONE-ENTRY-TLD-V1`):
+/// owner(32) + open(1), fixed 33 bytes.
+const TLD_ENTRY_LEN: usize = 32 + 1;
+
+fn encode_tld_entry(st: &TldState) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(TLD_ENTRY_LEN);
+    buf.extend_from_slice(st.owner.as_bytes());
+    buf.push(u8::from(st.open));
+    buf
+}
+
+pub(crate) fn decode_tld_entry(bytes: &[u8]) -> Option<TldState> {
+    if bytes.len() != TLD_ENTRY_LEN {
+        return None;
+    }
+    Some(TldState {
+        owner: OwnerId::from_bytes(bytes[0..32].try_into().expect("sliced to 32")),
+        open: bytes[32] != 0,
+    })
+}
+
 impl TldState {
     /// State right after a `RegisterTld`: owned, closed (M8b).
     #[must_use]
@@ -82,10 +164,12 @@ impl TldState {
 /// Authoritative in-memory state of a chain.
 ///
 /// Direct `DomainId -> DomainState` access, no full scan (ready for
-/// billions of domains; a storage backend will replace the map later,
-/// the rules stay here). Domain names are never used as keys: the
-/// 32-byte [`DomainId`] only. The TLD registry is a parallel
-/// `TldId -> TldState` map (M7b), disjoint by id derivation.
+/// billions of domains): the entries live in a [`StateBackend`] KV
+/// (see [`crate::state_backend`]); every hot structure beside it is
+/// bounded independently of the domain count (owner pool, expiration
+/// queue, grace windows — justified at each field). Domain names are
+/// never used as keys: the 32-byte [`DomainId`] only. The TLD
+/// registry shares the same backend (M7b), disjoint by id derivation.
 ///
 /// Since M8b the state is bound to one network ([`NetworkParams`]):
 /// every applied transaction must carry the same network id
@@ -99,8 +183,13 @@ impl TldState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainState {
     network: NetworkParams,
-    pub(crate) domains: HashMap<DomainId, DomainState>,
-    pub(crate) tlds: HashMap<TldId, TldState>,
+    /// KV backend of the domain and TLD entries (one ordered key
+    /// space, raw 32-byte ids). The consensus rules never depend on
+    /// the concrete type — only on the [`StateBackend`] contract.
+    pub(crate) backend: MemoryBackend,
+    /// O(1) counters (the backend holds the truth, these track it).
+    pub(crate) domain_count: usize,
+    pub(crate) tld_count: usize,
     /// OwnerId → signer public key (M3 of the .bak port): the PoS
     /// eligibility pool needs self-contained keys. Filled by apply
     /// (RegisterDomain carries the key of its owner; AssignDomain
@@ -108,23 +197,43 @@ pub struct ChainState {
     /// self-signed tx), replayed deterministically, never engaged in
     /// the state root (the owner-pool root hashes OwnerIds).
     pub(crate) owner_keys: HashMap<OwnerId, scone_crypto::PublicKey>,
+    /// Bounded live-owner pool (scalable-state pivot): one entry per
+    /// DISTINCT owner holding at least one live domain or TLD — the
+    /// pool is a set of KEYS, not of domains. Maintained by the undo
+    /// journal at every register/transfer/revoke/assign/renew-GC
+    /// mutation, so it never requires iterating the domain backend.
+    /// O(distinct owners), independent of the domain count.
+    pub(crate) owner_refcounts: HashMap<OwnerId, u64>,
+    /// Bounded expiration queue (scalable-state pivot): expiry
+    /// instant → ids of the domains expiring then (canonical order:
+    /// sorted ids per slot, so the state equality and the GC drain
+    /// order are independent of the arrival order). RAM bound: one
+    /// entry per LIVE domain (the queue holds only pending
+    /// expirations — a GC pass drains what it processes), NOT one
+    /// node per domain in a scan structure; a domain renewed or
+    /// garbage-collected leaves its slot (renew re-keys it). The GC
+    /// is a `range(..=now)` drain instead of the former O(N) scan.
+    pub(crate) expirations: BTreeMap<u64, BTreeSet<DomainId>>,
     /// Names whose registration lapsed less than `DOMAIN_GRACE_SECS`
     /// ago: a re-register by anyone other than the previous owner is
     /// refused until grace elapses (keyed by the deterministic
-    /// expiry instant, so replay/rollback stay exact).
+    /// expiry instant, so replay/rollback stay exact). RAM bound:
+    /// only lapsed-and-not-yet-re-registered names are parked here —
+    /// strictly fewer than the live set, in-flight only.
     grace: HashMap<DomainId, (u64, OwnerId)>,
-    /// Incremental SMT engagement of the domain and TLD maps (M6a):
-    /// one tree, keyed by `smt_key(id)` (top 40 bits of the 32-byte
-    /// id), leaf = the very same `SCONE-LEAF-DOM-V2` /
-    /// `SCONE-LEAF-TLD-V2` encoding the canonical
-    /// [`ChainState::state_root`] folds — the two commitments track
-    /// the same logical state by construction. Maintained by every
-    /// journaled mutation (apply/GC) and by `rollback` (bit-exact:
-    /// the undo entries carry the prior leaf bytes), so a reorg
-    /// replays without ever rebuilding the tree. DomainId and TldId
-    /// are hashes with distinct derivation prefixes, hence uniformly
-    /// distributed and disjoint in the 40-bit key space (collisions
-    /// fall into the SMT's sorted buckets and remain deterministic).
+    /// Incremental SMT engagement of the domain and TLD entries
+    /// (M6a, canonical root since the scalable-state pivot): one
+    /// tree, keyed by `smt_key(id)` (top 40 bits of the 32-byte id),
+    /// leaf = the very same `SCONE-LEAF-DOM-V2` /
+    /// `SCONE-LEAF-TLD-V2` encoding the archive V2 fold uses — the
+    /// two commitments track the same logical state by construction.
+    /// Maintained by every journaled mutation (apply/GC) and by
+    /// `rollback` (bit-exact: the undo entries carry the prior leaf
+    /// bytes), so a reorg replays without ever rebuilding the tree.
+    /// DomainId and TldId are hashes with distinct derivation
+    /// prefixes, hence uniformly distributed and disjoint in the
+    /// 40-bit key space (collisions fall into the SMT's sorted
+    /// buckets and remain deterministic).
     smt: Smt,
     /// Banned anchor keys (M9 slashing): proven checkpoint
     /// equivocators, removed from the PoS eligibility pool for life
@@ -170,7 +279,8 @@ enum UndoEntry {
     /// A `RevokeTld` removed the TLD: rolling back restores `prior`.
     RevokeTld { tld: TldId, prior: TldState },
     /// A `RenewDomain` mutated the domain expiry: rolling back
-    /// restores `prior` (M8b).
+    /// restores `prior` (M8b). The old expiry slot in the expiration
+    /// queue is restored by the `prior` field.
     RenewDomain {
         domain: DomainId,
         prior: DomainState,
@@ -219,9 +329,12 @@ impl ChainState {
     pub fn for_network(network: NetworkParams) -> Self {
         Self {
             network,
-            domains: HashMap::new(),
-            tlds: HashMap::new(),
+            backend: MemoryBackend::new(),
+            domain_count: 0,
+            tld_count: 0,
             owner_keys: HashMap::new(),
+            owner_refcounts: HashMap::new(),
+            expirations: BTreeMap::new(),
             grace: HashMap::new(),
             smt: Smt::new(),
             banned: HashSet::new(),
@@ -237,38 +350,42 @@ impl ChainState {
     /// Number of registered domains.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.domains.len()
+        self.domain_count
     }
 
     /// Whether no domain is registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.domains.is_empty()
+        self.domain_count == 0
     }
 
     /// Current state of `domain`, if registered and not expired at
     /// `now` (the caller supplies the deterministic block time).
     #[must_use]
-    pub fn domain(&self, domain: &DomainId) -> Option<&DomainState> {
-        self.domains.get(domain)
+    pub fn domain(&self, domain: &DomainId) -> Option<DomainState> {
+        self.backend
+            .get(&domain_key(domain))
+            .and_then(|bytes| decode_domain_entry(&bytes))
     }
 
     /// Current state of `tld`, if registered (M7b TLD registry).
     #[must_use]
-    pub fn tld(&self, tld: &TldId) -> Option<&TldState> {
-        self.tlds.get(tld)
+    pub fn tld(&self, tld: &TldId) -> Option<TldState> {
+        self.backend
+            .get(&tld_key(tld))
+            .and_then(|bytes| decode_tld_entry(&bytes))
     }
 
     /// Number of registered TLDs.
     #[must_use]
     pub fn tld_len(&self) -> usize {
-        self.tlds.len()
+        self.tld_count
     }
 
     /// Whether no TLD is registered.
     #[must_use]
     pub fn tld_is_empty(&self) -> bool {
-        self.tlds.is_empty()
+        self.tld_count == 0
     }
 
     /// Whether `key` is banned from the PoS eligibility pool (M9
@@ -278,10 +395,77 @@ impl ChainState {
         self.banned.contains(key)
     }
 
+    // ——— backend entry access (private; journaled by the callers) ———
+
+    /// Writes a domain entry into the backend (no index/SMT work —
+    /// the journaled callers do it all).
+    fn put_domain_entry(&mut self, id: &DomainId, st: &DomainState) {
+        self.backend.put(domain_key(id), encode_domain_entry(st));
+    }
+
+    fn remove_domain_entry(&mut self, id: &DomainId) {
+        self.backend.delete(&domain_key(id));
+    }
+
+    fn put_tld_entry(&mut self, id: &TldId, st: &TldState) {
+        self.backend.put(tld_key(id), encode_tld_entry(st));
+    }
+
+    fn remove_tld_entry(&mut self, id: &TldId) {
+        self.backend.delete(&tld_key(id));
+    }
+
+    // ——— bounded live-owner pool (journal-maintained refcounts) ———
+
+    /// +1 live registration for `owner` (domain registered / assigned,
+    /// TLD claimed, TLD transferred in). First arrival creates the
+    /// pool entry.
+    fn owner_acquire(&mut self, owner: OwnerId) {
+        *self.owner_refcounts.entry(owner).or_insert(0) += 1;
+    }
+
+    /// -1 live registration for `owner` (domain GC'd, TLD revoked,
+    /// TLD transferred away); the pool entry leaves at zero. No-op if
+    /// `owner` holds nothing (defensive — callers pair this with an
+    /// acquire).
+    fn owner_release(&mut self, owner: OwnerId) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            self.owner_refcounts.entry(owner)
+        {
+            let left = e.get_mut().saturating_sub(1);
+            if left == 0 {
+                e.remove();
+            } else {
+                *e.get_mut() = left;
+            }
+        }
+    }
+
+    // ——— bounded expiration queue (journal-maintained) ———
+
+    /// Parks `domain` to expire at `until` in the expiration queue.
+    fn expiration_enqueue(&mut self, until: u64, domain: DomainId) {
+        self.expirations.entry(until).or_default().insert(domain);
+    }
+
+    /// Removes `domain` from its (known) expiry slot — re-keying on
+    /// renewal, removal on GC/rollback. The slot holds each live id
+    /// at most once (a live id registers once), so a plain remove is
+    /// exact.
+    fn expiration_dequeue(&mut self, until: u64, domain: DomainId) {
+        let Some(set) = self.expirations.get_mut(&until) else {
+            return;
+        };
+        set.remove(&domain);
+        if set.is_empty() {
+            self.expirations.remove(&until);
+        }
+    }
+
     // ——— SMT engagement (M6a) ———
 
     /// SMT leaf of a registered domain — the exact
-    /// `SCONE-LEAF-DOM-V2` bytes the canonical `state_root` folds
+    /// `SCONE-LEAF-DOM-V2` bytes the archive V2 fold uses
     /// (see [`crate::finality::domain_leaf_v2`]).
     fn smt_domain_leaf(id: &DomainId, st: &crate::state::DomainState) -> [u8; 32] {
         crate::finality::domain_leaf_v2(id, st)
@@ -343,15 +527,15 @@ impl ChainState {
     /// || smt_root)` over the domain+TLD tree maintained by every
     /// journaled mutation. O(1) — the tree root is cached.
     ///
-    /// Choice (documented, per M6a): this is an **incremental
-    /// engagement**, not the canonical one. The canonical commitment
-    /// of the current protocol version remains the direct-fold
-    /// [`ChainState::state_root`] (`SCONE-STATE-V2`, format frozen) —
-    /// `state_root_smt` never feeds consensus artifacts. The two
-    /// commit the same leaves, so equality of logical states implies
-    /// equality of BOTH roots; the SMT additionally provides
-    /// O(40)-per-tx maintenance and non-membership-capable proofs at
-    /// O(log N), which the flat V2 fold cannot.
+    /// **Canonical state root since the scalable-state pivot**: the
+    /// checkpoint `state_root` field is this value ([`crate::
+    /// finality::Blockchain::checkpoint_data`] /
+    /// `accept_checkpoint`). Computing it never walks the domain set
+    /// — the commitment scales to 250+ billion potential domains by
+    /// construction (O(40) hashes per journaled mutation, cached
+    /// root). The archive V2 fold ([`ChainState::state_root_v2`])
+    /// commits the exact same leaves at O(N) cost and stays available
+    /// for archival verification.
     #[must_use]
     pub fn state_root_smt(&self) -> [u8; 32] {
         let mut top = Vec::with_capacity(18 + 32);
@@ -372,7 +556,9 @@ impl ChainState {
     /// [`DomainState`] comes from the node's own store.
     ///
     /// Not journaled: this is a storage-load path, never part of a
-    /// block application.
+    /// block application. The bounded indexes (expiration queue,
+    /// owner pool) are rebuilt alongside, so the restored state is
+    /// rule-identical to the pre-restart live one.
     ///
     /// # Errors
     ///
@@ -380,11 +566,14 @@ impl ChainState {
     /// domain is already restored (duplicate), which the caller treats
     /// as corrupted storage.
     pub fn restore_domain(&mut self, domain: DomainId, state: DomainState) -> Result<()> {
-        if self.domains.contains_key(&domain) {
+        if self.domain(&domain).is_some() {
             return Err(BlockchainError::DomainAlreadyRegistered);
         }
         self.smt_put_domain(&domain, None, &state);
-        self.domains.insert(domain, state);
+        self.put_domain_entry(&domain, &state);
+        self.domain_count += 1;
+        self.expiration_enqueue(state.valid_until, domain);
+        self.owner_acquire(state.owner);
         Ok(())
     }
 
@@ -396,11 +585,13 @@ impl ChainState {
     /// Returns [`BlockchainError::TldAlreadyRegistered`] if the TLD is
     /// already restored (duplicate).
     pub fn restore_tld(&mut self, tld: TldId, state: TldState) -> Result<()> {
-        if self.tlds.contains_key(&tld) {
+        if self.tld(&tld).is_some() {
             return Err(BlockchainError::TldAlreadyRegistered);
         }
         self.smt_insert_tld(&tld, &state);
-        self.tlds.insert(tld, state);
+        self.put_tld_entry(&tld, &state);
+        self.tld_count += 1;
+        self.owner_acquire(state.owner);
         Ok(())
     }
 
@@ -480,7 +671,9 @@ impl ChainState {
         match tx {
             Transaction::RegisterDomain(register) => {
                 let tld_id = TldId::from_tld(&register.name.tld());
-                let tld = self.tlds.get(&tld_id).ok_or(BlockchainError::UnknownTld)?;
+                let Some(tld) = self.tld(&tld_id) else {
+                    return Err(BlockchainError::UnknownTld);
+                };
                 if !tld.open {
                     return Err(BlockchainError::TldClosed);
                 }
@@ -522,17 +715,19 @@ impl ChainState {
                     valid_until,
                 };
                 self.smt_put_domain(&register.domain_id, None, &new_state);
-                self.domains.insert(register.domain_id, new_state);
+                self.put_domain_entry(&register.domain_id, &new_state);
+                self.domain_count += 1;
+                self.expiration_enqueue(valid_until, register.domain_id);
+                self.owner_acquire(register.owner);
                 journal.entries.push(UndoEntry::RegisterDomain {
                     domain: register.domain_id,
                     consumed_grace,
                 });
             }
             Transaction::UpdateDomain(update) => {
-                let state = self
-                    .domains
-                    .get_mut(&update.domain_id)
-                    .ok_or(BlockchainError::UnknownDomain)?;
+                let Some(state) = self.domain(&update.domain_id) else {
+                    return Err(BlockchainError::UnknownDomain);
+                };
                 if state.owner != update.owner {
                     return Err(BlockchainError::NotOwner);
                 }
@@ -559,10 +754,7 @@ impl ChainState {
                         got: update.sequence,
                     });
                 }
-                // Copy the prior state out so the `get_mut` borrow of
-                // `self.domains` ends before the SMT update takes
-                // `&mut self`.
-                let (id, prior_state) = (update.domain_id, *state);
+                let (id, prior_state) = (update.domain_id, state);
                 let mut next = prior_state;
                 next.sequence = expected;
                 next.record_hash = Some(update.record_hash);
@@ -571,10 +763,10 @@ impl ChainState {
                     prior: prior_state,
                 });
                 self.smt_put_domain(&id, Some(&prior_state), &next);
-                self.domains.insert(id, next);
+                self.put_domain_entry(&id, &next);
             }
             Transaction::RegisterTld(register_tld) => {
-                if self.tlds.contains_key(&register_tld.tld_id) {
+                if self.tld(&register_tld.tld_id).is_some() {
                     return Err(BlockchainError::TldAlreadyRegistered);
                 }
                 // ICANN root TLDs are claimable by NO ONE on Scone:
@@ -615,62 +807,66 @@ impl ChainState {
                     open: false,
                 };
                 self.smt_insert_tld(&register_tld.tld_id, &new_tld);
-                self.tlds.insert(register_tld.tld_id, new_tld);
+                self.put_tld_entry(&register_tld.tld_id, &new_tld);
+                self.tld_count += 1;
+                self.owner_acquire(new_tld.owner);
                 journal
                     .entries
                     .push(UndoEntry::RegisterTld(register_tld.tld_id));
             }
             Transaction::TransferTld(transfer) => {
-                let state = self
-                    .tlds
-                    .get_mut(&transfer.tld_id)
-                    .ok_or(BlockchainError::UnknownTld)?;
+                let Some(state) = self.tld(&transfer.tld_id) else {
+                    return Err(BlockchainError::UnknownTld);
+                };
                 if state.owner != transfer.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
-                // Copy out so the `get_mut` borrow ends before the
-                // SMT update takes `&mut self`.
-                let (tld, prior) = (transfer.tld_id, *state);
+                let (tld, prior) = (transfer.tld_id, state);
                 let mut next = prior;
                 next.owner = transfer.new_owner;
                 journal.entries.push(UndoEntry::MutateTld { tld, prior });
                 self.smt_put_tld(&tld, &prior, &next);
-                self.tlds.insert(tld, next);
+                self.put_tld_entry(&tld, &next);
+                // Bounded owner pool: the seat follows the namespace.
+                self.owner_release(prior.owner);
+                self.owner_acquire(next.owner);
             }
             Transaction::RevokeTld(revoke) => {
-                let state = self
-                    .tlds
-                    .get_mut(&revoke.tld_id)
-                    .ok_or(BlockchainError::UnknownTld)?;
+                let Some(state) = self.tld(&revoke.tld_id) else {
+                    return Err(BlockchainError::UnknownTld);
+                };
                 if state.owner != revoke.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
-                let prior = *state;
+                let prior = state;
                 self.smt_remove_tld(&revoke.tld_id, &prior);
-                self.tlds.remove(&revoke.tld_id);
+                self.remove_tld_entry(&revoke.tld_id);
+                self.tld_count -= 1;
+                self.owner_release(prior.owner);
                 journal.entries.push(UndoEntry::RevokeTld {
                     tld: revoke.tld_id,
                     prior,
                 });
             }
             Transaction::SetTldOpen(set_open) => {
-                let state = self
-                    .tlds
-                    .get_mut(&set_open.tld_id)
-                    .ok_or(BlockchainError::UnknownTld)?;
+                let Some(state) = self.tld(&set_open.tld_id) else {
+                    return Err(BlockchainError::UnknownTld);
+                };
                 if state.owner != set_open.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
-                let (tld, prior) = (set_open.tld_id, *state);
+                let (tld, prior) = (set_open.tld_id, state);
                 let mut next = prior;
                 next.open = set_open.open;
                 journal.entries.push(UndoEntry::MutateTld { tld, prior });
                 self.smt_put_tld(&tld, &prior, &next);
-                self.tlds.insert(tld, next);
+                self.put_tld_entry(&tld, &next);
             }
             Transaction::AssignDomain(assign) => {
                 let tld_id = TldId::from_tld(&assign.name.tld());
-                let tld = self.tlds.get(&tld_id).ok_or(BlockchainError::UnknownTld)?;
+                let Some(tld) = self.tld(&tld_id) else {
+                    return Err(BlockchainError::UnknownTld);
+                };
                 if tld.owner != assign.owner {
                     return Err(BlockchainError::NotTldOwner);
                 }
@@ -688,17 +884,19 @@ impl ChainState {
                     valid_until: now + DOMAIN_TERM_SECS,
                 };
                 self.smt_put_domain(&assign.domain_id, None, &new_state);
-                self.domains.insert(assign.domain_id, new_state);
+                self.put_domain_entry(&assign.domain_id, &new_state);
+                self.domain_count += 1;
+                self.expiration_enqueue(new_state.valid_until, assign.domain_id);
+                self.owner_acquire(assign.assignee);
                 journal.entries.push(UndoEntry::RegisterDomain {
                     domain: assign.domain_id,
                     consumed_grace,
                 });
             }
             Transaction::RenewDomain(renew) => {
-                let state = self
-                    .domains
-                    .get_mut(&renew.domain_id)
-                    .ok_or(BlockchainError::UnknownDomain)?;
+                let Some(state) = self.domain(&renew.domain_id) else {
+                    return Err(BlockchainError::UnknownDomain);
+                };
                 if state.owner != renew.owner {
                     return Err(BlockchainError::NotOwner);
                 }
@@ -715,14 +913,18 @@ impl ChainState {
                         proposed: renew.valid_until,
                     });
                 }
-                let (domain, prior) = (renew.domain_id, *state);
+                let (domain, prior) = (renew.domain_id, state);
                 let mut next = prior;
                 next.valid_until = renew.valid_until;
+                // Bounded expiration queue: the domain moves to its
+                // new expiry slot.
+                self.expiration_dequeue(prior.valid_until, domain);
+                self.expiration_enqueue(next.valid_until, domain);
                 journal
                     .entries
                     .push(UndoEntry::RenewDomain { domain, prior });
                 self.smt_put_domain(&domain, Some(&prior), &next);
-                self.domains.insert(domain, next);
+                self.put_domain_entry(&domain, &next);
             }
             Transaction::Slash(slash) => {
                 // M9 — equivocation evidence. The cryptographic proof
@@ -732,7 +934,7 @@ impl ChainState {
                 //
                 // 1. the offender must be in the eligibility pool AT
                 //    APPLICATION TIME — the pool of the current state
-                //    (live-domain/TLD owners, the same snapshot
+                //    (live-domain/TLD owners, the same set
                 //    `eligible_validators` computes). The committee of
                 //    the evidence's epoch is NOT reconstructible from
                 //    a bare ChainState (it depends on the finalized
@@ -768,7 +970,7 @@ impl ChainState {
     /// `AssignDomain`: not currently registered (M7 rule) and not in
     /// a grace window owned by someone else (M8b rule).
     fn ensure_domain_free(&self, domain: &DomainId, now: u64, claimant: &OwnerId) -> Result<()> {
-        if self.domains.contains_key(domain) {
+        if self.domain(domain).is_some() {
             return Err(BlockchainError::DomainAlreadyRegistered);
         }
         if let Some(&(expired_at, lapsed_owner)) = self.grace.get(domain)
@@ -783,32 +985,67 @@ impl ChainState {
     }
 
     /// Deterministic garbage collection of expired registrations
-    /// (M8b). Removes every domain whose `valid_until < now` from the
-    /// live registry and parks it in the grace map. Called by
+    /// (M8b). Removes every domain whose `valid_until <= now` from
+    /// the live registry and parks it in the grace map. Called by
     /// `Blockchain::push_block` with the **parent** block timestamp
     /// before applying the block's transactions — same blocks, same
     /// time input, same result on every node.
     ///
     /// Journaled: a rolled-back block restores the exact pre-GC
     /// registry bit for bit.
+    ///
+    /// Scalable-state pivot: the expiry candidates come from the
+    /// **bounded expiration queue** (`expirations`, a
+    /// `BTreeMap<u64, Vec<DomainId>>`), NOT from a scan of the
+    /// domain backend. RAM bound: the queue holds one list entry per
+    /// LIVE domain (pending expirations only — renewal re-keys the
+    /// slot, GC drains it), never one node per domain in a scan
+    /// structure; the cost of this pass is O(expired now), not
+    /// O(total domains).
     pub(crate) fn gc_expired_journaled(
         &mut self,
         now: u64,
         journal: &mut UndoLog,
     ) -> Vec<DomainId> {
-        let expired: Vec<DomainId> = self
-            .domains
-            .iter()
-            .filter(|(_, state)| state.valid_until <= now)
-            .map(|(id, _)| *id)
+        // Drain every expiry slot at or before `now` (ascending —
+        // deterministic order).
+        let due: Vec<u64> = self
+            .expirations
+            .range(..=now)
+            .map(|(until, _)| *until)
             .collect();
-        for id in expired.clone() {
-            let prior = self.domains.remove(&id).expect("checked present");
-            self.smt_remove_domain(&id, &prior);
-            self.grace.insert(id, (prior.valid_until, prior.owner));
-            journal
-                .entries
-                .push(UndoEntry::ExpireDomain { domain: id, prior });
+        let mut expired = Vec::new();
+        for until in due {
+            let ids: Vec<DomainId> = self
+                .expirations
+                .remove(&until)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            for id in ids {
+                // Re-check against the entry: the queue is derived
+                // state, the backend is the truth (a renewal always
+                // re-keys the slot, so a stale id cannot appear —
+                // the check is defensive, never a rule).
+                let Some(prior) = self.domain(&id) else {
+                    continue;
+                };
+                if prior.valid_until > now {
+                    // Cannot happen (slot == valid_until <= now);
+                    // keep the entry live rather than lose it.
+                    self.expiration_enqueue(prior.valid_until, id);
+                    continue;
+                }
+                self.remove_domain_entry(&id);
+                self.smt_remove_domain(&id, &prior);
+                self.domain_count -= 1;
+                self.owner_release(prior.owner);
+                self.grace.insert(id, (prior.valid_until, prior.owner));
+                journal
+                    .entries
+                    .push(UndoEntry::ExpireDomain { domain: id, prior });
+                expired.push(id);
+            }
         }
         expired
     }
@@ -819,7 +1056,9 @@ impl ChainState {
     /// the exact inverse leaf operation (re-insert the prior leaf /
     /// remove the inserted leaf), so the restored tree is
     /// bit-identical (physical shape and root) to the pre-journal
-    /// tree, not merely an equivalent commitment.
+    /// tree, not merely an equivalent commitment. The bounded
+    /// indexes (owner pool, expiration queue, counters) are restored
+    /// by the same entries.
     pub(crate) fn rollback(&mut self, journal: UndoLog) {
         for entry in journal.entries.into_iter().rev() {
             match entry {
@@ -827,41 +1066,63 @@ impl ChainState {
                     domain,
                     consumed_grace,
                 } => {
-                    if let Some(state) = self.domains.remove(&domain) {
+                    if let Some(state) = self.domain(&domain) {
                         self.smt_remove_domain(&domain, &state);
+                        self.remove_domain_entry(&domain);
+                        self.domain_count -= 1;
+                        self.expiration_dequeue(state.valid_until, domain);
+                        self.owner_release(state.owner);
                     }
                     if let Some(entry) = consumed_grace {
                         self.grace.insert(domain, entry);
                     }
                 }
                 UndoEntry::UpdateDomain { domain, prior } => {
-                    if let Some(current) = self.domains.insert(domain, prior) {
+                    if let Some(current) = self.domain(&domain) {
                         self.smt_put_domain(&domain, Some(&current), &prior);
                     }
+                    self.put_domain_entry(&domain, &prior);
                 }
                 UndoEntry::RegisterTld(tld) => {
-                    if let Some(state) = self.tlds.remove(&tld) {
+                    if let Some(state) = self.tld(&tld) {
                         self.smt_remove_tld(&tld, &state);
+                        self.remove_tld_entry(&tld);
+                        self.tld_count -= 1;
+                        self.owner_release(state.owner);
                     }
                 }
                 UndoEntry::MutateTld { tld, prior } => {
-                    if let Some(current) = self.tlds.insert(tld, prior) {
+                    if let Some(current) = self.tld(&tld) {
                         self.smt_put_tld(&tld, &current, &prior);
+                        // Owner-pool seat follows the namespace on
+                        // the restore too.
+                        self.owner_release(current.owner);
+                        self.owner_acquire(prior.owner);
                     }
+                    self.put_tld_entry(&tld, &prior);
                 }
                 UndoEntry::RevokeTld { tld, prior } => {
                     self.smt_insert_tld(&tld, &prior);
-                    self.tlds.insert(tld, prior);
+                    self.put_tld_entry(&tld, &prior);
+                    self.tld_count += 1;
+                    self.owner_acquire(prior.owner);
                 }
                 UndoEntry::RenewDomain { domain, prior } => {
-                    if let Some(current) = self.domains.insert(domain, prior) {
+                    if let Some(current) = self.domain(&domain) {
                         self.smt_put_domain(&domain, Some(&current), &prior);
+                        // Expiration slot back to the prior expiry.
+                        self.expiration_dequeue(current.valid_until, domain);
                     }
+                    self.expiration_enqueue(prior.valid_until, domain);
+                    self.put_domain_entry(&domain, &prior);
                 }
                 UndoEntry::ExpireDomain { domain, prior } => {
                     self.grace.remove(&domain);
                     self.smt_put_domain(&domain, None, &prior);
-                    self.domains.insert(domain, prior);
+                    self.put_domain_entry(&domain, &prior);
+                    self.domain_count += 1;
+                    self.expiration_enqueue(prior.valid_until, domain);
+                    self.owner_acquire(prior.owner);
                 }
                 UndoEntry::LearnOwnerKey(owner) => {
                     self.owner_keys.remove(&owner);
@@ -1619,25 +1880,43 @@ mod tests {
 
     use crate::finality::{domain_leaf_v2, tld_leaf_v2};
     use crate::smt::{Smt, smt_key};
+    use crate::state_backend::Pkey;
 
     /// Invariant: the incrementally maintained SMT is EXACTLY the
-    /// commitment of the current domain+TLD maps (naive rebuild from
-    /// the maps → same root, same size). Catches any apply/GC path
-    /// that forgets to sync a leaf.
+    /// commitment of the current domain+TLD entries (naive rebuild
+    /// from the backend → same root, same size). Catches any
+    /// apply/GC path that forgets to sync a leaf.
     fn assert_smt_invariant(state: &ChainState) {
         let mut expect = Smt::new();
-        for (id, st) in &state.domains {
-            expect.insert(smt_key(id.as_bytes()), domain_leaf_v2(id, st));
-        }
-        for (id, st) in &state.tlds {
-            expect.insert(smt_key(id.as_bytes()), tld_leaf_v2(id, st));
+        let mut cursor: Option<Pkey> = None;
+        let mut total = 0usize;
+        loop {
+            let (page, next) = state.backend.range(cursor.as_ref(), 512);
+            for (key, bytes) in page {
+                // Domain and TLD ids are disjoint by derivation
+                // prefix; try both decodings, exactly one fits.
+                if let Some(st) = decode_domain_entry(&bytes) {
+                    let id = DomainId::from_bytes(key);
+                    expect.insert(smt_key(&key), domain_leaf_v2(&id, &st));
+                } else if let Some(st) = decode_tld_entry(&bytes) {
+                    let id = TldId::from_bytes(key);
+                    expect.insert(smt_key(&key), tld_leaf_v2(&id, &st));
+                } else {
+                    panic!("undecodable backend entry");
+                }
+                total += 1;
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
         }
         assert_eq!(
             state.smt().root(),
             expect.root(),
-            "maintained SMT == naive rebuild of the maps"
+            "maintained SMT == naive rebuild of the backend"
         );
-        assert_eq!(state.smt().len(), state.domains.len() + state.tlds.len());
+        assert_eq!(state.smt().len(), total);
     }
 
     #[test]
@@ -1789,9 +2068,9 @@ mod tests {
         assert_ne!(a.state_root_smt(), b.state_root_smt());
         assert_ne!(a.state_root_smt(), c.state_root_smt());
         assert_ne!(b.state_root_smt(), c.state_root_smt());
-        // The canonical V2 root distinguishes them too (same leaves).
-        assert_ne!(a.state_root(), b.state_root());
-        assert_ne!(a.state_root(), c.state_root());
+        // The archive V2 root distinguishes them too (same leaves).
+        assert_ne!(a.state_root_v2(), b.state_root_v2());
+        assert_ne!(a.state_root_v2(), c.state_root_v2());
     }
 
     #[test]
@@ -1806,5 +2085,175 @@ mod tests {
         let _ = state.apply(&update("example.uip", 1, 7));
         assert_eq!(state, snapshot);
         assert_eq!(state.state_root_smt(), root);
+    }
+
+    // --- Scalable state: bounded hot structures (pivot) ---
+
+    /// 10 000+ domains on ONE owner: the hot structures stay bounded
+    /// by the number of DISTINCT owners and PENDING expirations, not
+    /// by the domain count. 10 001 domains, one shared expiry slot
+    /// per registration instant (two instants here: registration
+    /// timestamps 0 and 500).
+    #[test]
+    fn ten_thousand_domains_bounded_hot_structures() {
+        let mut state = ChainState::new();
+        seed_open_uip(&mut state);
+        let mut j = UndoLog::default();
+        for i in 0..10_000u32 {
+            let name = format!("d{i}.uip");
+            let tx = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(&name).unwrap(),
+                1,
+                mined_proof(&domain_challenge(&name), "domain"),
+                key(7).public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
+            let now = u64::from(i / 5_000) * 500;
+            state.apply_journaled_at(&tx, now, &mut j).unwrap();
+        }
+        assert_eq!(state.len(), 10_000);
+        // Hot structures: the domain owner + the uip TLD owner = TWO
+        // distinct owners; TWO expiry instants (registration
+        // timestamps 0 and 500).
+        assert_eq!(state.owner_refcounts.len(), 2, "domain owner + uip owner");
+        assert_eq!(state.expirations.len(), 2, "two registration instants");
+        assert_eq!(
+            state.expirations.values().map(BTreeSet::len).sum::<usize>(),
+            10_000
+        );
+        // Replay identity: a second node applying the same journaled
+        // ops reaches the same full state, including the indexes.
+        let mut replay = ChainState::new();
+        seed_open_uip(&mut replay);
+        let mut j2 = UndoLog::default();
+        for i in 0..10_000u32 {
+            let name = format!("d{i}.uip");
+            let tx = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(&name).unwrap(),
+                1,
+                mined_proof(&domain_challenge(&name), "domain"),
+                key(7).public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
+            let now = u64::from(i / 5_000) * 500;
+            replay.apply_journaled_at(&tx, now, &mut j2).unwrap();
+        }
+        assert_eq!(state, replay);
+        assert_eq!(state.state_root_smt(), replay.state_root_smt());
+        assert_eq!(state.state_root_v2(), replay.state_root_v2());
+    }
+
+    /// GC through the queue on a big state: expired domains leave,
+    /// survivors stay, the queue drains exactly the expired slots.
+    #[test]
+    fn gc_queue_drains_a_large_state_exactly() {
+        let mut state = ChainState::new();
+        seed_open_uip(&mut state);
+        let mut j = UndoLog::default();
+        // 300 domains registered at t=0 (expire at TERM), 300 at
+        // t=10_000 (expire at TERM+10_000), interleaved.
+        for i in 0..600u32 {
+            let now = if i % 2 == 0 { 0 } else { 10_000 };
+            let name = format!("g{i}.uip");
+            let tx = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(&name).unwrap(),
+                1,
+                mined_proof(&domain_challenge(&name), "domain"),
+                key(7).public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
+            state.apply_journaled_at(&tx, now, &mut j).unwrap();
+        }
+        assert_eq!(state.len(), 600);
+        let mut j2 = UndoLog::default();
+        let removed = state.gc_expired_journaled(DOMAIN_TERM_SECS, &mut j2);
+        assert_eq!(removed.len(), 300);
+        assert_eq!(state.len(), 300);
+        // Queue: only the late instant remains.
+        assert_eq!(state.expirations.len(), 1);
+        assert_eq!(
+            state.expirations.values().map(BTreeSet::len).sum::<usize>(),
+            300
+        );
+        // The expired ids are exactly the t=0 half, parked in grace.
+        for id in &removed {
+            assert!(state.domain(id).is_none());
+        }
+        // Survivors: the t=10_000 half.
+        for i in (0..600u32).filter(|i| i % 2 == 1) {
+            assert!(state.domain(&domain_id(&format!("g{i}.uip"))).is_some());
+        }
+        // Rollback restores the exact pre-GC state (bit-exact,
+        // indexes included).
+        state.rollback(j2);
+        assert_eq!(state.len(), 600);
+        assert_eq!(
+            state.expirations.values().map(BTreeSet::len).sum::<usize>(),
+            600
+        );
+    }
+
+    /// eligible_validators never iterates the domains: the pool is
+    /// read from the journal-maintained BTreeSet, O(pool) not O(N).
+    /// Structural assert (pool contents), not behavioral.
+    #[test]
+    fn eligible_validators_pool_is_indexed_not_scanned() {
+        let mut state = ChainState::new();
+        seed_open_uip(&mut state);
+        // 200 domains spread over 3 owners (+ the uip owner).
+        for i in 0..200u32 {
+            let seed = 2u8 + (i % 3) as u8;
+            let name = format!("p{i}.uip");
+            let tx = Transaction::RegisterDomain(RegisterDomain::register_domain_signed(
+                DomainName::new(&name).unwrap(),
+                1,
+                mined_proof(&domain_challenge(&name), "domain"),
+                key(seed).public_key(),
+                Signature::from_bytes([0; 64]),
+            ));
+            state.apply(&tx).unwrap();
+        }
+        // The bounded index: 4 distinct owners (uip owner + 3).
+        assert_eq!(state.owner_refcounts.len(), 4);
+        // The pool answers from the index — same set as the former
+        // full scan would produce.
+        let pool = state.eligible_validators(0);
+        assert_eq!(pool.len(), 4);
+        // GC every domain (they all expire at TERM): the 3 domain
+        // owners leave the pool, the uip owner stays.
+        let mut j = UndoLog::default();
+        state.gc_expired_journaled(DOMAIN_TERM_SECS, &mut j);
+        assert_eq!(state.owner_refcounts.len(), 1);
+        let pool = state.eligible_validators(DOMAIN_TERM_SECS);
+        assert_eq!(pool.len(), 1);
+        // Rollback: pool entries restored bit-exact.
+        state.rollback(j);
+        assert_eq!(state.owner_refcounts.len(), 4);
+        assert_eq!(state.eligible_validators(0).len(), 4);
+    }
+
+    /// The owner pool follows transfers/revocations too (TLD seats).
+    #[test]
+    fn owner_pool_follows_tld_transfers_and_revocations() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        assert_eq!(state.owner_refcounts.len(), 1);
+        let transfer = Transaction::TransferTld(TransferTld::transfer_tld_signed(
+            tld_id("uip"),
+            owner(2),
+            key(1).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&transfer).unwrap();
+        assert_eq!(state.owner_refcounts.len(), 1);
+        assert!(state.owner_refcounts.contains_key(&owner(2)));
+        let revoke = Transaction::RevokeTld(RevokeTld::revoke_tld_signed(
+            tld_id("uip"),
+            key(2).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&revoke).unwrap();
+        assert_eq!(state.owner_refcounts.len(), 0);
+        assert!(state.eligible_validators(0).is_empty());
     }
 }

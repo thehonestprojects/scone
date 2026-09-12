@@ -41,12 +41,13 @@ use std::collections::HashSet;
 use scone_core::checkpoint::{
     Checkpoint, CheckpointData, next_seed, recovery_seed, select_committee,
 };
-use scone_core::{MIN_FINALITY_COMMITTEE_SIZE, quorum_for};
+use scone_core::{DomainId, MIN_FINALITY_COMMITTEE_SIZE, TldId, quorum_for};
 use scone_crypto::{PublicKey, SigningKey};
 
 use crate::chain::Blockchain;
 use crate::error::{BlockchainError, Result};
 use crate::state::ChainState;
+use crate::state_backend::StateBackend as _;
 
 /// Finalized checkpoints kept in RAM (the storage layer keeps
 /// everything; the chain reads only the last for the rules). Ported
@@ -124,7 +125,7 @@ impl<C: crate::consensus::Consensus> Blockchain<C> {
             height: tip.header.height,
             block_hash: *crate::block_hash::block_hash(&tip.header)?.as_bytes(),
             prev_checkpoint_hash: prev,
-            state_root: self.state().state_root(),
+            state_root: self.state().state_root_smt(),
             recovery,
         })
     }
@@ -235,12 +236,14 @@ impl<C: crate::consensus::Consensus> Blockchain<C> {
                 "checkpoint quorum not met (need {quorum})"
             )));
         }
-        // State root must match OUR recomputation at that height. The
-        // current RAM state is the tip: exact when the checkpoint
-        // targets the tip; otherwise the caller replays (the relay
-        // drives this — a full replay-to-height is a storage/relay
-        // concern, the chain layer verifies what it can see).
-        if cp.data.height == self.height() && cp.data.state_root != self.state().state_root() {
+        // State root must match OUR recomputation at that height —
+        // the canonical O(1) SMT root since the scalable-state
+        // pivot. The current RAM state is the tip: exact when the
+        // checkpoint targets the tip; otherwise the caller replays
+        // (the relay drives this — a full replay-to-height is a
+        // storage/relay concern, the chain layer verifies what it
+        // can see).
+        if cp.data.height == self.height() && cp.data.state_root != self.state().state_root_smt() {
             return Err(BlockchainError::Consensus(
                 "checkpoint state root mismatch".into(),
             ));
@@ -361,44 +364,41 @@ impl ChainState {
     /// **minus banned keys** (M9: a slashed equivocator is out of the
     /// pool for life). One key with a hundred domains = one seat
     /// (economic anti-Sybil is per identity, linear).
+    ///
+    /// Scalable-state pivot: the pool is read from the
+    /// journal-maintained bounded index (`owner_refcounts`, one entry
+    /// per DISTINCT live owner — O(owners), independent of the domain
+    /// count), NEVER by iterating the domain backend. Time-liveness
+    /// (`valid_until > now`) is answered by the expiration queue:
+    /// every domain whose expiry is `<= now` has already left the
+    /// live registry and its owner's refcount — the deterministic GC
+    /// (`Blockchain::push_block`, parent timestamp) ran first. The
+    /// output is sorted (deterministic order, independent of the
+    /// index's iteration order).
     #[must_use]
     pub fn eligible_validators(&self, now: u64) -> Vec<PublicKey> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for state in self.domains.values() {
-            if state.valid_until > now
-                && seen.insert(state.owner)
-                && let Some(pk) = self.owner_public_key(state.owner)
-                && !self.banned.contains(&pk)
-            {
-                out.push(pk);
-            }
-        }
-        for state in self.tlds.values() {
-            // A claimed TLD is live until revoked (M8b GC handles
-            // the 3-year inactivity rule); a claimed TLD cost a PoW —
-            // its owner is a stakeholder.
-            if seen.insert(state.owner)
-                && let Some(pk) = self.owner_public_key(state.owner)
-                && !self.banned.contains(&pk)
-            {
-                out.push(pk);
-            }
-        }
-        out
+        let _ = now; // liveness is enforced by the GC + refcount index
+        let mut pool: Vec<PublicKey> = self
+            .owner_refcounts
+            .keys()
+            .filter_map(|owner| self.owner_keys.get(owner).copied())
+            .filter(|pk| !self.banned.contains(pk))
+            .collect();
+        pool.sort();
+        pool
     }
 
-    /// Recomputes the state root: BLAKE3 over the domain-root, the
-    /// TLD-root, the owner-pool root and the banned-root (domain
-    /// separation `SCONE-STATE-V2`). Deterministic: two nodes with the
-    /// same logical state compute the same root.
-    ///
-    /// This V2 direct fold is the **canonical commitment of the
-    /// current protocol version**. The incremental SMT engagement
-    /// lives beside it ([`ChainState::state_root_smt`]) and commits
-    /// the exact same domain/TLD leaves (see
-    /// [`domain_leaf_v2`]/[`tld_leaf_v2`]), so the two can never
-    /// diverge on the logical state.
+    /// Archive state root (`SCONE-STATE-V2`, format frozen): BLAKE3
+    /// over the domain-root, the TLD-root, the owner-pool root and
+    /// the banned-root, folding the SAME leaves as the SMT. **O(N)
+    /// over the whole entry set — document every call site**: this is
+    /// the archival verification path (a node re-folding the full
+    /// state from storage to cross-check a historical root), NOT a
+    /// consensus artifact. The canonical commitment of the current
+    /// protocol version is [`ChainState::state_root_smt`] (O(1),
+    /// cached — what checkpoints commit since the scalable-state
+    /// pivot); the two commit the same leaves, so equality of logical
+    /// states implies equality of both roots.
     ///
     /// M9: the ban list is part of the committed state — the leaf
     /// per banned key is `BLAKE3("SCONE-LEAF-BAN-V1" || pk)` and the
@@ -407,19 +407,25 @@ impl ChainState {
     /// contradict the state every honest node computes after the
     /// SlashTx.
     #[must_use]
-    pub fn state_root(&self) -> [u8; 32] {
-        use std::collections::BTreeMap;
-        // Deterministic order: BTreeMap over ids.
-        let domains: BTreeMap<&scone_core::DomainId, &crate::state::DomainState> =
-            self.domains.iter().collect();
-        let tlds: BTreeMap<&scone_core::TldId, &crate::state::TldState> =
-            self.tlds.iter().collect();
-        let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(domains.len() + tlds.len());
-        for (id, st) in &domains {
-            leaves.push(domain_leaf_v2(id, st));
-        }
-        for (id, st) in &tlds {
-            leaves.push(tld_leaf_v2(id, st));
+    pub fn state_root_v2(&self) -> [u8; 32] {
+        // Deterministic order: ascending backend keys (the ids ARE
+        // the keys — a BTreeMap over ids in the old layout, the
+        // backend's ordered range now).
+        let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(self.domain_count + self.tld_count);
+        let mut cursor: Option<crate::state_backend::Pkey> = None;
+        loop {
+            let (page, next) = self.backend.range(cursor.as_ref(), 1024);
+            for (key, bytes) in page {
+                if let Some(st) = crate::state::decode_domain_entry(&bytes) {
+                    leaves.push(domain_leaf_v2(&DomainId::from_bytes(key), &st));
+                } else if let Some(st) = crate::state::decode_tld_entry(&bytes) {
+                    leaves.push(tld_leaf_v2(&TldId::from_bytes(key), &st));
+                }
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
         }
         let mut top = Vec::with_capacity(15 + 32 + 32);
         top.extend_from_slice(b"SCONE-STATE-V2");
@@ -431,10 +437,12 @@ impl ChainState {
         scone_crypto::hash256(&[&top])
     }
 
+    /// Owner-pool root: one `SCONE-LEAF-OWN-V2` leaf per DISTINCT
+    /// owner of a live domain/TLD (the bounded index — never a scan
+    /// of the domain backend), folded in ascending order.
     fn owner_pool_root(&self) -> [u8; 32] {
-        use std::collections::BTreeSet;
-        let owners: BTreeSet<scone_core::OwnerId> =
-            self.domains.values().map(|s| s.owner).collect();
+        let owners: std::collections::BTreeSet<scone_core::OwnerId> =
+            self.owner_refcounts.keys().copied().collect();
         let leaves: Vec<[u8; 32]> = owners
             .iter()
             .map(|o| {
@@ -463,15 +471,6 @@ impl ChainState {
             .collect();
         fold_hashes(&leaves)
     }
-
-    /// OwnerId → PublicKey resolution. The chain state stores
-    /// OwnerId (identity), not keys; the pool carries self-contained
-    /// keys. Without a key index the pool falls back to deriving
-    /// from... nothing — so the ChainState keeps a light
-    /// owner→key index (filled by apply, replayed deterministically).
-    fn owner_public_key(&self, _owner: scone_core::OwnerId) -> Option<PublicKey> {
-        self.owner_keys.get(&_owner).copied()
-    }
 }
 
 /// Deterministic merkle fold over 32-byte leaves (empty = zero hash).
@@ -489,4 +488,70 @@ fn fold_hashes(leaves: &[[u8; 32]]) -> [u8; 32] {
         level = next;
     }
     level[0]
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::tests_support::{
+        child, claim_open_uip, producer_key, register_domain_tx, update_domain_tx,
+    };
+    use scone_core::checkpoint::Checkpoint;
+
+    /// Scalable-state pivot: a checkpoint accepted with the SMT root
+    /// re-verifies after a restore (reload) — the O(1) canonical
+    /// root is a pure function of the restored KV + SMT, and the
+    /// idempotent duplicate path answers on the hash alone.
+    #[test]
+    fn accepted_smt_checkpoint_reverifies_after_restore() {
+        let mut chain = Blockchain::new();
+        claim_open_uip(&mut chain, 1);
+        for (name, seed) in [("a.uip", 2u8), ("b.uip", 3), ("c.uip", 4)] {
+            chain
+                .push_block(&child(&chain, vec![register_domain_tx(name, seed)]))
+                .unwrap();
+        }
+        let data = chain.checkpoint_data(0).unwrap();
+        // The committed root IS the canonical SMT root.
+        assert_eq!(data.state_root, chain.state().state_root_smt());
+        let committee = chain.committee(0);
+        assert!(
+            committee.len() >= scone_core::MIN_FINALITY_COMMITTEE_SIZE,
+            "test fixture must reach the BFT floor"
+        );
+        let keys: Vec<_> = (1..=4u8)
+            .map(|i| scone_crypto::SigningKey::from_bytes([i; 32]))
+            .collect();
+        let sigs: Vec<_> = keys
+            .iter()
+            .map(|sk| (sk.public_key(), sk.sign(&data.signing_hash())))
+            .collect();
+        let cp = Checkpoint {
+            data,
+            signatures: sigs,
+        };
+        chain.accept_checkpoint(cp.clone()).unwrap();
+
+        // Restore (reload) the chain from the tip + state, as the
+        // storage layer does.
+        let tip = chain.height();
+        let restored = Blockchain::restore(
+            tip,
+            chain.tip_hash(),
+            chain.block(tip).unwrap().clone(),
+            chain.state().clone(),
+        );
+        // The restored state recomputes the exact same SMT root.
+        assert_eq!(
+            restored.state().state_root_smt(),
+            cp.data.state_root,
+            "checkpoint accepted with the SMT root re-verifies after restore"
+        );
+        // A fresh checkpoint_data over the restored tip commits the
+        // same root: the content rule stays satisfiable.
+        let re_data = restored.checkpoint_data(0).unwrap();
+        assert_eq!(re_data.state_root, cp.data.state_root);
+        assert_eq!(re_data.epoch, cp.data.epoch);
+        let _ = producer_key();
+        let _ = update_domain_tx;
+    }
 }

@@ -448,6 +448,86 @@ pub trait Consensus {
   s'insérera sans réécrire la chaîne ;
 - une seule abstraction, pas de hiérarchie de traits.
 
+## État scalable (backend KV, pivot SMT, file d'expiration, pool owners borné)
+
+Objectif : 250+ milliards de domaines potentiels — JAMAIS tout charger
+en RAM. Quatre pièces :
+
+### Backend KV (`state_backend.rs`)
+
+```rust
+pub trait StateBackend: Default + Send {
+    fn get(&self, key: &Pkey) -> Option<Vec<u8>>;
+    fn put(&mut self, key: Pkey, value: Vec<u8>);
+    fn delete(&mut self, key: &Pkey);
+    fn range(&self, from: Option<&Pkey>, limit: usize)
+        -> (Vec<(Pkey, Vec<u8>)>, Option<Pkey>);
+}
+```
+
+- `Pkey` = les 32 octets bruts du `DomainId`/`TldId` — UN espace de
+  clés ordonné (préfixes de dérivation disjoints), valeurs = les
+  encodages fixes `SCONE-ENTRY-DOM-V1` (88 o) / `SCONE-ENTRY-TLD-V1`
+  (33 o) ;
+- `MemoryBackend` (BTreeMap) = implémentation de référence (dev,
+  tests) ; AUCUNE dépendance concrète dans `scone-blockchain` (redb
+  interdit dans la crate) — le protocole/consensus dépendent du
+  TRAIT seul, un backend TiKV/kvsharded/redb se branchera plus tard
+  depuis une autre crate sans toucher une règle ;
+- `range` itère par ordre de clé croissant (contrat de
+  déterminisme) — chemin archive uniquement, jamais une règle de
+  consensus ;
+- `ChainState` accède aux domaines/TLD UNIQUEMENT par clé via le
+  backend (point reads, writes journalisées).
+
+### SMT root canonique (pivot)
+
+- `state_root_smt()` (O(1), racine cachée, `SCONE-STATE-SMT-V1`) est
+  le state_root **canonique** : c'est ce que `checkpoint_data`
+  commet et ce qu'`accept_checkpoint` vérifie à la pointe. Le
+  calcul ne traverse JAMAIS l'ensemble des domaines ;
+- l'ancien fold direct `SCONE-STATE-V2` survit comme
+  `state_root_v2()` : O(N), chemin d'archive/vérification
+  (re-pli complet depuis le stockage pour recouper un root
+  historique) — pas un artefact de consensus. Les deux engagent les
+  mêmes feuilles : états logiques égaux ⇒ roots égaux (les deux) ;
+- un checkpoint accepté avec le root SMT se re-vérifie après un
+  restore (reload) : le root est une fonction pure de l'état
+  restauré (backend + SMT + index).
+
+### File d'expiration (GC O(expirés), pas O(N))
+
+- `expirations: BTreeMap<u64, BTreeSet<DomainId>>` — instant
+  d'expiration → ids expirant alors (ids triés par slot : égalité
+  d'état et ordre de drain indépendants de l'ordre d'arrivée) ;
+- `gc_expired_journaled(now)` draine `range(..=now)` au lieu de
+  scanner l'état entier : coût O(expirés à cet instant) ;
+- borne RAM : une entrée par domaine VIVANT (expirations en attente
+  uniquement — un renouvellement re-keye le slot, le GC le draine),
+  jamais un nœud par domaine dans une structure de scan ;
+- maintenu par le journal d'undo (rollback bit-exact : le slot
+  restauré est remis).
+
+### Pool d'owners borné (clefs, pas domaines)
+
+- `owner_refcounts: HashMap<OwnerId, u64>` — un compteur par owner
+  DISTINCT vivant (domaines + TLDs), maintenu par le journal à
+  chaque register/transfer/revoke/assign/GC (acquire/release) ;
+- `eligible_validators(now)` lit cet index — O(owners), JAMAIS
+  d'itération des domaines. La vivacité temporelle est déjà
+  assurée : le GC déterministe (timestamp parent) a retiré tout
+  domaine expiré ET son refcount avant l'appel. Sortie triée
+  (déterministe) ;
+- borne RAM : O(owners distincts), indépendant du nombre de
+  domaines ;
+- `owner_pool_root` (fold V2 archive) plie ces owners triés — pas
+  de scan des domaines non plus.
+
+Budget RAM en régime permanent (backend disque/réseau) :
+O(owners distincts + expirations en attente + fenêtres de grâce en
+vol + journal d'undo) — tout borné indépendamment du nombre de
+domaines, tout restauré bit-exact par le journal.
+
 ## Différé au consensus
 
 Volontairement non définis dans cette crate :
