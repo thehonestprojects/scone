@@ -259,6 +259,17 @@ impl Relay {
                 }
                 Ok(())
             }
+            Transaction::TransferDomain(t) => {
+                let state = self
+                    .chain
+                    .state()
+                    .domain(&t.domain_id)
+                    .ok_or(BlockchainError::UnknownDomain)?;
+                if state.owner != t.owner {
+                    return Err(BlockchainError::NotOwner);
+                }
+                Ok(())
+            }
             // M9: slash evidence is self-contained — the cryptographic
             // proof was checked by `validate_transaction`; the pool
             // membership rule is enforced at application time.

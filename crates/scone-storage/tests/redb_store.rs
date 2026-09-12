@@ -110,6 +110,10 @@ fn build_block(
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
             }
+            Transaction::TransferDomain(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::TransferDomain(t)
+            }
             Transaction::Slash(mut x) => {
                 x.signature = sk.sign(&payload);
                 Transaction::Slash(x)
@@ -360,6 +364,10 @@ fn stored_domain_states_match_replayed_state() {
                 Transaction::RenewDomain(mut r) => {
                     r.signature = sk.sign(&payload);
                     Transaction::RenewDomain(r)
+                }
+                Transaction::TransferDomain(mut t) => {
+                    t.signature = sk.sign(&payload);
+                    Transaction::TransferDomain(t)
                 }
                 Transaction::Slash(mut x) => {
                     x.signature = sk.sign(&payload);

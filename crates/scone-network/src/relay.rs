@@ -306,7 +306,10 @@ impl Relay {
                         }
                     })
                 });
-                let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::Cache::new()));
+                let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::Cache::with_bounds(
+                    self.config.dns_cache_capacity,
+                    crate::dns::MAX_FALLBACK_TTL,
+                )));
                 let tcp_resolver = resolver.clone();
                 let tcp_upstreams = upstreams.clone();
                 let tcp_cache = cache.clone();

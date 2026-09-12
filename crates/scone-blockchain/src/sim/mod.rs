@@ -221,6 +221,15 @@ impl Rejections {
 
     /// Occurrences of `kind`.
     #[must_use]
+    /// Toutes les catégories non nulles (diagnostic).
+    pub fn nonzero(&self) -> Vec<(&'static str, usize)> {
+        self.counts
+            .iter()
+            .filter(|(_, v)| **v > 0)
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
     pub fn get(&self, kind: &str) -> usize {
         self.counts.get(kind).copied().unwrap_or(0)
     }
@@ -1786,6 +1795,10 @@ fn sign_tx(unsigned: Transaction, sk: &SigningKey) -> Transaction {
             r.signature = sig;
             Transaction::RenewDomain(r)
         }
+        Transaction::TransferDomain(mut t) => {
+            t.signature = sig;
+            Transaction::TransferDomain(t)
+        }
         Transaction::Slash(mut s) => {
             s.signature = sig;
             Transaction::Slash(s)
@@ -1878,3 +1891,6 @@ pub fn sim_update_domain(id: DomainId, seed: u8, sequence: u64, record: u8) -> T
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scale_tests;

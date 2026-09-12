@@ -17,6 +17,7 @@ pub(crate) fn run_relay(
     rpc: Option<String>,
     dns: Option<String>,
     dns_upstream: Vec<String>,
+    dns_cache_limit: Option<usize>,
     anchor_key: Option<PathBuf>,
     anchor_passphrase_env: String,
 ) -> Result<Vec<String>, CliError> {
@@ -53,6 +54,9 @@ pub(crate) fn run_relay(
         );
     }
     config.dns_upstreams = dns_upstream;
+    if let Some(limit) = dns_cache_limit {
+        config.dns_cache_capacity = limit.max(1);
+    }
     // M5: anchor identity — checkpoint participation + block
     // production authority.
     config.anchor_key = anchor_key;

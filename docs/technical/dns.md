@@ -55,7 +55,8 @@ Client de validation : `scone dig <name> --dns 127.0.0.1:5353
 
 ## Chemin de résolution (AUTORITÉ = la chaîne, toujours)
 
-1. **Cache** : clé `(qname, qtype)`, capacité 1024 entrées, TTL 60 s
+1. **Cache** : clé `(qname, qtype)`, capacité 100 000 entrées par
+   défaut (`--dns-cache-limit` pour outrepasser), TTL 60 s
    (autoritaire) / clampé à 600 s (fallback). Le cache négatif
    (NXDOMAIN/NODATA) suit les mêmes règles ; chaque entrée porte son
    origine (autoritaire ou fallback) pour que le bit AA reste honnête

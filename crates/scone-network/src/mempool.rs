@@ -35,6 +35,7 @@ pub fn domain_key(tx: &scone_core::Transaction) -> Option<[u8; 32]> {
         Transaction::UpdateDomain(u) => Some(*u.domain_id.as_bytes()),
         Transaction::AssignDomain(a) => Some(*a.domain_id.as_bytes()),
         Transaction::RenewDomain(r) => Some(*r.domain_id.as_bytes()),
+        Transaction::TransferDomain(t) => Some(*t.domain_id.as_bytes()),
         Transaction::RegisterTld(t) => Some(*t.tld_id.as_bytes()),
         Transaction::TransferTld(t) => Some(*t.tld_id.as_bytes()),
         Transaction::RevokeTld(r) => Some(*r.tld_id.as_bytes()),

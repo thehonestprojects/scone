@@ -285,6 +285,12 @@ enum UndoEntry {
         domain: DomainId,
         prior: DomainState,
     },
+    /// A `TransferDomain` changed the owner: rolling back restores
+    /// `prior` (including the owner pool seats, M8c).
+    TransferDomain {
+        domain: DomainId,
+        prior: DomainState,
+    },
     /// A domain expired and was garbage-collected: rolling back
     /// restores it and drops the grace entry the GC created (M8b).
     ExpireDomain {
@@ -926,6 +932,26 @@ impl ChainState {
                 self.smt_put_domain(&domain, Some(&prior), &next);
                 self.put_domain_entry(&domain, &next);
             }
+            Transaction::TransferDomain(transfer) => {
+                let Some(state) = self.domain(&transfer.domain_id) else {
+                    return Err(BlockchainError::UnknownDomain);
+                };
+                if state.owner != transfer.owner {
+                    return Err(BlockchainError::NotOwner);
+                }
+                let (domain, prior) = (transfer.domain_id, state);
+                let mut next = prior;
+                next.owner = transfer.new_owner;
+                journal
+                    .entries
+                    .push(UndoEntry::TransferDomain { domain, prior });
+                self.smt_put_domain(&domain, Some(&prior), &next);
+                self.put_domain_entry(&domain, &next);
+                // Bounded owner pool: the seat follows the domain (M8c,
+                // symmetric of TransferTld).
+                self.owner_release(prior.owner);
+                self.owner_acquire(next.owner);
+            }
             Transaction::Slash(slash) => {
                 // M9 — equivocation evidence. The cryptographic proof
                 // was already re-verified by `tx.validate()` above
@@ -1116,6 +1142,14 @@ impl ChainState {
                     self.expiration_enqueue(prior.valid_until, domain);
                     self.put_domain_entry(&domain, &prior);
                 }
+                UndoEntry::TransferDomain { domain, prior } => {
+                    if let Some(current) = self.domain(&domain) {
+                        self.smt_put_domain(&domain, Some(&current), &prior);
+                        self.owner_release(current.owner);
+                    }
+                    self.owner_acquire(prior.owner);
+                    self.put_domain_entry(&domain, &prior);
+                }
                 UndoEntry::ExpireDomain { domain, prior } => {
                     self.grace.remove(&domain);
                     self.smt_put_domain(&domain, None, &prior);
@@ -1140,7 +1174,7 @@ mod tests {
     use super::*;
     use scone_core::{
         AssignDomain, DomainName, Proof, RegisterDomain, RegisterTld, RenewDomain, RevokeTld,
-        SetTldOpen, TldName, TransferTld, UpdateDomain,
+        SetTldOpen, TldName, TransferDomain, TransferTld, UpdateDomain,
     };
     use scone_crypto::{Signature, SigningKey};
 
@@ -1591,6 +1625,98 @@ mod tests {
             Signature::from_bytes([0; 64]),
         ));
         assert_eq!(state.apply(&ghost), Err(BlockchainError::UnknownTld));
+    }
+
+    // --- TransferDomain (M8c) ---
+
+    #[test]
+    fn transfer_domain_moves_ownership() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&set_open("uip", 1, true)).unwrap();
+        state.apply(&register("example.uip", 1)).unwrap();
+        let tx = Transaction::TransferDomain(TransferDomain::transfer_domain_signed(
+            domain_id("example.uip"),
+            owner(2),
+            key(1).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&tx).unwrap();
+        assert_eq!(
+            state.domain(&domain_id("example.uip")).unwrap().owner,
+            owner(2)
+        );
+        // The old owner cannot update the domain anymore.
+        let upd = Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
+            domain_id("example.uip"),
+            1,
+            RecordHash::from_bytes([0; 32]),
+            key(1).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        assert_eq!(state.apply(&upd), Err(BlockchainError::NotOwner));
+        // The new owner can (sequence 1 = first update).
+        let upd2 = Transaction::UpdateDomain(UpdateDomain::update_domain_signed(
+            domain_id("example.uip"),
+            1,
+            RecordHash::from_bytes([0; 32]),
+            key(2).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        state.apply(&upd2).unwrap();
+    }
+
+    #[test]
+    fn transfer_domain_by_non_owner_and_unknown_are_rejected() {
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&set_open("uip", 1, true)).unwrap();
+        state.apply(&register("example.uip", 1)).unwrap();
+        let stranger = Transaction::TransferDomain(TransferDomain::transfer_domain_signed(
+            domain_id("example.uip"),
+            owner(2),
+            key(9).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        assert_eq!(state.apply(&stranger), Err(BlockchainError::NotOwner));
+        let ghost = Transaction::TransferDomain(TransferDomain::transfer_domain_signed(
+            domain_id("ghost.uip"),
+            owner(2),
+            key(1).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        assert_eq!(state.apply(&ghost), Err(BlockchainError::UnknownDomain));
+    }
+
+    #[test]
+    fn transfer_domain_undo_restores_owner_and_pool() {
+        use crate::state::UndoEntry;
+        let mut state = ChainState::new();
+        state.apply(&register_tld("uip", 1)).unwrap();
+        state.apply(&set_open("uip", 1, true)).unwrap();
+        state.apply(&register("example.uip", 1)).unwrap();
+        let tx = Transaction::TransferDomain(TransferDomain::transfer_domain_signed(
+            domain_id("example.uip"),
+            owner(2),
+            key(1).public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        // Capture the journal by applying through the journaled path.
+        let mut journal = UndoLog::default();
+        state.apply_journaled_at(&tx, 1, &mut journal).unwrap();
+        assert_eq!(
+            state.domain(&domain_id("example.uip")).unwrap().owner,
+            owner(2)
+        );
+        assert!(matches!(
+            journal.entries.last(),
+            Some(UndoEntry::TransferDomain { .. })
+        ));
+        state.rollback(journal);
+        assert_eq!(
+            state.domain(&domain_id("example.uip")).unwrap().owner,
+            owner(1)
+        );
     }
 
     // --- RevokeTld (M8b) ---

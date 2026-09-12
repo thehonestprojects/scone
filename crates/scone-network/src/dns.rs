@@ -98,8 +98,9 @@ pub const UDP_PAYLOAD_LIMIT: usize = 512;
 pub const ANSWER_TTL: u32 = 60;
 /// Maximum TTL accepted on a cached fallback answer.
 pub const MAX_FALLBACK_TTL: u32 = 600;
-/// Maximum names cached (positive and negative).
-pub const CACHE_CAPACITY: usize = 1024;
+/// Maximum names cached (positive and negative). Default for the
+/// relay DNS surface; overridable via `--dns-cache-limit`.
+pub const CACHE_CAPACITY: usize = 100_000;
 /// Maximum simultaneously in-flight UDP queries (anti-flood bound).
 pub const MAX_INFLIGHT_UDP: usize = 256;
 /// Per-upstream forward timeout.

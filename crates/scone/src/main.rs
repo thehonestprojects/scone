@@ -87,6 +87,7 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
             rpc,
             dns,
             dns_upstream,
+            dns_cache_limit,
             anchor_key,
             anchor_passphrase_env,
         } => run_relay(
@@ -97,6 +98,7 @@ fn run(cli: Cli) -> Result<Vec<String>, CliError> {
             rpc,
             dns,
             dns_upstream,
+            dns_cache_limit,
             anchor_key,
             anchor_passphrase_env,
         ),

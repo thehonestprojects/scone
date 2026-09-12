@@ -73,6 +73,9 @@ pub(crate) enum Command {
         /// charset are forwarded there, otherwise REFUSED.
         #[arg(long = "dns-upstream")]
         dns_upstream: Vec<String>,
+        /// Maximum entries in the DNS cache (default 100000).
+        #[arg(long = "dns-cache-limit")]
+        dns_cache_limit: Option<usize>,
         /// Anchor keyfile (`.sconekey`) — when set, this relay
         /// participates in the checkpoint loop (proposes, signs,
         /// aggregates) and produces blocks with the anchor identity

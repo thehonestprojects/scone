@@ -10,6 +10,7 @@
 //!   0xB8 SetTldOpen       (M8a)
 //!   0xD4 AssignDomain     (M8a)
 //!   0x3C RenewDomain      (M8a)
+//!   0xE2 TransferDomain   (M8c)
 //!   0x15 Slash            (M9 — checkpoint equivocation evidence)
 //! ```
 //!
@@ -28,8 +29,8 @@
 
 use scone_core::{
     AssignDomain, CheckpointData, DomainId, DomainName, OwnerId, Proof, RecordHash, RegisterDomain,
-    RegisterTld, RenewDomain, RevokeTld, SetTldOpen, SlashTx, Transaction, TransferTld,
-    UpdateDomain,
+    RegisterTld, RenewDomain, RevokeTld, SetTldOpen, SlashTx, Transaction, TransferDomain,
+    TransferTld, UpdateDomain,
 };
 use scone_crypto::{PublicKey, Signature};
 
@@ -62,6 +63,8 @@ pub mod tx_type {
     pub const ASSIGN_DOMAIN: u8 = 0xD4;
     /// Extends a domain registration (M8a).
     pub const RENEW_DOMAIN: u8 = 0x3C;
+    /// Transfers a domain to a new owner (M8c).
+    pub const TRANSFER_DOMAIN: u8 = 0xE2;
     /// Equivocation evidence against a checkpoint anchor (M9).
     pub const SLASH: u8 = 0x15;
 }
@@ -291,6 +294,36 @@ impl Decode for TransferTld {
     }
 }
 
+// TransferDomain (M8c) = domain_id[32] || owner[32] || new_owner[32]
+//        || public_key[32] || signature[64]
+
+impl Encode for TransferDomain {
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate().map_err(ProtocolError::Validation)?;
+        self.network.encode(out)?;
+        self.domain_id.encode(out)?;
+        self.owner.encode(out)?;
+        self.new_owner.encode(out)?;
+        self.public_key.encode(out)?;
+        self.signature.encode(out)
+    }
+}
+
+impl Decode for TransferDomain {
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let transfer = Self {
+            network: scone_core::NetworkId::decode(input)?,
+            domain_id: DomainId::decode(input)?,
+            owner: OwnerId::decode(input)?,
+            new_owner: OwnerId::decode(input)?,
+            public_key: PublicKey::decode(input)?,
+            signature: Signature::decode(input)?,
+        };
+        transfer.validate().map_err(ProtocolError::Validation)?;
+        Ok(transfer)
+    }
+}
+
 // RevokeTld (M8a) = tld_id[32] || owner[32] || public_key[32]
 //        || signature[64]
 
@@ -499,6 +532,11 @@ impl Encode for Transaction {
                 out.push(TX_FORMAT_VERSION);
                 tx.encode(out)
             }
+            Self::TransferDomain(tx) => {
+                out.push(tx_type::TRANSFER_DOMAIN);
+                out.push(TX_FORMAT_VERSION);
+                tx.encode(out)
+            }
             Self::Slash(tx) => {
                 out.push(tx_type::SLASH);
                 out.push(TX_FORMAT_VERSION);
@@ -524,6 +562,7 @@ impl Decode for Transaction {
             tx_type::SET_TLD_OPEN => Self::SetTldOpen(SetTldOpen::decode(input)?),
             tx_type::ASSIGN_DOMAIN => Self::AssignDomain(AssignDomain::decode(input)?),
             tx_type::RENEW_DOMAIN => Self::RenewDomain(RenewDomain::decode(input)?),
+            tx_type::TRANSFER_DOMAIN => Self::TransferDomain(TransferDomain::decode(input)?),
             tx_type::SLASH => Self::Slash(SlashTx::decode(input)?),
             value => {
                 return Err(ProtocolError::UnknownDiscriminant {
@@ -641,6 +680,19 @@ pub enum UnsignedTransaction {
         /// Signer public key.
         public_key: PublicKey,
     },
+    /// See [`scone_core::TransferDomain`] (M8c).
+    TransferDomain {
+        /// Network this transaction is built for (M8b).
+        network: scone_core::NetworkId,
+        /// Target domain.
+        domain_id: DomainId,
+        /// Derived owner identity.
+        owner: OwnerId,
+        /// Recipient identity.
+        new_owner: OwnerId,
+        /// Signer public key.
+        public_key: PublicKey,
+    },
     /// See [`scone_core::RenewDomain`] (M8a).
     RenewDomain {
         /// Network this transaction is built for (M8b).
@@ -736,6 +788,13 @@ impl From<&Transaction> for UnsignedTransaction {
                 domain_id: tx.domain_id,
                 owner: tx.owner,
                 valid_until: tx.valid_until,
+                public_key: tx.public_key,
+            },
+            Transaction::TransferDomain(tx) => Self::TransferDomain {
+                network: tx.network,
+                domain_id: tx.domain_id,
+                owner: tx.owner,
+                new_owner: tx.new_owner,
                 public_key: tx.public_key,
             },
             Transaction::Slash(tx) => Self::Slash {
@@ -884,6 +943,21 @@ impl Encode for UnsignedTransaction {
                 varint::put_u64(*valid_until, out);
                 public_key.encode(out)
             }
+            Self::TransferDomain {
+                network,
+                domain_id,
+                owner,
+                new_owner,
+                public_key,
+            } => {
+                out.push(tx_type::TRANSFER_DOMAIN);
+                out.push(TX_FORMAT_VERSION);
+                network.encode(out)?;
+                domain_id.encode(out)?;
+                owner.encode(out)?;
+                new_owner.encode(out)?;
+                public_key.encode(out)
+            }
             Self::Slash {
                 network,
                 offender,
@@ -974,6 +1048,13 @@ impl Decode for UnsignedTransaction {
                 domain_id: DomainId::decode(input)?,
                 owner: OwnerId::decode(input)?,
                 valid_until: u64::decode(input)?,
+                public_key: PublicKey::decode(input)?,
+            },
+            tx_type::TRANSFER_DOMAIN => Self::TransferDomain {
+                network: scone_core::NetworkId::decode(input)?,
+                domain_id: DomainId::decode(input)?,
+                owner: OwnerId::decode(input)?,
+                new_owner: OwnerId::decode(input)?,
                 public_key: PublicKey::decode(input)?,
             },
             tx_type::SLASH => Self::Slash {
@@ -1117,6 +1198,37 @@ mod tests {
             sk.public_key(),
             sk.sign(&payload),
         )
+    }
+
+    fn signed_transfer_domain() -> TransferDomain {
+        let sk = key(7);
+        let unsigned = Transaction::TransferDomain(TransferDomain::transfer_domain_signed(
+            domain_id(),
+            OwnerId::from_bytes([0xee; 32]),
+            sk.public_key(),
+            Signature::from_bytes([0; 64]),
+        ));
+        let payload = signing_payload(&unsigned).unwrap();
+        TransferDomain::transfer_domain_signed(
+            domain_id(),
+            OwnerId::from_bytes([0xee; 32]),
+            sk.public_key(),
+            sk.sign(&payload),
+        )
+    }
+
+    #[test]
+    fn transfer_domain_wire_roundtrip_and_signature_stability() {
+        let tx = Transaction::TransferDomain(signed_transfer_domain());
+        let bytes = encode_to_vec(&tx).unwrap();
+        let decoded = decode_complete::<Transaction>(&bytes).unwrap();
+        assert_eq!(decoded, tx);
+        // The discriminant is the documented one (normative table).
+        assert_eq!(bytes[0], tx_type::TRANSFER_DOMAIN);
+        // The signature verifies over the canonical payload.
+        let sk = key(7);
+        let payload = signing_payload(&tx).unwrap();
+        assert!(sk.public_key().verify(&payload, &tx.signature().clone()));
     }
 
     fn signed_revoke_tld() -> RevokeTld {

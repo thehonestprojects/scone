@@ -39,5 +39,5 @@ pub use pow::{CheckedPow, check, encode_proof, leading_zero_bits, mine, verify};
 pub use record::{DnsRecord, RecordData, Signature, SignedDnsRecord};
 pub use transaction::{
     AssignDomain, Proof, RecordHash, RegisterDomain, RegisterTld, RenewDomain, RevokeTld,
-    SetTldOpen, SlashTx, Transaction, TransferTld, UpdateDomain,
+    SetTldOpen, SlashTx, Transaction, TransferDomain, TransferTld, UpdateDomain,
 };

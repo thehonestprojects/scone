@@ -62,6 +62,10 @@ pub struct Config {
     /// Optional recursive DNS fallback upstreams (`addr:port`).
     /// Empty = Scone-unknown names get REFUSED.
     pub dns_upstreams: Vec<String>,
+    /// Maximum entries in the DNS cache (positive + negative).
+    /// Defaults to [`crate::dns::CACHE_CAPACITY`] (100 000);
+    /// `--dns-cache-limit` overrides.
+    pub dns_cache_capacity: usize,
     /// Optional anchor keyfile (`.sconekey`, opened via
     /// `scone-keystore`): when set AND this node is in the current
     /// committee, the relay signs and gossips checkpoint proposals
@@ -87,6 +91,7 @@ impl Config {
             rpc_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             dns_addr: None,
             dns_upstreams: Vec::new(),
+            dns_cache_capacity: crate::dns::CACHE_CAPACITY,
             anchor_key: None,
             anchor_passphrase_env: DEFAULT_ANCHOR_PASSPHRASE_ENV.to_string(),
         }

@@ -76,6 +76,7 @@ pub(crate) fn run_tx(command: TxCommand) -> Result<Vec<String>, CliError> {
                 scone_core::Transaction::SetTldOpen(_) => "set-tld-open",
                 scone_core::Transaction::AssignDomain(_) => "assign-domain",
                 scone_core::Transaction::RenewDomain(_) => "renew-domain",
+                scone_core::Transaction::TransferDomain(_) => "transfer-domain",
             };
             Ok(vec![
                 format!("kind: {kind}"),
@@ -226,6 +227,21 @@ fn unsigned_into_transaction(
             public_key,
             scone_crypto::Signature::from_bytes([0; 64]),
         )),
+        U::TransferDomain {
+            network,
+            domain_id,
+            owner: _,
+            new_owner,
+            public_key,
+        } => {
+            scone_core::Transaction::TransferDomain(scone_core::TransferDomain::transfer_domain_on(
+                network,
+                domain_id,
+                new_owner,
+                public_key,
+                scone_crypto::Signature::from_bytes([0; 64]),
+            ))
+        }
         U::Slash {
             network,
             offender,
@@ -475,6 +491,14 @@ fn rebind(tx: &scone_core::Transaction, sk: &SigningKey) -> scone_core::Transact
                 Signature::from_bytes([0; 64]),
             ))
         }
+        scone_core::Transaction::TransferDomain(t) => scone_core::Transaction::TransferDomain(
+            scone_core::TransferDomain::transfer_domain_signed(
+                t.domain_id,
+                t.new_owner,
+                sk.public_key(),
+                Signature::from_bytes([0; 64]),
+            ),
+        ),
         scone_core::Transaction::RenewDomain(r) => {
             scone_core::Transaction::RenewDomain(RenewDomain::renew_domain_signed(
                 r.domain_id,
@@ -535,6 +559,10 @@ fn attach_signature(
         scone_core::Transaction::RenewDomain(mut r) => {
             r.signature = signature;
             scone_core::Transaction::RenewDomain(r)
+        }
+        scone_core::Transaction::TransferDomain(mut t) => {
+            t.signature = signature;
+            scone_core::Transaction::TransferDomain(t)
         }
         scone_core::Transaction::Slash(mut x) => {
             x.signature = signature;

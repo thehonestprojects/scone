@@ -468,6 +468,83 @@ impl TransferTld {
     }
 }
 
+/// Transfers ownership of a registered domain to a new owner
+/// (M8c, symmetric of [`TransferTld`]).
+///
+/// Signed by the current owner. The recipient is any `OwnerId` (an
+/// Ed25519-derived identity): the state layer binds it to the keys
+/// that can spend it. Carries no timestamp: a transfer is one-shot
+/// against the current state (domain exists, not expired, signer is
+/// the owner — enforced at application time).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TransferDomain {
+    /// Network this transaction is built for (M8b, signed field).
+    pub network: NetworkId,
+    /// The domain being transferred.
+    pub domain_id: DomainId,
+    /// Current owner (recomputed from `public_key`, never trusted).
+    pub owner: OwnerId,
+    /// The recipient identity.
+    pub new_owner: OwnerId,
+    /// Ed25519 public key of the signer (32 bytes).
+    pub public_key: PublicKey,
+    /// Ed25519 signature (64 bytes) over the canonical signing payload.
+    pub signature: Signature,
+}
+
+impl TransferDomain {
+    /// Builds a signed-shaped `TransferDomain` for the **testnet**,
+    /// recomputing `owner` from `public_key`.
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn transfer_domain_signed(
+        domain_id: DomainId,
+        new_owner: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self::transfer_domain_on(
+            TESTNET.network_id,
+            domain_id,
+            new_owner,
+            public_key,
+            signature,
+        )
+    }
+
+    /// Builds a signed-shaped `TransferDomain` for `network` (M8b).
+    ///
+    /// See [`RegisterDomain::register_domain_signed`] for the signature contract.
+    #[must_use]
+    pub fn transfer_domain_on(
+        network: NetworkId,
+        domain_id: DomainId,
+        new_owner: OwnerId,
+        public_key: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        Self {
+            network,
+            domain_id,
+            owner: owner_of(&public_key),
+            new_owner,
+            public_key,
+            signature,
+        }
+    }
+
+    /// Checks protocol invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SconeError::InvalidOwner`] when `owner` is not the
+    /// identity derived from `public_key`.
+    pub fn validate(&self) -> Result<()> {
+        check_owner_binding(&self.owner, &self.public_key)
+    }
+}
+
 /// Relinquishes a registered TLD (M8a): the namespace becomes free
 /// again and can be re-claimed with a fresh [`RegisterTld`].
 ///
@@ -920,6 +997,8 @@ pub enum Transaction {
     AssignDomain(AssignDomain),
     /// See [`RenewDomain`] (domain registry, M8a).
     RenewDomain(RenewDomain),
+    /// See [`TransferDomain`] (domain registry, M8c).
+    TransferDomain(TransferDomain),
     /// See [`SlashTx`] (checkpoint equivocation proof, M9).
     Slash(SlashTx),
 }
@@ -937,6 +1016,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.network,
             Self::AssignDomain(tx) => tx.network,
             Self::RenewDomain(tx) => tx.network,
+            Self::TransferDomain(tx) => tx.network,
             Self::Slash(tx) => tx.network,
         }
     }
@@ -953,6 +1033,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.owner,
             Self::AssignDomain(tx) => tx.owner,
             Self::RenewDomain(tx) => tx.owner,
+            Self::TransferDomain(tx) => tx.owner,
             // M9: the reporter is NOT the (only) owner of the tx — the
             // accused is. Expose the reporter's identity: it is the
             // derivation of the embedded key, like every owner.
@@ -971,6 +1052,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => &tx.public_key,
             Self::AssignDomain(tx) => &tx.public_key,
             Self::RenewDomain(tx) => &tx.public_key,
+            Self::TransferDomain(tx) => &tx.public_key,
             Self::Slash(tx) => &tx.public_key,
         }
     }
@@ -986,6 +1068,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => &tx.signature,
             Self::AssignDomain(tx) => &tx.signature,
             Self::RenewDomain(tx) => &tx.signature,
+            Self::TransferDomain(tx) => &tx.signature,
             Self::Slash(tx) => &tx.signature,
         }
     }
@@ -1015,6 +1098,7 @@ impl Transaction {
             Self::SetTldOpen(tx) => tx.validate(),
             Self::AssignDomain(tx) => tx.validate(),
             Self::RenewDomain(tx) => tx.validate(),
+            Self::TransferDomain(tx) => tx.validate(),
             Self::Slash(tx) => tx.validate(),
         }
     }

@@ -65,6 +65,10 @@ fn sign(unsigned: Transaction, sk: &SigningKey) -> Transaction {
             r.signature = sk.sign(&payload);
             Transaction::RenewDomain(r)
         }
+        Transaction::TransferDomain(mut t) => {
+            t.signature = sk.sign(&payload);
+            Transaction::TransferDomain(t)
+        }
         Transaction::Slash(mut x) => {
             x.signature = sk.sign(&payload);
             Transaction::Slash(x)

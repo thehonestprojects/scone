@@ -82,6 +82,7 @@ pub fn touched_domains(block: &Block) -> Vec<&DomainId> {
             Transaction::UpdateDomain(u) => seen.insert(u.domain_id).then_some(&u.domain_id),
             Transaction::AssignDomain(a) => seen.insert(a.domain_id).then_some(&a.domain_id),
             Transaction::RenewDomain(r) => seen.insert(r.domain_id).then_some(&r.domain_id),
+            Transaction::TransferDomain(t) => seen.insert(t.domain_id).then_some(&t.domain_id),
             Transaction::RegisterTld(_)
             | Transaction::TransferTld(_)
             | Transaction::RevokeTld(_)
@@ -655,6 +656,10 @@ mod tests {
             Transaction::RenewDomain(mut r) => {
                 r.signature = sk.sign(&payload);
                 Transaction::RenewDomain(r)
+            }
+            Transaction::TransferDomain(mut t) => {
+                t.signature = sk.sign(&payload);
+                Transaction::TransferDomain(t)
             }
             Transaction::Slash(mut x) => {
                 x.signature = sk.sign(&payload);
