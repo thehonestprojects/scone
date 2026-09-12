@@ -72,6 +72,12 @@ Règles :
 | `snapshot_v3_domains` (M6b) | `DomainId` (32 o, ordre octet) | `DomainStateBytes` (même format que `domains`) |
 | `snapshot_v3_tlds` (M6b) | `TldId` (32 o, ordre octet) | `TldStateBytes` (même format que `tlds`) |
 
+Clé de `meta` supplémentaire (P0.3/P0.4) :
+
+| Clé | Valeur |
+|---|---|
+| `verified_snapshot_v1` (P0.3) | `height(8 BE) ‖ tip_hash(32) ‖ manifest_hash(32)` = 72 o — marqueur d'un snapshot importé VÉRIFIÉ (réservée, comme `tip`) |
+
 Clés de `meta` :
 
 | Clé | Valeur |
@@ -439,6 +445,153 @@ la fenêtre concernée). L'index anti-replay TXID suit le même contrat
 L'égalité bit à bit avec `load_chain_replay` est vérifiée par test
 sur l'état canonique (state_root V2 + SMT).
 
+## Snapshot d'état VÉRIFIÉ — chunks + manifest + vérification crypto (P0.3)
+
+Le snapshot M6b ci-dessus accélère le boot d'un nœud qui fait
+confiance à son disque. P0.3 répond à un autre besoin : transporter
+un état entre nœuds (bootstrap d'un nouveau nœud, réparation) sans
+faire confiance au transport. Le format et la vérification vivent
+dans `crates/scone-storage/src/verified_snapshot.rs` + la
+reconstruction de racine dans
+`crates/scone-blockchain/src/snapshot_verify.rs`.
+
+### Modèle de confiance
+
+Le snapshot porte l'état d'un bloc **finalisé** — un checkpoint
+signé par le quorum du comité (`CheckpointData.state_root`, la
+racine `state_root_smt` O(1)). L'authenticité du checkpoint
+(quorum de signatures Ed25519) est validée par la couche chaîne
+AVANT l'import. L'import lui-même vérifie l'adhérence
+snapshot ↔ checkpoint par RECALCUL :
+
+1. **hash de chaque page** : `blake3("SCONE-SNAP-PAGE-HASH" ‖
+   encodage intégral de la page)` doit égaler le hash annoncé par le
+   manifest (un octet falsifié → rejet) ;
+2. **somme des entrées == compteurs** du manifest (une page
+   manquante ou un compteur faux → rejet) ;
+3. **racine SMT recalculée depuis les entrées importées ==
+   `checkpoint.data.state_root`** — LA vérification
+   cryptographique : l'état entier (domaines + TLDs) est re-plié
+   dans un SMT neuf (`snapshot_verify::recompute_state_root`,
+   feuilles `SCONE-LEAF-DOM-V2`/`SCONE-LEAF-TLD-V2` exactement
+   comme le chemin vivant) et la racine doit égaler celle que le
+   comité a signée. Un snapshot falsifié, tronqué ou incomplet est
+   rejeté AVANT TOUTE ÉCRITURE ;
+4. **cohérences structurelles** : `height`/`tip_hash`/`state_root`
+   du manifest == ceux du checkpoint ; ids strictement croissants
+   (pas de doublons) ; index de pages séquentiels ; bornes DoS
+   (≤ 10 000 entrées/page, ≤ 2^20 pages, budget total).
+
+Échec de vérification → `StorageError::SnapshotRejected`, le store
+reste strictement inchangé (tout est vérifié avant la transaction
+d'écriture).
+
+### Format sérialisé (strict, big-endian, décodage sans pitié)
+
+```text
+manifest = "SCONE-SNAP-MAN-V1"
+        ‖ height(8) ‖ tip_hash(32) ‖ state_root(32)
+        ‖ page_count(4) ‖ domain_count(8) ‖ tld_count(8)
+        ‖ page_hashes(page_count × 32)
+
+page    = "SCONE-SNAP-PAGE-V1"
+        ‖ index(4) ‖ height(8) ‖ state_root(32)      ← chaque page est
+        ‖ entry_count(4) ‖ entries                     auto-identifiante
+
+entry   = kind(0x01 domaine | 0x02 TLD) ‖ id(32) ‖ len(2) ‖ état
+          (état = DomainStateBytes 57/89 o ou TldStateBytes 34 o —
+           les formats de stockage canoniques existants, réutilisés)
+```
+
+Ordre des pages : toutes les entrées domaine (ids croissants),
+puis toutes les entrées TLD (ids croissants) — l'ordre de la
+pagination curseur du store. Chaque page porte `(index, hauteur,
+state_root du checkpoint, entrées)` : une page seule sait à quel
+snapshot elle appartient. Pages de 256 entrées à l'export
+(`VERIFIED_SNAPSHOT_PAGE_ENTRIES`) ; bornes DoS à l'import.
+
+### Export (`export_verified_snapshot(store, checkpoint)`)
+
+Sérialise l'état du DERNIER CHECKPOINT FINALISÉ — pas la pointe.
+Prérequis : le store détient un snapshot M6b persisté
+(`snapshot_v3_*`) exactement à la hauteur du checkpoint (la fenêtre
+`CHECKPOINT_KEEP`/`SNAPSHOT_INTERVAL` garantit qu'un tel état est
+disponible régulièrement) ; l'ancre du bloc est RECALCULÉE depuis
+les octets stockés et doit égaler `checkpoint.data.block_hash`.
+Sinon → `StorageError::SnapshotUnavailable` (l'export est une
+action explicite : attendre le prochain intervalle/checkpoint).
+
+### Import (`import_verified_snapshot(store, checkpoint, manifest, pages)`)
+
+Vérifie tout (voir ci-dessus), puis écrit dans UNE transaction
+redb : tables vivantes `domains`/`tlds` + compteurs + `tip = (H,
+hash du checkpoint)`, tables gelées `snapshot_v3_*` ancrées au même
+bloc, et marqueur réservé `meta["verified_snapshot_v1"]`
+(`height ‖ tip_hash ‖ manifest_hash`). Cible : store vide
+uniquement (sinon `SnapshotUnavailable`).
+
+### Coût de la vérification (documenté)
+
+Reconstruction du SMT par insertions ordonnées : N entrées × O(40)
+hachages ≈ O(N·40). ~2,1 M hachages blake3 pour 100 000 domaines
+(dizaines de ms). PONCTUEL — un import de bootstrap/réparation,
+jamais un chemin par bloc : acceptable. L'insertion ordonnée
+(ids croissants) crée chaque point de branchement une seule fois ;
+de toute façon la racine ne dépend que du contenu (garantie SMT,
+fuzz différentiel dans `smt.rs`).
+
+## Bootstrap d'état — sans rejeu genèse (P0.4)
+
+Un nouveau nœud rejoint le réseau sans rejouer l'historique depuis
+la genèse :
+
+```text
+finalized checkpoint (relay, validé par la couche chaîne)
+        │
+        ▼
+verified snapshot (manifest + pages, vérification crypto ci-dessus)
+        │  import → état à H + tip (H, hash) + marqueur
+        ▼
+bloc d'ancrage H (demandé au réseau PAR HASH — append_bootstrap_anchor)
+        │
+        ▼
+blocs récents H+1..H+k (relay, hauteur croissante, append atomique
+        │               ordinaire — l'API storage n'exige que ça)
+        ▼
+synced — boot rejoue SEULEMENT le suffixe au-dessus de H
+```
+
+- **API storage exposée au relay** : `append_bootstrap_anchor(H,
+  hash, bytes)` (pose le bloc d'ancrage : marqueur requis,
+  cohérence hauteur/hash avec le marqueur, idempotent) puis
+  l'append atomique ordinaire par hauteur croissante. La
+  récupération réseau (par hash depuis le manifest) est un concern
+  du relay, pas du store.
+- **`load_chain`** reconnaît le marqueur : l'historique sous H est
+  légitimement absent (nœud non-archive). Concrètement : le
+  rescan de la fenêtre anti-replay M8 est plancher à H (les blocs
+  sous H n'existent pas et ne manquent pas) ; un tip sans bloc
+  stocké APRÈS un import (ancre pas encore posée) → diagnostic
+  typé `SnapshotUnavailable` (« l'ancre doit venir du réseau »),
+  pas une corruption.
+- **Nœud archive vs full-state** : un nœud archive (drapeau
+  opérateur) continue de tout garder — il sert les blocs
+  historiques au réseau et démarre par les chemins existants. Un
+  nœud full-state (default P0.4 pour un nouveau nœud CONFIGURÉ
+  ainsi) démarre à H : il valide les blocs futurs (rejeu de
+  suffixe) mais ne peut servir l'historique sous H ni rejouer la
+  genèse. **Le comportement par défaut ne change PAS** : ce chemin
+  n'est actif que si l'opérateur déclenche explicitement
+  l'import (`import_verified_snapshot` est une action dédiée,
+  jamais automatique) ; tout nœud existant boote à l'identique.
+- **Égalité avec le nœud complet** : après jonction du suffixe
+  H+1..H+k, l'état, le tip et `state_root_smt` sont bit-exacts
+  avec un nœud complet au même tip (testé) ; l'index anti-replay
+  couvre exactement les txs à/au-dessus de H — un nœud non-archive
+  ne peut pas connaître la fenêtre sous H, les règles d'état
+  demeurent le garde-fou (une tx dupliquée sous H échoue sur
+  l'état, jamais acceptée deux fois).
+
 ## Politique mémoire
 
 - **Curseurs partout** : `iterate_domains` borne la page à `max`
@@ -470,9 +623,10 @@ faire allouer :
   démesuré ne matérialise jamais plus de 10 000 états en RAM ;
   `iterate_tlds` a la même borne (`MAX_TLD_PAGE`, M7d) ;
 - **Clés `meta` réservées** : `meta_set` rejette `tip`,
-  `tip_height`, `format_version`, `domain_count` et `tld_count`
-  avec `StorageError::ReservedKey` — écraser la comptabilité
-  interne du store reviendrait à le corrompre silencieusement.
+  `tip_height`, `format_version`, `domain_count`, `tld_count` et
+  `verified_snapshot_v1` (P0.3) avec `StorageError::ReservedKey` —
+  écraser la comptabilité interne du store reviendrait à le
+  corrompre silencieusement.
 
 ## Modèle de confiance
 
@@ -551,6 +705,21 @@ Chaque test utilise son tmpfile redb (`tempfile`). Couverture :
   supprime l'entrée (pas de fantômes), avant et après rebuild ;
   séparation stricte des espaces de noms domaine/TLD ; un append
   échoué ne laisse aucune entrée d'index ; la clé d'index est la
-  dérivation BLAKE3 documentée.
+  dérivation BLAKE3 documentée ;
+- P0.3/P0.4 (`tests/verified_snapshot.rs`) : export → import →
+  boot == rejeu complet (état, tip, `state_root_smt` bit-exact ;
+  l'état importé est celui du bloc finalisé, pas de la pointe) ;
+  page falsifiée d'un octet → rejet avant toute écriture (store
+  strictement inchangé) ; page manquante → rejet ; mauvais
+  `state_root` (manifest ↔ checkpoint, puis racine recalculée ≠
+  racine signée) → rejet ; compteurs faux / hauteurs / tip
+  incohérents / doublons d'ids → rejet ; import exige un store
+  vide ; export exige un snapshot persisté à la hauteur du
+  checkpoint ; contrat de l'ancre (`append_bootstrap_anchor` :
+  marqueur requis, cohérence, idempotence) ; format sérialisé
+  strict (octets en excès, tags, bornes DoS) ; snapshot à H puis
+  blocs H+1..H+k rejoint → chaîne identique au nœud complet
+  (état/tip/racine), boot sans historique sous H, index
+  anti-replay = txs à/au-dessus de H exactement.
 
 [`ChainState`]: ../../../crates/scone-blockchain/src/state.rs

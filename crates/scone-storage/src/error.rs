@@ -39,10 +39,22 @@ pub enum StorageError {
         /// Maximum allowed size.
         max: usize,
     },
-    /// A `meta` key reserved for the store's internal bookkeeping
-    /// (`tip`, `tip_height`, `format_version`, `domain_count`).
+    /// A `meta` key reserved for the store's internal
+    /// bookkeeping (`tip`, `tip_height`, `format_version`, `domain_count`).
     #[error("reserved meta key: {0}")]
     ReservedKey(String),
+    /// P0.3: a verified-snapshot export or import cannot run on this
+    /// store (no usable persisted snapshot at the checkpoint height,
+    /// or a non-empty import target).
+    #[error("snapshot unavailable: {0}")]
+    SnapshotUnavailable(String),
+    /// P0.3: a verified-snapshot import FAILED a verification (page
+    /// hash, entry counts, recomputed state root, manifest ↔
+    /// checkpoint coherence, canonical ordering). Nothing was
+    /// written — a falsified or incomplete snapshot is rejected
+    /// BEFORE any use.
+    #[error("snapshot rejected: {0}")]
+    SnapshotRejected(String),
     /// Stored bytes do not decode as the expected type.
     #[error("corrupted storage: {0}")]
     Corrupted(String),

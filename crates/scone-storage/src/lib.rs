@@ -30,6 +30,7 @@ pub mod error;
 pub mod integration;
 pub mod redb;
 pub mod state_bytes;
+pub mod verified_snapshot;
 
 pub use error::{Result, StorageError};
 pub use redb::{
@@ -37,6 +38,12 @@ pub use redb::{
     SNAPSHOT_INTERVAL, name_index_key,
 };
 pub use state_bytes::{DomainStateBytes, TldStateBytes};
+pub use verified_snapshot::{
+    MANIFEST_TAG, MAX_VERIFIED_SNAPSHOT_PAGE_ENTRIES, MAX_VERIFIED_SNAPSHOT_PAGES,
+    META_VERIFIED_SNAPSHOT, PAGE_TAG, SnapshotEntry, SnapshotPage, VERIFIED_SNAPSHOT_PAGE_ENTRIES,
+    VerifiedSnapshotManifest, VerifiedSnapshotMarker, export_verified_snapshot,
+    import_verified_snapshot,
+};
 
 use scone_core::{DomainId, TldId};
 

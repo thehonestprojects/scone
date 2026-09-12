@@ -118,6 +118,45 @@ Un nœud Scone combine :
 3. un stockage local (état, index, caches) ;
 4. un resolver / serveur DNS en façade.
 
+### Démarrage d'un nouveau nœud (bootstrap d'état, P0.3/P0.4)
+
+Un nouveau nœud ne rejoue PAS la genèse : il démarre d'un état
+finalisé vérifié.
+
+```text
+finalized checkpoint (comité, quorum de signatures — validé par
+        │              la couche chaîne avant tout usage)
+        ▼
+verified snapshot (manifest + pages paginées ; l'importateur
+        │              RECALCULE la racine SMT depuis les entrées
+        │              et la compare au state_root signé — un
+        │              snapshot falsifié/incomplet est rejeté
+        │              avant toute écriture)
+        ▼
+bloc d'ancrage H (demandé au réseau PAR HASH)
+        │
+        ▼
+blocs récents H+1..H+k (relay, hauteur croissante)
+        │
+        ▼
+synced — au boot, rejeu du SEUL suffixe au-dessus de H
+```
+
+Deux profils de nœuds :
+
+- **nœud archive** (drapeau opérateur) : garde tous les blocs
+  historiques, les sert au réseau, démarre par les chemins
+  existants ;
+- **nœud full-state** : détient l'état complet à H et le suffixe,
+  mais pas l'historique sous H — il valide les blocs futurs et
+  sert l'état, il ne sert pas l'historique.
+
+Ce chemin est OPT-IN : l'import d'un snapshot vérifié est une
+action explicite de l'opérateur (`import_verified_snapshot`),
+jamais automatique — le comportement par défaut d'un nœud existant
+ne change pas. Détails normatifs : `/docs/technical/storage.md`,
+sections « Snapshot d'état VÉRIFIÉ » et « Bootstrap d'état ».
+
 ## Flux de résolution DNS (futur, provisoire)
 
 ```text

@@ -33,6 +33,7 @@ use scone_protocol::{Block, BlockHash, decode_complete, encode_to_vec};
 
 use crate::NodeStore;
 use crate::error::{Result, StorageError};
+use crate::verified_snapshot::{META_VERIFIED_SNAPSHOT, VerifiedSnapshotMarker};
 use crate::{DomainStateBytes, TldStateBytes};
 
 /// Batch size of domain-state pagination.
@@ -261,9 +262,31 @@ pub fn load_chain(
         // when the store is empty (pass the network explicitly).
         return Ok(Blockchain::for_network(network));
     }
-    let tip_bytes = store.block_at_height(tip_height)?.ok_or_else(|| {
-        StorageError::Corrupted(format!("blocks_by_height[{tip_height}]: tip block missing"))
-    })?;
+    // P0.4: a verified imported snapshot, if present, marks a chain
+    // that STARTS at the snapshot height — the persisted history
+    // below it is legitimately absent (non-archive node).
+    let bootstrap_marker = read_verified_marker(store)?;
+    let tip_bytes = match store.block_at_height(tip_height)? {
+        Some(bytes) => bytes,
+        None => {
+            // Import done, anchor block not fetched yet: a clean,
+            // typed diagnostic (the relay knows what to do — ask the
+            // network for the anchor by hash).
+            if let Some(marker) = &bootstrap_marker
+                && marker.height == tip_height
+                && marker.tip_hash == tip_hash
+            {
+                return Err(StorageError::SnapshotUnavailable(
+                    "verified snapshot imported but its anchor block is not stored yet \
+                     (the relay must fetch it from the network)"
+                        .into(),
+                ));
+            }
+            return Err(StorageError::Corrupted(format!(
+                "blocks_by_height[{tip_height}]: tip block missing"
+            )));
+        }
+    };
     let tip_block: Block = decode_complete(&tip_bytes)
         .map_err(|e| StorageError::Corrupted(format!("tip block: {e}")))?;
     if tip_block.header.height != tip_height {
@@ -299,6 +322,15 @@ pub fn load_chain(
     Ok(chain)
 }
 
+/// Reads the P0.4 verified-snapshot marker through the `NodeStore`
+/// trait (strict decode; `None` for backends/stores without one).
+fn read_verified_marker(store: &impl NodeStore) -> Result<Option<VerifiedSnapshotMarker>> {
+    match store.meta_get(META_VERIFIED_SNAPSHOT)? {
+        None => Ok(None),
+        Some(bytes) => VerifiedSnapshotMarker::decode(&bytes).map(Some),
+    }
+}
+
 /// Rebuilds the anti-replay TXID index of a restored chain by
 /// re-scanning the persisted window tail (M8).
 ///
@@ -332,7 +364,16 @@ pub fn rebuild_replay_index_from_store(
     chain: &mut Blockchain,
     tip_height: u64,
 ) -> Result<()> {
-    let start = tip_height.saturating_sub(REPLAY_WINDOW_BLOCKS - 1).max(1);
+    // P0.4: a chain bootstrapped from a verified snapshot STARTS at
+    // the snapshot height — blocks below it are legitimately absent
+    // (non-archive node). The window scan is floored at that height
+    // instead of failing on the missing history.
+    let mut start = tip_height.saturating_sub(REPLAY_WINDOW_BLOCKS - 1).max(1);
+    if let Some(marker) = read_verified_marker(store)?
+        && marker.height > start
+    {
+        start = marker.height;
+    }
     let mut entries: Vec<(scone_blockchain::TxId, u64)> = Vec::new();
     for height in start..=tip_height {
         let Some(bytes) = store.block_at_height(height)? else {

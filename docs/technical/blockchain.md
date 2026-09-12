@@ -548,3 +548,92 @@ réseau (`RegisterTld` toujours, `RegisterDomain` sur TLD ouvert),
 expirations/renouvellement 1 an + grâce 30 j + horizon 3 ans, GC
 déterministe au timestamp du bloc parent, replay cross-réseau
 impossible (genesis + champ signé + digest PoW).
+
+## Simulation distribuée déterministe (P1.6)
+
+`crates/scone-blockchain/src/sim/` contient un harness de simulation
+réseau **déterministe** (`SimNet`) : N vraies `Blockchain` (aucun mock)
+pilotées par une **horloge virtuelle** et une **file d'événements**
+priorisée par `(tick, ordre d'insertion)`. Pas de sockets, pas d'async,
+pas d'horloge murale — chaque tirage (perte, latence, duplication) est
+une fonction pure de `(seed, numéro d'envoi)`, donc un scénario avec
+un seed fixe est reproductible octet par octet.
+
+### Modèle
+
+- **Transport** : chaque émission subit une perte probabiliste
+  (paramétrable en ‰), une latence artificielle bornée
+  (`latency_ticks`), une duplication éventuelle (une copie retardée)
+  et la carte de partitions courante (les messages inter-groupes sont
+  perdus). Les duplications n'avancent jamais l'horloge logique et ne
+  provoquent aucun envoi nouveau : le flux d'événements réels est
+  identique avec ou sans duplication (contrat de déterminisme, prouvé
+  par le test `duplicate_and_delay`).
+- **Gossip épidémique** : un nœud re-transmet à ses pairs connectés
+  (même partition) un bloc/transaction/checkpoint seulement à la
+  première vue — règle H2 du relay (coupe les boucles). Un bloc parqué
+  (orphan) n'est JAMAIS re-diffusé ; les trous de réception sont
+  comblés par la voie de synchronisation (`GetBlocks`), comme le relay.
+- **Production** : un pas de production global par intervalle ; chaque
+  groupe de partition produit au plus UN bloc par tour, par son nœud
+  autorisé détenant la meilleure hauteur. Pendant l'amorçage (avant la
+  première finalité) le producteur est épinglé au nœud le plus bas :
+  l'ensemble de producteurs autorisés dérive de l'état (pool de
+  domaines vivants), deux vues légèrement différentes élisent des
+  comités différents et un bloc légitime localement serait
+  `InvalidProducer` ailleurs — une divergence permanente. Après la
+  première finalité le comité est gelé dans la base de finalité
+  (identique sur tout nœud convergé) et la production est libre.
+- **Finalité** : à chaque multiple de `sign_interval` hauteurs,
+  l'ancre désignée du comité signe le contenu déterministe de son tip
+  via un vrai `SignerGuard` crash-safe (une clé = un vote par epoch,
+  état fsyncé avant diffusion) ; les autres membres du comité signent
+  à la réception (après vérification que le bloc référencé est bien
+  leur bloc canonique à cette hauteur — garde de niveau relay) et
+  re-diffusent l'agrégat enrichi. Au quorum, `accept_checkpoint`
+  finalise. Chaque nœud s'engage sur la première proposition vue par
+  epoch (garde anti-double-finalité d'amorçage : deux propositions
+  concurrentes de la même epoch avec des signataires disjoints ne
+  peuvent pas toutes deux accumuler).
+- **Crash/redémarrage** : un nœud crashé perd tout son état RAM
+  (chaîne, mempool, parking, vues) mais garde son dossier signer-guard
+  sur disque, exactement comme un processus réel ; il resynchronise en
+  rejouant les blocs canoniques servis par ses pairs
+  (`GetBlocks`/`GetCheckpoints`).
+
+### Scénarios couverts (`sim::tests`)
+
+| Test | Ce qui est prouvé |
+|---|---|
+| `convergence_simple` | 8 nœuds, 5 ‰ de perte, latence 1–5 ticks, 500 blocs : même tip, même `state_root_smt` partout ; finalité active ; jamais deux checkpoints incompatibles par epoch. |
+| `partition_then_heal` | Partition 4a/4b pendant ~300 blocs : les deux côtés produisent, guérison → convergence avec reorg de la branche perdante ; les fenêtres de checkpoints croisées ne contredisent jamais une epoch partagée (avant et après la guérison). |
+| `crash_restart` | Crash à h≈200, redémarrage à h≈400 : resynchronisation par rejeu des blocs du réseau — même hauteur, tip, état ; la transaction post-crash est visible du nœud ressuscité. |
+| `duplicate_and_delay` | 10 ‰ de duplication : hauteur finale, racine d'état et nombre de checkpoints finalisés identiques au run sans duplication (idempotence : TxReplay/seen-sets absorbent les doublons). |
+| `concurrent_tx` | Deux propriétaires concurrents sur le même domaine : exactement une mise à jour gagne (l'owner — `NotOwner` pour l'intrus, rejet typé propre), jamais de double application d'état, la tx perdante n'entre dans aucune chaîne. |
+
+### Paramètres et bornes de durée
+
+Valeurs par défaut : `produce_interval` 7 ticks, `sign_interval` 16
+hauteurs, `sync_interval` 29–41 ticks, `horizon` 200k–500k ticks
+virtuels. Chaque test embarque un garde-fou wall-clock < 60 s en mode
+debug (`assert_under_60s`). Le coût dominant est le noyau de
+validation (~9 ms par `push_block_with_gc` vide en debug, Ed25519 non
+optimisé) : les scénarios restent sous ~8 nœuds × 500 blocs.
+
+### Limites
+
+- **Pas de vraie couche transport** : ce harness exerce la logique de
+  chaîne sous livraison adverse, pas le swarm (libp2p,
+  request-response, backpressure, découverte). Les e2e réels
+  (`crates/scone-network/tests/`) restent la preuve transport.
+- **Synchronisation par lots en RAM** : les blocs servis viennent de
+  la fenêtre RAM (les scénarios restent sous `RAM_WINDOW_BLOCKS`) ; le
+  chemin `BlockPruned` + rechargement store n'est pas simulé (couvert
+  par les tests unitaires de la chaîne).
+- **Modèle d'ancre honnête** : les ancres signent uniquement du
+  contenu vérifiable contre leur propre chaîne canonique ; l'équivocation
+  byzantine (double-signature délibérée) est empêchée par le
+  `SignerGuard` mais pas exercée en tant qu'attaque active.
+- **Une partition à la fois** : la carte de groupes est globale et
+  changée séquentiellement par le pilote ; les partitions qui se
+  recouvrent/évoluent en continu ne sont pas modélisées.

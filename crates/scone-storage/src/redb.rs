@@ -114,6 +114,7 @@ fn ensure_not_reserved(key: &[u8]) -> Result<()> {
         || key == META_FORMAT_VERSION
         || key == META_DOMAIN_COUNT
         || key == META_TLD_COUNT
+        || key == crate::verified_snapshot::META_VERIFIED_SNAPSHOT
     {
         return Err(StorageError::ReservedKey(
             String::from_utf8_lossy(key).into_owned(),
@@ -280,6 +281,11 @@ pub struct RedbStore {
 /// Genesis hash (32 bytes) — re-derived, never stored, never trusted.
 fn genesis_hash_bytes() -> [u8; 32] {
     *scone_blockchain::genesis_hash().as_bytes()
+}
+
+/// Lower-case hex of 32 bytes (error messages only).
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Reads a strictly 8-byte big-endian u64 from `meta`, `what` naming
@@ -515,6 +521,165 @@ impl RedbStore {
         }
         wtxn.commit()?;
         Ok(())
+    }
+
+    /// P0.3/P0.4: writes a VERIFIED imported snapshot in ONE
+    /// transaction. The store must be empty (the importer checks
+    /// before calling; re-checked here — defensive depth).
+    ///
+    /// Persisted atomically:
+    ///
+    /// - the live `domains`/`tlds` tables (imported state) and their
+    ///   counters;
+    /// - `tip = (marker.height, marker.tip_hash)` — the finalized
+    ///   checkpoint's block, the anchor the relay will fill in with
+    ///   [`RedbStore::append_bootstrap_anchor`];
+    /// - the frozen `snapshot_v3_*` tables anchored at the same
+    ///   `(height, hash)` — identical content to the live tables, so
+    ///   the M6b boot path restores this exact state and replays only
+    ///   the blocks above it;
+    /// - the reserved marker `meta["verified_snapshot_v1"]`
+    ///   (`height ‖ tip_hash ‖ manifest_hash`).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::SnapshotUnavailable`] if the store is not
+    /// empty; redb errors on I/O failure (nothing persisted — the
+    /// transaction aborts).
+    pub fn write_verified_snapshot(
+        &mut self,
+        domains: &[(DomainId, DomainStateBytes)],
+        tlds: &[(TldId, TldStateBytes)],
+        marker: &crate::verified_snapshot::VerifiedSnapshotMarker,
+    ) -> Result<()> {
+        let (tip_height, _) = self.tip_inner()?;
+        if tip_height != 0 {
+            return Err(StorageError::SnapshotUnavailable(
+                "import target store is not empty".into(),
+            ));
+        }
+        let mut meta_value = Vec::with_capacity(SNAPSHOT_META_LEN);
+        meta_value.extend_from_slice(&marker.height.to_be_bytes());
+        meta_value.extend_from_slice(&marker.tip_hash);
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut domains_t = wtxn.open_table(DOMAINS)?;
+            let mut tlds_t = wtxn.open_table(TLDS)?;
+            for (id, state) in domains {
+                domains_t.insert(&id.as_bytes()[..], state.as_encoded())?;
+            }
+            for (id, state) in tlds {
+                tlds_t.insert(&id.as_bytes()[..], state.as_encoded())?;
+            }
+            let mut snap_meta = wtxn.open_table(SNAPSHOT_META)?;
+            let mut snap_domains = wtxn.open_table(SNAPSHOT_DOMAINS)?;
+            let mut snap_tlds = wtxn.open_table(SNAPSHOT_TLDS)?;
+            snap_meta.retain(|_, _| false)?;
+            snap_meta.insert(0u64, &meta_value[..])?;
+            snap_domains.retain(|_, _| false)?;
+            for (id, state) in domains {
+                snap_domains.insert(&id.as_bytes()[..], state.as_encoded())?;
+            }
+            snap_tlds.retain(|_, _| false)?;
+            for (id, state) in tlds {
+                snap_tlds.insert(&id.as_bytes()[..], state.as_encoded())?;
+            }
+            let mut meta_t = wtxn.open_table(META)?;
+            meta_t.insert(META_DOMAIN_COUNT, &(domains.len() as u64).to_be_bytes()[..])?;
+            meta_t.insert(META_TLD_COUNT, &(tlds.len() as u64).to_be_bytes()[..])?;
+            write_tip(&mut meta_t, marker.height, &marker.tip_hash)?;
+            meta_t.insert(
+                crate::verified_snapshot::META_VERIFIED_SNAPSHOT,
+                &marker.encode()[..],
+            )?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// P0.4 (API storage du bootstrap réseau) : pose le bloc
+    /// d'ancrage d'un snapshot importé vérifié. Le relay reçoit le
+    /// bloc `H` du réseau (par hash, depuis le manifest) et le
+    /// confie au store ici — le rejeu de suffixe au boot exige que le
+    /// bloc d'ancrage soit présent sous la pointe.
+    ///
+    /// Contrats : le store doit porter un marqueur
+    /// `verified_snapshot_v1` à `(height, hash)`, le bloc doit
+    /// annoncer exactement cette hauteur, et le hash fourni —
+    /// RECALCULÉ par l'appelant depuis le header, jamais cru — doit
+    /// égaler le hash du marqueur. Écriture dans une transaction
+    /// unique (`blocks_by_height` + `blocks_by_hash`, index
+    /// auto-porteur comme tout append).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::SnapshotUnavailable`] si le marqueur est
+    /// absent ou incohérent ; [`StorageError::NonMonotonicHeight`]
+    /// si la hauteur du bloc ne poursuit pas la pointe ;
+    /// [`StorageError::Corrupted`] sur un marqueur indécodable.
+    pub fn append_bootstrap_anchor(
+        &mut self,
+        height: u64,
+        hash: &[u8; 32],
+        block_bytes: &[u8],
+    ) -> Result<()> {
+        let marker = self.verified_snapshot_marker()?.ok_or_else(|| {
+            StorageError::SnapshotUnavailable("no verified snapshot imported".into())
+        })?;
+        if height != marker.height || hash != &marker.tip_hash {
+            return Err(StorageError::SnapshotUnavailable(format!(
+                "anchor ({height}, {}) does not match the imported snapshot marker",
+                hex(hash)
+            )));
+        }
+        let (tip_height, _) = self.tip_inner()?;
+        if tip_height != marker.height {
+            return Err(StorageError::NonMonotonicHeight {
+                expected: tip_height + 1,
+                got: height,
+            });
+        }
+        let mut indexed = Vec::with_capacity(BLOCK_INDEX_HEADER + block_bytes.len());
+        indexed.extend_from_slice(hash);
+        indexed.extend_from_slice(&height.to_be_bytes());
+        indexed.extend_from_slice(block_bytes);
+        let wtxn = self.db.begin_write()?;
+        {
+            let mut by_height = wtxn.open_table(BLOCKS_BY_HEIGHT)?;
+            let mut by_hash = wtxn.open_table(BLOCKS_BY_HASH)?;
+            if let Some(previous) = by_height.get(height)? {
+                if previous.value() == indexed.as_slice() {
+                    return Ok(()); // idempotent re-anchor
+                }
+                return Err(StorageError::Conflict {
+                    what: "blocks_by_height",
+                    id: format!("{height}"),
+                });
+            }
+            by_height.insert(height, &indexed[..])?;
+            by_hash.insert(&hash[..], block_bytes)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Reads the P0.4 verified-snapshot marker from `meta`, strictly
+    /// decoded.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Corrupted`] if the stored marker does not
+    /// decode; on I/O errors.
+    pub fn verified_snapshot_marker(
+        &self,
+    ) -> Result<Option<crate::verified_snapshot::VerifiedSnapshotMarker>> {
+        let raw = self.meta_get(crate::verified_snapshot::META_VERIFIED_SNAPSHOT)?;
+        match raw {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(
+                crate::verified_snapshot::VerifiedSnapshotMarker::decode(&bytes)?,
+            )),
+        }
     }
 
     /// Rebuilds the P0.2 name index from the persisted blocks (P0.2).
