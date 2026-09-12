@@ -15,6 +15,7 @@
 pub mod checkpoint;
 pub mod consensus_params;
 pub mod error;
+pub mod groups;
 pub mod icann_tlds;
 pub mod id;
 pub mod name;

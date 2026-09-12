@@ -21,6 +21,7 @@
 //! - registration proof of work
 //! - Merkle trees for block commitments
 
+pub mod group_aead;
 pub mod keys;
 
 pub use keys::{
