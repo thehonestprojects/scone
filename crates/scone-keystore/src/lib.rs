@@ -667,3 +667,183 @@ mod tests {
         assert_eq!(KEYFILE_LEN, 9 + 3 + 16 + 24 + 32 + 16);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Recovery phrase (BIP39) — same model as the web client: the phrase
+// alone regenerates a *random* key? NO: the phrase IS the entropy of
+// the key. `create_with_phrase` derives the signing key from fresh
+// BIP39 entropy and returns the words; `restore_from_phrase` rebuilds
+// the same key from the words and stores it encrypted under
+// `passphrase`.
+// ---------------------------------------------------------------------------
+
+/// A freshly generated key + its 24-word BIP39 recovery phrase.
+#[derive(Debug)]
+pub struct GeneratedWithPhrase {
+    /// The signing key (zeroized on drop).
+    pub signing_key: SigningKey,
+    /// Where it was persisted (encrypted).
+    pub path: PathBuf,
+    /// The 24 recovery words, in order.
+    pub phrase: Vec<String>,
+}
+
+/// Creates a keyfile whose key derives from FRESH BIP39 entropy:
+/// 256 bits of OS entropy -> 24 words. The words alone regenerate
+/// the same key ([`restore_from_phrase`]).
+///
+/// # Errors
+///
+/// See [`Error`]; I/O failures propagate as [`Error::Io`].
+pub fn create_with_phrase<P: AsRef<Path>>(
+    path: P,
+    passphrase: &str,
+) -> Result<GeneratedWithPhrase> {
+    create_with_phrase_overwriting(path, passphrase, CreateMode::NoClobber)
+}
+
+/// [`create_with_phrase`] replacing an existing file.
+///
+/// # Errors
+///
+/// See [`Error`].
+pub fn create_with_phrase_overwriting<P: AsRef<Path>>(
+    path: P,
+    passphrase: &str,
+    mode: CreateMode,
+) -> Result<GeneratedWithPhrase> {
+    // Fresh 256-bit entropy from the OS CSPRNG.
+    let mut entropy = [0u8; 32];
+    {
+        use getrandom::rand_core::{TryRng, UnwrapErr};
+        let mut rng = UnwrapErr(getrandom::SysRng);
+        rng.try_fill_bytes(&mut entropy)
+            .map_err(|_| Error::Io(std::io::Error::other("os rng")))?;
+    }
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("bip39: {e}"))))?;
+    let phrase: Vec<String> = mnemonic.word_iter().map(str::to_string).collect();
+
+    // Deterministic key: BIP39 seed (PBKDF2-HMAC-SHA512, empty
+    // passphrase — the recovery phrase IS the secret) -> first 32
+    // bytes -> Ed25519.
+    let seed = mnemonic.to_seed("");
+    let signing_key = SigningKey::from_bytes(seed[..32].try_into().expect("32"));
+
+    write_derived_keyfile(path.as_ref(), passphrase, &signing_key, mode)?;
+    let path = path.as_ref().to_path_buf();
+    Ok(GeneratedWithPhrase {
+        signing_key,
+        path,
+        phrase,
+    })
+}
+
+/// Regenerates the key from a BIP39 recovery phrase (12/15/18/21/24
+/// words, checksum verified) and stores it encrypted under
+/// `passphrase`. The SAME model as the web client's restore.
+///
+/// # Errors
+///
+/// [`Error::Io`] on malformed phrase (invalid words, order or
+/// checksum) or I/O failure.
+pub fn restore_from_phrase<P: AsRef<Path>>(
+    path: P,
+    passphrase: &str,
+    phrase: &str,
+) -> Result<SigningKey> {
+    let mnemonic = bip39::Mnemonic::parse_normalized(phrase.trim())
+        .map_err(|e| Error::Io(std::io::Error::other(format!("bip39: {e}"))))?;
+    let seed = mnemonic.to_seed("");
+    let signing_key = SigningKey::from_bytes(seed[..32].try_into().expect("32"));
+    write_derived_keyfile(
+        path.as_ref(),
+        passphrase,
+        &signing_key,
+        CreateMode::Overwrite,
+    )?;
+    Ok(signing_key)
+}
+
+/// Encrypts an arbitrary (already derived) signing key into a
+/// standard keyfile — shared by create_with_phrase/restore.
+fn write_derived_keyfile(
+    path: &Path,
+    passphrase: &str,
+    signing_key: &SigningKey,
+    mode: CreateMode,
+) -> Result<()> {
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    {
+        use getrandom::rand_core::{TryRng, UnwrapErr};
+        let mut rng = UnwrapErr(getrandom::SysRng);
+        rng.try_fill_bytes(&mut salt)
+            .map_err(|_| Error::Io(std::io::Error::other("os rng")))?;
+        rng.try_fill_bytes(&mut nonce)
+            .map_err(|_| Error::Io(std::io::Error::other("os rng")))?;
+    }
+    let seed = Zeroizing::new(signing_key.to_bytes());
+    let key = try_derive_key(passphrase, &salt, DEFAULT_M_COST_KIB, DEFAULT_T_COST)?;
+    let cipher = XChaCha20Poly1305::new((&*key).into());
+    let nonce = XNonce::from(nonce);
+    let ciphertext = cipher
+        .encrypt(&nonce, seed.as_slice())
+        .map_err(|_| Error::Cipher)?;
+
+    let mut file = Vec::with_capacity(KEYFILE_LEN);
+    file.extend_from_slice(MAGIC);
+    file.push(VERSION);
+    file.push((DEFAULT_M_COST_KIB / 1024) as u8);
+    file.push(DEFAULT_T_COST as u8);
+    file.extend_from_slice(&salt);
+    file.extend_from_slice(&nonce);
+    file.extend_from_slice(&ciphertext);
+
+    write_private_file(path, &file, mode)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod phrase_tests {
+    use super::*;
+
+    fn dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn phrase_roundtrip_same_key() {
+        let d = dir();
+        let p = d.path().join("a.sconekey");
+        let g = create_with_phrase(&p, "pass-pass").unwrap();
+        assert_eq!(g.phrase.len(), 24);
+        // Restore from the phrase in a NEW file: same public key.
+        let q = d.path().join("b.sconekey");
+        let restored = restore_from_phrase(&q, "other-pass", &g.phrase.join(" ")).unwrap();
+        assert_eq!(restored.public_key(), g.signing_key.public_key());
+        // And it opens with its own passphrase.
+        assert!(open(&q, "other-pass").is_ok());
+    }
+
+    #[test]
+    fn bad_phrase_is_rejected() {
+        let d = dir();
+        let q = d.path().join("c.sconekey");
+        // Valid words, invalid checksum/order.
+        assert!(restore_from_phrase(&q, "p", "abandon abandon abandon").is_err());
+        assert!(restore_from_phrase(&q, "p", "not a real phrase at all here").is_err());
+    }
+
+    #[test]
+    fn phrase_key_differs_from_random_key() {
+        // The derived-from-phrase keyfile is a STANDARD keyfile:
+        // open() works on it transparently.
+        let d = dir();
+        let p = d.path().join("d.sconekey");
+        let g = create_with_phrase(&p, "pp").unwrap();
+        let opened = open(&p, "pp").unwrap();
+        assert_eq!(opened.public_key(), g.signing_key.public_key());
+        assert!(open(&p, "wrong").is_err());
+    }
+}
