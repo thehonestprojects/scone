@@ -246,7 +246,7 @@ pub fn create_overwriting<P: AsRef<Path>>(path: P, passphrase: &str) -> Result<G
 }
 
 /// Whether [`write_keyfile`] may replace an existing file.
-enum CreateMode {
+pub enum CreateMode {
     /// Fail with [`Error::KeyfileExists`] if the file exists.
     NoClobber,
     /// Replace the file if it exists.
@@ -722,7 +722,7 @@ pub fn create_with_phrase_overwriting<P: AsRef<Path>>(
     }
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy)
         .map_err(|e| Error::Io(std::io::Error::other(format!("bip39: {e}"))))?;
-    let phrase: Vec<String> = mnemonic.word_iter().map(str::to_string).collect();
+    let phrase: Vec<String> = mnemonic.words().map(str::to_string).collect();
 
     // Deterministic key: BIP39 seed (PBKDF2-HMAC-SHA512, empty
     // passphrase — the recovery phrase IS the secret) -> first 32
