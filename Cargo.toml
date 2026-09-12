@@ -25,7 +25,7 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 chacha20poly1305 = { version = "0.11", features = ["alloc"] }
 argon2 = "0.6"
 clap = { version = "4.6", features = ["derive"] }
-libp2p = { version = "0.56", default-features = false, features = ["kad", "request-response", "quic", "tokio", "tcp", "dns", "identify", "ping", "yamux", "macros"] }
+libp2p = { version = "0.56", default-features = false, features = ["kad", "request-response", "quic", "tokio", "tcp", "dns", "identify", "ping", "yamux", "macros", "memory-connection-limits"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "fs"] }
 futures = "0.3"
 async-trait = "0.1"

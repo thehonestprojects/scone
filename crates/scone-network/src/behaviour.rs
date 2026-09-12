@@ -176,6 +176,9 @@ impl request_response::Codec for SconeCodec {
 /// Composite network behaviour of a relay.
 #[derive(NetworkBehaviour)]
 pub struct SconeBehaviour {
+    /// Connection admission (P1.5): hard caps enforced at the swarm
+    /// level — a peer cannot exhaust memory by opening connections.
+    pub limits: libp2p::connection_limits::Behaviour,
     /// Identify protocol (address discovery for Kademlia).
     pub identify: identify::Behaviour,
     /// Liveness probes.
@@ -221,13 +224,36 @@ pub fn build_behaviour(key: &libp2p::identity::Keypair) -> SconeBehaviour {
         reqres_config,
     );
 
+    // P1.5 — connection admission: a relay keeps at most
+    // MAX_TOTAL_CONNECTIONS connections overall (in+out) and
+    // MAX_PER_PEER_CONNECTIONS per peer. libp2p refuses the excess
+    // (incoming) instead of queueing it — a connection-flood peer
+    // gets dropped, never a memory bump. Outbound dials by honest
+    // peers still succeed: the total cap leaves headroom.
+    let limits = libp2p::connection_limits::Behaviour::new(
+        libp2p::connection_limits::ConnectionLimits::default()
+            .with_max_established(Some(MAX_TOTAL_CONNECTIONS))
+            .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+            .with_max_established_per_peer(Some(MAX_PER_PEER_CONNECTIONS)),
+    );
+
     SconeBehaviour {
+        limits,
         identify,
         ping,
         kad,
         reqres,
     }
 }
+
+/// Hard cap on concurrent connections (in + out) per relay (P1.5).
+pub const MAX_TOTAL_CONNECTIONS: u32 = 128;
+/// Hard cap on concurrent connections to a single peer (P1.5).
+pub const MAX_PER_PEER_CONNECTIONS: u32 = 4;
+/// Hard cap on pending (handshaking) incoming connections (P1.5) —
+/// the slowloris guard: unauthenticated half-connections never queue
+/// unboundedly.
+pub const MAX_PENDING_INCOMING: u32 = 32;
 
 /// Extracts `(PeerId, Multiaddr)` from a bootstrap multiaddr ending
 /// in `/p2p/<id>`.

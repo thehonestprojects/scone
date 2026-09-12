@@ -37,6 +37,24 @@ expose un **RPC de contrôle local** que le CLI interroge.
 tout ce qui est en dessous (crypto → core → protocol → blockchain →
 storage) reste synchrone et pur.
 
+## Admission des connexions (P1.5)
+
+Bornes matérielles au niveau du swarm (comportement libp2p
+`connection_limits`, la première entrée de `SconeBehaviour`) :
+
+- `MAX_TOTAL_CONNECTIONS = 128` — plafond de connexions établies
+  (entrantes + sortantes) par relay ; l'excédent entrant est REFUSÉ,
+  jamais mis en file ;
+- `MAX_PER_PEER_CONNECTIONS = 4` — un seul pair ne peut pas monopoliser
+  le quota total en ouvrant beaucoup de connexions ;
+- `MAX_PENDING_INCOMING = 32` — garde slowloris : les demi-connexions
+  non authentifiées n'attendent jamais indéfiniment.
+
+Ces bornes complètent les limites existantes par message
+(`MAX_MESSAGE_LEN` 1 Mio) et par budget (sync `max ≤ 128` blocs, DNS
+TCP 64 connexions/512 o/5 s). Un attaquant par inondation de
+connexions obtient des refus, pas une croissance mémoire.
+
 ## Transport et protocoles libp2p
 
 | Protocole | Nom | Rôle |
