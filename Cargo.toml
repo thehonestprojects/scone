@@ -9,7 +9,6 @@ members = [
     "crates/scone-network",
     "crates/scone-protocol",
     "crates/scone-storage",
-    "crates/gui",
 ]
 
 [workspace.package]
